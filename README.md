@@ -1,0 +1,70 @@
+<p align="center">
+  <img src=".github/icon.png" width="128" alt="LabDC app icon">
+</p>
+
+# LabDC
+
+**An Active Directory–compatible domain controller for your Mac — with a built-in RADIUS server for 802.1X Wi-Fi and wired, and its own certificate authority.**
+
+LabDC is written from scratch in Swift and SwiftUI. Windows 10/11 PCs join its domain, users
+sign in with Kerberos and NTLM, and access points and switches authenticate Wi-Fi and wired
+clients against the same accounts — all from one app, one process and one folder on your Mac.
+No Windows Server, no Samba, no `sudo`.
+
+## ⬇️ Download
+
+[![Download LabDC for macOS](https://img.shields.io/badge/Download-LabDC_1.0_%281%29_for_macOS-2ea44f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/bestonehxh/LabDC/releases/latest)
+
+**[Get the latest release →](https://github.com/bestonehxh/LabDC/releases/latest)** — download `LabDC-1.0-1.zip`, unzip, and drag **LabDC.app** into `Applications`.
+
+> The build is unsigned (not notarized), so macOS will warn on first launch —
+> right-click the app and choose **Open**, or run
+> `xattr -dr com.apple.quarantine /Applications/LabDC.app`
+>
+> Requires macOS 26 or later, Apple Silicon.
+
+## The Sheep family 🐑
+
+LabDC sits next to a few small native macOS apps for network engineers:
+
+|  | App | What it does |
+|---|---|---|
+| <img src="https://raw.githubusercontent.com/bestonehxh/SheepDrop/main/.github/icon.png?v=3" width="44" alt=""> | [SheepDrop](https://github.com/bestonehxh/SheepDrop) | SFTP / SCP / FTP / TFTP file transfer — client and built-in server |
+| <img src="https://raw.githubusercontent.com/bestonehxh/SheepTerm/main/.github/icon.png?v=3" width="44" alt=""> | [SheepTerm](https://github.com/bestonehxh/SheepTerm) | SSH / Serial / local-shell terminal for network engineers |
+| <img src="https://raw.githubusercontent.com/bestonehxh/SheepTap/main/.github/icon.png?v=3" width="44" alt=""> | [SheepTap](https://github.com/bestonehxh/SheepTap) | Menu-bar viewer for your Mac's network interfaces with click-to-copy |
+| <img src="https://raw.githubusercontent.com/bestonehxh/SheepPing/main/.github/icon.png?v=3" width="44" alt=""> | [SheepPing](https://github.com/bestonehxh/SheepPing) | Continuous multi-host ping monitor with per-host logs and CSV export |
+| <img src="https://raw.githubusercontent.com/bestonehxh/SheepText/main/.github/icon.png?v=3" width="44" alt=""> | [SheepText](https://github.com/bestonehxh/SheepText) | Fast text editor with tree-sitter highlighting and a JavaScript plugin system |
+| <img src="https://raw.githubusercontent.com/bestonehxh/SheepLog/main/.github/icon.png?v=3" width="44" alt=""> | [SheepLog](https://github.com/bestonehxh/SheepLog) | Syslog viewer, SNMP tester and packet capture |
+
+## Features
+
+### Directory
+- **Domain join for Windows 10/11** — DNS with the SRV records Windows looks for, CLDAP, LDAP/LDAPS and Global Catalog, SMB with the NETLOGON, SAMR, LSA and DRSUAPI pipes, and SYSVOL with Group Policy
+- **Kerberos KDC and kpasswd**, NTLM, password policy, lockout, "must change password at next logon"
+- **People, groups, computers and OUs** in a quiet, text-first app — plus a `labdc` command line for scripts
+- **Rename the domain** in place, **profiles** for several labs side by side, backups and Start over
+
+### RADIUS and 802.1X
+- **WPA2-Enterprise, WPA3-Enterprise and WPA3-Enterprise 192-bit**, wireless and wired
+- **EAP-TLS, PEAP-MSCHAPv2 and EAP-TTLS** (PAP, MS-CHAPv2, EAP-MSCHAPv2, EAP-GTC) over TLS 1.2 and 1.3, with fast reconnect and PEAP crypto binding
+- **Change an expired password at Wi-Fi logon**
+- **Policies with AND/OR conditions** on groups, OUs, SSID, NAS, time of day and more — return VLANs and vendor attributes
+- **802.1X profiles pushed to Windows by Group Policy**, wired and wireless
+
+### Certificates
+- A **lab certificate authority** with templates, auto-enrollment, SCEP and EST, revocation and CRLs
+- A **P-384 chain** for WPA3-Enterprise 192-bit, created when you first need it
+- A certificate **converter** (PEM, DER, PKCS#12, PKCS#7, JKS)
+
+## Build from source
+
+```sh
+Scripts/make-app.sh          # builds build/LabDC.app
+swift build -c release       # or just the command-line tools: labdc, labdc-kdc
+```
+
+Requires Xcode 26 / Swift 6.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

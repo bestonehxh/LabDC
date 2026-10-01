@@ -1,0 +1,8 @@
+.build/
+*.pcap
+*.keytab
+.DS_Store
+.claude/
+Scripts/venv-test/
+__pycache__/
+build/
