@@ -56,8 +56,33 @@ extension NetlogonService {
             return w
         }
 
+        // Throttle (security audit, 1 Oct 2026): every failed credential check counts against the
+        // computer account and the source address; past `lockoutThreshold` failures within
+        // `lockoutWindow` both are refused for `lockoutDuration` — an online guess of the machine
+        // password (or a Zerologon-style credential search) cannot run unbounded.
+        let now = clock()
+        let throttleKeys = ["acct:" + accountName, "ip:" + (NetlogonCallInfo.current?.address ?? "-")]
+        if let until = throttleKeys.lazy.compactMap({ self.authenticateFailures.lockedUntil($0, now: now) }).first {
+            return fail(NLStatus.accessDenied, "too many failed Authenticate3 attempts; refused until "
+                        + until.formatted(.dateTime.hour().minute()))
+        }
+        func failCounted(_ status: UInt32, _ reason: String) -> NDRWriter {
+            var locked = false
+            for key in throttleKeys {
+                locked = authenticateFailures.recordFailure(key, now: now, threshold: config.lockoutThreshold,
+                                                            window: config.lockoutWindow,
+                                                            duration: config.lockoutDuration) || locked
+            }
+            return fail(status, locked ? reason + "; further attempts throttled" : reason)
+        }
+        // RequireSignOrSeal: a client that does not negotiate NETLOGON_NEG_AUTHENTICATED_RPC would
+        // run the secure channel's calls unsigned, which this DC refuses (CVE-2022-38023).
+        guard clientFlags & NetlogonNegotiateFlags.authenticatedRPC.rawValue != 0 else {
+            return fail(NLStatus.accessDenied, "client did not negotiate NETLOGON_NEG_AUTHENTICATED_RPC (schannel)")
+        }
+
         guard let account = try await machineNTHash(sam: accountName) else {
-            return fail(NLStatus.noTrustSamAccount, "no such machine account")
+            return failCounted(NLStatus.noTrustSamAccount, "no such machine account")
         }
         guard let pending = state.takePending(computer: computer) else {
             return fail(NLStatus.accessDenied, "no ReqChallenge pending for this computer")
@@ -65,7 +90,7 @@ extension NetlogonService {
         // CVE-2020-1472: a credential with 5 identical leading bytes is how Zerologon guesses its way in.
         guard !NetlogonCrypto.isWeakChallenge(pending.clientChallenge),
               !NetlogonCrypto.isWeakChallenge(clientCredential) else {
-            return fail(NLStatus.accessDenied, "client credential is not random (CVE-2020-1472)")
+            return failCounted(NLStatus.accessDenied, "client credential is not random (CVE-2020-1472)")
         }
         if let reason = Self.trustAccountMismatch(account.userAccountControl, channelType: channelTypeRaw) {
             return fail(NLStatus.noTrustSamAccount, reason)
@@ -92,8 +117,9 @@ extension NetlogonService {
         }
         let expectedClient = credential(pending.clientChallenge)
         guard ConstantTime.equal(expectedClient, clientCredential) else {
-            return fail(NLStatus.accessDenied, "client credential mismatch: machine password differs from the DC's")
+            return failCounted(NLStatus.accessDenied, "client credential mismatch: machine password differs from the DC's")
         }
+        for key in throttleKeys { authenticateFailures.recordSuccess(key) }
         let serverCredential = credential(pending.serverChallenge)
 
         var channel = NetlogonChannel(

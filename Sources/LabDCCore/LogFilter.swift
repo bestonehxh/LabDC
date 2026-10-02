@@ -36,8 +36,8 @@ public struct LogFilter: Equatable, Sendable {
     }
 
     /// The chips: well-known components first (in this order), then any other seen in `lines`.
-    public static let knownComponents = ["KDC", "NETLOGON", "LDAP", "DRSUAPI", "SMB", "RPC", "DNS", "SCEP", "EST", "HTTP", "PKI",
-                                         "GPO", "SYSVOL", "SNTP", "Store", "kpasswd", "serve"]
+    public static let knownComponents = ["KDC", "NETLOGON", "LDAP", "DRSUAPI", "BKRP", "SMB", "RPC", "DNS", "SCEP", "EST", "HTTP", "PKI",
+                                         "GPO", "SYSVOL", "SNTP", "DHCP", "Store", "kpasswd", "serve"]
 
     public static func components(in lines: [LogLine]) -> [String] {
         let seen = Set(lines.map(\.component))
@@ -53,7 +53,9 @@ public struct LogFilter: Equatable, Sendable {
 /// The log's plain-word groups (owner, 27 Sep 2026: "easy to read"): what a line is about,
 /// instead of the protocol that wrote it.
 public enum LogCategory: String, CaseIterable, Sendable, Hashable {
-    case signIns = "Sign-ins"
+    // "Authentication", not "Sign-ins": that is the name of the Activity tab beside the log
+    // (owner, 2 Oct 2026).
+    case signIns = "Authentication"
     case devices = "Devices"
     case certificates = "Certificates"
     case system = "System"
@@ -61,7 +63,7 @@ public enum LogCategory: String, CaseIterable, Sendable, Hashable {
     public init(component: String) {
         switch component.uppercased() {
         case "KDC", "KPASSWD", "NETLOGON", "LDAP", "CLDAP", "RADIUS": self = .signIns
-        case "DNS", "SMB", "RPC", "DRSUAPI", "GPO", "SYSVOL", "SNTP", "NBNS", "LSA", "SAMR": self = .devices
+        case "DNS", "SMB", "RPC", "DRSUAPI", "BKRP", "GPO", "SYSVOL", "SNTP", "NBNS", "LSA", "SAMR", "DHCP": self = .devices
         case "SCEP", "EST", "HTTP", "HTTPS", "PKI", "CEP", "CES": self = .certificates
         default: self = .system
         }
@@ -78,6 +80,7 @@ public enum LogCategory: String, CaseIterable, Sendable, Hashable {
         case "SMB": "File sharing"
         case "RPC", "LSA", "SAMR": "Windows calls"
         case "DRSUAPI": "Windows join"
+        case "BKRP": "DPAPI key backup"
         case "GPO", "SYSVOL": "Group Policy"
         case "SNTP": "Time"
         case "NBNS": "NetBIOS"

@@ -24,7 +24,9 @@ enum NLNDR {
         let maxCount = Int(try r.u32())
         _ = try r.u32()                        // Offset
         let actual = Int(try r.u32())
-        guard actual <= maxCount, actual <= r.remaining / 2 + 1 else {
+        // Each unit is two bytes: the body must fit in what is left (no "+ 1" slack — that let a
+        // count one past the end through to the unit loop).
+        guard actual <= maxCount, actual <= r.remaining / 2 else {
             throw NDRError(offset: r.offset, reason: "wchar body count \(actual) too large")
         }
         var units = [UInt16](); units.reserveCapacity(actual)

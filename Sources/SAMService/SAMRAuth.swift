@@ -36,13 +36,36 @@ extension SAMRService {
         return Privileges(admin: admin, accountOperator: accountOperator)
     }
 
-    /// Throws `accessDenied` unless the caller may set `target`'s password.
-    func authorizePasswordSet(_ ctx: RPCCallContext, target: DirectoryEntry) async throws {
-        if let tsid = target.sid, tsid == ctx.identity.sid { return }        // own account
+    /// Throws `accessDenied` unless the caller may write `target` (SetInformationUser at any level,
+    /// DeleteUser): administrators any account, Account Operators any account outside the
+    /// AdminSDHolder-protected set. Returns the caller's privileges for the per-field checks.
+    ///
+    /// Security audit (1 Oct 2026): there is no "own account" shortcut any more. SetInformationUser
+    /// is an administrative *set* — level 16/21 carry the ACB flags, primary group and expiry, and
+    /// the password levels (18/23/24/25/26) prove nothing about the old password — so a user
+    /// changes their own password with SamrUnicodeChangePasswordUser2 (or kpasswd) instead.
+    @discardableResult
+    func authorizePasswordSet(_ ctx: RPCCallContext, target: DirectoryEntry) async throws -> Privileges {
         let p = try await privileges(ctx)
-        if p.admin { return }
-        if p.accountOperator, !(try await isProtected(target)) { return }
+        if p.admin { return p }
+        if p.accountOperator, !(try await isProtected(target)) { return p }
         throw SAMRError(.accessDenied)
+    }
+
+    /// ACB bits only an administrator may set or clear (delegation needs SeEnableDelegationPrivilege;
+    /// partial secrets makes an RODC) — on top of the account type, which non-admins never change.
+    static let adminOnlyACB: UInt32 = ACB.trustedForDelegation | ACB.trustedToAuthForDelegation
+        | ACB.partialSecretsAccount
+
+    /// Throws `accessDenied` when a non-administrator's ACB set would change the account type or an
+    /// admin-only bit (old and new compared as ACB).
+    static func checkACBChange(old oldACB: UInt32, new acb: UInt32, privileges p: Privileges) throws {
+        guard !p.admin else { return }
+        // An ACB set without any account-type bit keeps the current type (userAccountControl(settingACB:)).
+        let newType = acb & ACB.accountTypeMask == 0 ? oldACB & ACB.accountTypeMask : acb & ACB.accountTypeMask
+        guard newType == oldACB & ACB.accountTypeMask, acb & adminOnlyACB == oldACB & adminOnlyACB else {
+            throw SAMRError(.accessDenied)
+        }
     }
 
     /// Throws `accessDenied` unless the caller may create accounts.

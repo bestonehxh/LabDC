@@ -48,8 +48,10 @@ public struct EAPCredentials: Sendable, Equatable {
     public var chain: [[UInt8]]
     public var keyDER: [UInt8]
     public var suiteB: TLSContext.Credential?
-    public init(chain: [[UInt8]], keyDER: [UInt8], suiteB: TLSContext.Credential? = nil) {
-        self.chain = chain; self.keyDER = keyDER; self.suiteB = suiteB
+    /// The RSA compatibility chain for RSA-only devices ("Allow RSA-only devices"); nil: off.
+    public var rsa: TLSContext.Credential?
+    public init(chain: [[UInt8]], keyDER: [UInt8], suiteB: TLSContext.Credential? = nil, rsa: TLSContext.Credential? = nil) {
+        self.chain = chain; self.keyDER = keyDER; self.suiteB = suiteB; self.rsa = rsa
     }
 }
 
@@ -70,6 +72,8 @@ public struct EAPFacts: Sendable, Equatable {
     public var cryptoBinding = false
     /// The 192-bit credential and policy were used (WPA3-Enterprise 192-bit).
     public var suiteB = false
+    /// The RSA compatibility chain was used (an RSA-only device).
+    public var rsaCompatibility = false
     /// MS-CHAPv2 changed an expired password in this exchange.
     public var passwordChanged = false
 
@@ -110,6 +114,11 @@ public struct EAPSettings: Sendable {
     public var resumptionLifetime: TimeInterval = 8 * 3600
     /// The name in the MS-CHAPv2 challenge.
     public var serverName = "LabDC"
+    /// PEAP: reject a client that does not return a valid Crypto-Binding TLV ([MS-PEAP]
+    /// §3.1.5.5). Without it the outer TLS tunnel is not bound to the inner MS-CHAPv2, so a rogue
+    /// AP can relay the inner exchange. Off by default (some old supplicants never send it);
+    /// on is recommended. Changed at run time with `EAPServer.setRequirePEAPCryptoBinding`.
+    public var requirePEAPCryptoBinding = false
 
     public init() {}
 }
@@ -133,8 +142,14 @@ public actor EAPServer {
         self.backend = backend
         self.settings = settings
         self.credentials = credentials
+        self.requirePEAPCryptoBinding = settings.requirePEAPCryptoBinding
         resumption = settings.resumption ? EAPResumptionCache(lifetime: settings.resumptionLifetime) : nil
     }
+
+    /// "Require PEAP crypto binding" now (the RADIUS server follows its setting).
+    public private(set) var requirePEAPCryptoBinding: Bool
+
+    public func setRequirePEAPCryptoBinding(_ on: Bool) { requirePEAPCryptoBinding = on }
 
     public var sessionCount: Int { sessions.count }
 
@@ -203,11 +218,11 @@ public actor EAPServer {
             let max: UInt16 = settings.allowTLS13 ? 0x0304 : 0x0303
             guard let tls = try? TLSContext(isServer: true, chain: creds.chain, privateKeyDER: creds.keyDER, requireClientCertificate: true,
                                             maxVersion: max, suiteB: creds.suiteB, resumption: resumption, sessionContext: "EAP-TLS",
-                                            deferClientVerification: true),
+                                            deferClientVerification: true, rsa: creds.rsa),
                   let peap = try? TLSContext(isServer: true, chain: creds.chain, privateKeyDER: creds.keyDER, maxVersion: max,
-                                             resumption: resumption, sessionContext: "PEAP"),
+                                             resumption: resumption, sessionContext: "PEAP", rsa: creds.rsa),
                   let ttls = try? TLSContext(isServer: true, chain: creds.chain, privateKeyDER: creds.keyDER, maxVersion: max,
-                                             resumption: resumption, sessionContext: "EAP-TTLS") else {
+                                             resumption: resumption, sessionContext: "EAP-TTLS", rsa: creds.rsa) else {
                 return nil
             }
             contexts = (creds, tls, peap, ttls)
@@ -478,6 +493,7 @@ public actor EAPServer {
         var f = EAPFacts(method: method.title, innerMethod: inner, outerIdentity: s.identity, tlsVersion: engine.versionName)
         f.resumed = engine.resumed
         f.suiteB = engine.suiteB
+        f.rsaCompatibility = engine.rsaCompatibility
         return f
     }
 
@@ -581,6 +597,9 @@ public actor EAPServer {
                 }
                 facts.cryptoBinding = true
                 msk = Array(PEAPCrypto.compoundSessionKey(ipmk: binding.ipmk).prefix(64))
+            } else if requirePEAPCryptoBinding {
+                return .reject(reason: "PEAP: the client returned no Crypto-Binding TLV (Require PEAP crypto binding is on)",
+                               account: account, facts: facts)
             }
             return .accept(account: account, facts: facts, msk: msk)
 

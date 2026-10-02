@@ -11,6 +11,10 @@ struct NetlogonCallInfo: Sendable {
     var transport: String
     /// The connection's RPC authentication level (schannel sign/seal = pktIntegrity/pktPrivacy).
     var authLevel: RPCAuthLevel = .none
+    /// The connection's RPC auth service (`.schannel` once a type-68 bind is established).
+    var authType: RPCAuthType = .none
+    /// The computer whose secure channel the schannel binding uses (nil without schannel).
+    var schannelComputer: String?
 
     @TaskLocal static var current: NetlogonCallInfo?
 
@@ -24,13 +28,24 @@ struct NetlogonCallInfo: Sendable {
     init(_ context: RPCCallContext) {
         self = Self.parse(context.clientAddress)
         authLevel = context.authLevel
+        authType = context.authType
+        schannelComputer = context.authType == .schannel ? context.authPrincipal : nil
     }
 
     /// True for real clients (SMB named pipe or ncacn_ip_tcp), false for the in-memory test transport.
     var isNetworkTransport: Bool { transport == "np" || transport == "tcp" }
 
-    /// Secure RPC: the call arrived on a signed or sealed (schannel) binding.
-    var isSecureRPC: Bool { authLevel.rawValue >= RPCAuthLevel.pktIntegrity.rawValue }
+    /// Secure RPC (MS-NRPC): the call arrived on a Netlogon schannel binding that signs or seals
+    /// every PDU. NTLM/Kerberos-signed bindings do not count — they prove a user, not a channel.
+    var isSecureRPC: Bool {
+        authType == .schannel && authLevel.rawValue >= RPCAuthLevel.pktIntegrity.rawValue
+    }
+
+    /// Secure RPC bound to `computer`'s own secure channel.
+    func isSecureRPC(for computer: String) -> Bool {
+        guard isSecureRPC, let bound = schannelComputer else { return false }
+        return bound.caseInsensitiveCompare(computer) == .orderedSame
+    }
 
     static func parse(_ a: String) -> NetlogonCallInfo {
         if a.hasPrefix("["), let close = a.firstIndex(of: "]") {

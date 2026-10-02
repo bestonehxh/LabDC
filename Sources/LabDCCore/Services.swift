@@ -3,7 +3,7 @@ import Foundation
 /// What the owner sees instead of ports (owner decision 26 Sep 2026): the Overview status, the
 /// sidebar tooltip and Settings ▸ Directory group the listeners by service.
 public enum ServeService: String, CaseIterable, Identifiable, Sendable, Hashable {
-    case dns, kerberos, directory, fileAndRPC, time, webPKI, radius
+    case dns, kerberos, directory, fileAndRPC, time, webPKI, radius, dhcp
 
     public var id: String { rawValue }
 
@@ -16,6 +16,7 @@ public enum ServeService: String, CaseIterable, Identifiable, Sendable, Hashable
         case .time: "Time"
         case .webPKI: "Web/PKI"
         case .radius: "RADIUS"
+        case .dhcp: "DHCP"
         }
     }
 
@@ -29,6 +30,7 @@ public enum ServeService: String, CaseIterable, Identifiable, Sendable, Hashable
         case .time: "Keeps joined computers' clocks in step."
         case .webPKI: "CA download, CRL and certificate enrollment."
         case .radius: "802.1X: the NAS asks, the policy answers with VLANs."
+        case .dhcp: "Addresses for test VLANs, through the switches' DHCP relay."
         }
     }
 
@@ -41,6 +43,7 @@ public enum ServeService: String, CaseIterable, Identifiable, Sendable, Hashable
         case .time: "clock"
         case .webPKI: "globe.badge.chevron.backward"
         case .radius: "dot.radiowaves.right"
+        case .dhcp: "network"
         }
     }
 
@@ -54,6 +57,7 @@ public enum ServeService: String, CaseIterable, Identifiable, Sendable, Hashable
         case .time: [.sntp]
         case .webPKI: [.http, .https, .est]
         case .radius: [.radius, .radacct]
+        case .dhcp: [.dhcp, .dhcpv6]
         }
     }
 
@@ -93,6 +97,8 @@ public struct ServiceStatus: Identifiable, Hashable, Sendable {
     public var listeners: [ListenerStatus]
     /// The result of the last Restart of this row (`Restarted 14:02:11` / the error), until the next one.
     public var lastRestart: RestartOutcome?
+    /// A one-line runtime summary (DHCP: `relay-only · 4 scopes · 123 leases`).
+    public var detail: String?
 
     public init(service: ServeService, state: State, listeners: [ListenerStatus], lastRestart: RestartOutcome? = nil) {
         self.service = service
@@ -108,7 +114,7 @@ public struct ServiceStatus: Identifiable, Hashable, Sendable {
         case .starting: "Starting…"
         case .restarting: "Restarting…"
         case .problem: "Problem"
-        case .off: "Off in Settings"
+        case .off: service == .dhcp ? "Off until a scope exists" : "Off in Settings"
         case .stopped: "Stopped"
         }
     }
@@ -137,6 +143,11 @@ public struct ServiceStatus: Identifiable, Hashable, Sendable {
                 } else {
                     tokens.append("NetBIOS \(port(l))")
                 }
+            // The row already says RADIUS: "Auth udp 1812 · Accounting udp 1813" (owner, 2 Oct 2026).
+            case .radius:
+                tokens.append("Auth udp \(port(l))")
+            case .radacct:
+                tokens.append("Accounting udp \(port(l))")
             default:
                 let proto = l.listener.transport == "udp" ? "udp " : ""
                 tokens.append("\(l.listener.shortName) \(proto)\(port(l))")
@@ -154,13 +165,25 @@ public struct ServiceStatus: Identifiable, Hashable, Sendable {
         return "NetBIOS name service is off: macOS's own netbiosd holds udp 137 (names still resolve through DNS)."
     }
 
-    /// Restart makes sense only while the server runs and the service is not off or mid-restart.
+    /// Restart makes sense only while the server runs and the service is not off or mid-restart;
+    /// on a row stopped with Stop it starts the service again.
     public var canRestart: Bool {
+        switch state {
+        case .running, .problem, .stopped: true
+        default: false
+        }
+    }
+
+    /// Services ▸ Stop: a running (or failing) service can be stopped on its own.
+    public var canStop: Bool {
         switch state {
         case .running, .problem: true
         default: false
         }
     }
+
+    /// What else a Stop takes down because it shares the server ("Time", "File & RPC").
+    public var stopAlsoAffects: [ServeService] { service.restartAlsoAffects }
 
     /// Folds the listener states into one: problem wins, then restarting, starting, running, off, stopped.
     public static func make(_ service: ServeService, listeners all: [ListenerStatus], restarting: Bool,
@@ -169,7 +192,7 @@ public struct ServiceStatus: Identifiable, Hashable, Sendable {
         let state: State
         if let failed = mine.first(where: { if case .failed = $0.state { true } else { false } }),
            case .failed(let why) = failed.state {
-            state = restarting ? .restarting : .problem(why)
+            state = restarting ? .restarting : .problem(service == .dhcp ? dhcpProblem(mine) ?? why : why)
         } else if restarting {
             state = .restarting
         } else if mine.contains(where: { $0.state == .starting }) {
@@ -182,6 +205,37 @@ public struct ServiceStatus: Identifiable, Hashable, Sendable {
             state = .stopped
         }
         return ServiceStatus(service: service, state: state, listeners: mine, lastRestart: lastRestart)
+    }
+
+    /// DHCPv4 and DHCPv6 are independent: `Running (IPv4) · IPv6: udp 547 in use by …` when one
+    /// runs and the other failed; `IPv4: … · IPv6: …` when both failed. nil when none failed.
+    static func dhcpProblem(_ listeners: [ListenerStatus]) -> String? {
+        func family(_ l: ServeListener) -> String { l == .dhcpv6 ? "IPv6" : "IPv4" }
+        func reason(_ l: ListenerStatus, _ why: String) -> String {
+            let port = l.port ?? Int(l.configuredPort)
+            if let holder = PortProbe.holderName(in: why) {
+                return holder.hasPrefix("not visible")
+                    ? "udp \(port) in use (\(holder))"
+                    : "udp \(port) in use by \(holder)"
+            }
+            // `DHCPv6 udp 547: …` → `…`.
+            if let colon = why.range(of: ": "), why.hasPrefix(l.listener.shortName + " ") {
+                return String(why[colon.upperBound...])
+            }
+            return why
+        }
+        var running: [String] = []
+        var failed: [String] = []
+        for l in listeners {
+            switch l.state {
+            case .running: running.append(family(l.listener))
+            case .failed(let why): failed.append("\(family(l.listener)): \(reason(l, why))")
+            default: break
+            }
+        }
+        guard !failed.isEmpty else { return nil }
+        let head = running.isEmpty ? [] : ["Running (\(running.joined(separator: ", ")))"]
+        return (head + failed).joined(separator: " · ")
     }
 }
 

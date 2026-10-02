@@ -45,26 +45,27 @@ struct ServicesView: View {
                         Button("Change ports in Settings…") { openSettings() }
                             .buttonStyle(.quietLink)
                     }
-                    ForEach(status.notes, id: \.self) { note in
-                        QuietNote(note)
-                    }
                 }
                 .padding(.top, 20)
             }
         }
     }
 
-    /// "Devices reach this Mac at 192.168.1.155 on Wi-Fi. You can change this in Settings."
+    /// "Devices reach this Mac at 192.168.1.155 on Wi-Fi (this Mac has 3 addresses). You can
+    /// change this in Settings." The one place on the page that says the address (owner, 2 Oct
+    /// 2026: no footer note repeating it).
     static func subtitle(_ status: ServerStatus) -> String {
         guard let ip = status.advertisedIPv4 else {
             return "Devices are told this Mac's address once the services run. You can choose it in Settings."
         }
         let on = status.advertisedInterfaceName.map { " on \($0)" } ?? ""
-        return "Devices reach this Mac at \(ip)\(on). You can change this in Settings."
+        let several = status.addresses.count > 1 ? " (this Mac has \(status.addresses.count) addresses)" : ""
+        return "Devices reach this Mac at \(ip)\(on)\(several). You can change this in Settings."
     }
 }
 
-/// "Everything is running · DNS, Kerberos, …" as one quiet line, the problem colour when not.
+/// "Everything is running" as one quiet line (the rows below name the services); with a
+/// problem, what is not running after it, in the problem color.
 struct ServicesHeadline: View {
     @Environment(AppModel.self) private var model
 
@@ -75,11 +76,13 @@ struct ServicesHeadline: View {
             Text(status.statusTitle)
                 .font(Theme.emphasis)
                 .foregroundStyle(trouble ? Theme.attention : Theme.ink)
-            Text(status.statusSubtitle)
-                .font(Theme.detail)
-                .foregroundStyle(Theme.muted)
-                .lineLimit(1)
-                .truncationMode(.tail)
+            if trouble || status.phase != .running {
+                Text(status.statusSubtitle)
+                    .font(Theme.detail)
+                    .foregroundStyle(Theme.muted)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
@@ -106,13 +109,21 @@ struct ServiceRow: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: 360, alignment: .trailing)
                     .multilineTextAlignment(.trailing)
-                Button(row.state == .restarting ? "Restarting…" : "Restart") {
+                // Stop one service (owner, 1 Oct 2026); a stopped row offers Start instead.
+                if row.canStop {
+                    Button("Stop") { confirmStop = true }
+                        .buttonStyle(.quietLink)
+                        .disabled(model.controller.status.isBusy)
+                        .help("Stop \(row.service.title); the other services keep running")
+                        .accessibilityLabel("Stop \(row.service.title)")
+                }
+                Button(restartTitle) {
                     Task { await model.controller.restartService(row.service) }
                 }
                 .buttonStyle(.quietLink)
                 .disabled(!row.canRestart || !model.controller.isRunning && model.controller.status.phase != .problem)
                 .help(helpText)
-                .accessibilityLabel(row.state == .restarting ? "Restarting \(row.service.title)" : "Restart \(row.service.title)")
+                .accessibilityLabel("\(restartTitle) \(row.service.title)")
                 .accessibilityHint(helpText)
             }
             .contentShape(Rectangle())
@@ -126,11 +137,22 @@ struct ServiceRow: View {
                         .font(Theme.detail)
                         .foregroundStyle(Theme.muted)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text(row.state == .off ? "Off in Settings ▸ Directory (Let devices join the domain)" : row.portsText)
+                    Text(row.state == .off ? offText : row.portsText)
                         .font(Theme.caption.monospaced())
                         .foregroundStyle(Theme.muted)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
+                    if let detail = row.detail {
+                        Text(detail)
+                            .font(Theme.detail)
+                            .foregroundStyle(Theme.muted)
+                            .textSelection(.enabled)
+                    }
+                    if row.service == .dhcp {
+                        Button(row.state == .off ? "Add a scope on the DHCP page" : "Open the DHCP page") { model.selection = .dhcp }
+                            .buttonStyle(.quietLink)
+                            .padding(.top, 2)
+                    }
                     if let note = row.note {
                         QuietNote(note)
                     }
@@ -144,9 +166,47 @@ struct ServiceRow: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(row.service.title), \(row.stateLabel)")
+        .alert("Stop \(row.service.title)?", isPresented: $confirmStop) {
+            Button("Stop", role: .destructive) {
+                Task { await model.controller.stopService(row.service) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(stopMessage)
+        }
     }
 
-    /// The state as words: "Running since 14:02", "Restarted at 14:05:11", the problem in attention.
+    @State private var confirmStop = false
+
+    private var restartTitle: String {
+        switch row.state {
+        case .restarting: "Restarting…"
+        case .stopped where model.controller.isRunning: "Start"
+        default: "Restart"
+        }
+    }
+
+    /// Why a row is off, where to turn it on.
+    private var offText: String {
+        row.service == .dhcp
+            ? "Off until a scope exists: DHCP starts with the first scope on the DHCP page."
+            : "Off in Settings ▸ System (Let devices join the domain)"
+    }
+
+    /// What stopping this service means for devices, in one or two sentences.
+    private var stopMessage: String {
+        if row.service == .dhcp {
+            return "\(row.service.summary) While it is stopped, relayed requests get no answer from LabDC: clients keep the "
+                + "addresses they hold until their lease runs out. New scopes do not start it; Start on this row (or reopening LabDC) does."
+        }
+        var s = "\(row.service.summary) Devices that need it fail until you start it again (Start on this row, Restart all, or reopening LabDC)."
+        if !row.stopAlsoAffects.isEmpty {
+            s += " Also stops " + row.stopAlsoAffects.map(\.title).joined(separator: ", ") + " (same server)."
+        }
+        return s
+    }
+
+    /// The state as words: "Running since 14:02", "Restarted at 14:05", the problem in attention.
     @ViewBuilder private var stateText: some View {
         if let message = row.problemMessage {
             StateText(text: message, attention: true)
@@ -163,7 +223,8 @@ struct ServiceRow: View {
 
     private var runningText: String {
         if let last = row.lastRestart, last.succeeded {
-            return "Restarted at \(last.date.activityStamp)"
+            // The same short time as "Running since" (owner, 2 Oct 2026).
+            return "Restarted at \(last.date.formatted(date: .omitted, time: .shortened))"
         }
         if let started = model.controller.status.startedAt {
             return "Running since \(started.formatted(date: .omitted, time: .shortened))"

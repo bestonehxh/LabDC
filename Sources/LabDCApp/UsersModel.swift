@@ -21,6 +21,14 @@ final class UsersModel {
             case .computers: "Computers"
             }
         }
+        /// "person", "group", "computer": one of them, without a count ("Select a person …").
+        var noun: String {
+            switch self {
+            case .people: "person"
+            case .groups: "group"
+            case .computers: "computer"
+            }
+        }
         /// "3 people", "1 group".
         func count(_ n: Int) -> String {
             switch self {
@@ -151,12 +159,10 @@ final class UsersModel {
 
     var currentFolder: DirectoryFolder { snapshot.folder(folderID) ?? snapshot.root }
 
-    /// Under the table: `Folder (OU): Staff / IT · 3 people`.
+    /// Under the table, only the hint (owner, 2 Oct 2026: the folder chip already shows the
+    /// folder and its count); empty for groups, which are not dragged.
     var footer: String {
-        let where_ = currentFolder.kind == .domain ? "All folders" : "Folder (OU): \(currentFolder.path)"
-        var s = "\(where_) · \(tab.count(rowCount))"
-        if tab != .groups { s += " · Drag onto a folder to move, ⌘Z to undo" }
-        return s
+        tab == .groups ? "" : "Drag onto a folder to move, ⌘Z to undo"
     }
 
     // MARK: Inspector

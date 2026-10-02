@@ -174,7 +174,7 @@ struct LogPage: View {
                     Button("Export…") { log.export() }
                         .buttonStyle(.quietLink)
                         .help("Save the lines shown to a file")
-                    Button("Log folder") { model.openLogFolder() }
+                    Button("Open log folder") { model.openLogFolder() }
                         .buttonStyle(.quietLink)
                         .help("Open the folder with one log file per day")
                 }

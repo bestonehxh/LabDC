@@ -1,5 +1,6 @@
 // NIOSSL loading helpers. Kept in their own file so the NIOSSL dependency can be split into a
 // separate target later without touching LabPKI itself.
+import AuthKit
 import NIOSSL
 
 extension LabPKI {
@@ -47,5 +48,14 @@ extension LabPKI {
         )
         configuration.minimumTLSVersion = .tlsv12
         return configuration
+    }
+}
+
+extension TLSConfiguration {
+    /// The `tls-server-end-point` channel binding (RFC 5929) of the leaf certificate this server
+    /// configuration presents, for Extended Protection (EPA) checks. nil without a certificate.
+    public var tlsServerEndPoint: ChannelBindings? {
+        guard case .certificate(let leaf)? = certificateChain.first, let der = try? leaf.toDERBytes() else { return nil }
+        return ChannelBindings.tlsServerEndPoint(certificateDER: der)
     }
 }

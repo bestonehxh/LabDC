@@ -74,11 +74,11 @@ struct AdvertisedInterfaceSetting: View {
         }
     }
 
+    /// What the choice means; not the address again, the picker beside it shows that (owner, 2 Oct 2026).
     private func caption(_ status: ServerStatus) -> String {
-        let now = status.advertisedLabel.map { "Devices are told \($0). " } ?? ""
-        return now + (model.controller.settings.advertise == nil
+        model.controller.settings.advertise == nil
             ? "Automatic follows this Mac's network: a VPN or Wi-Fi change is picked up within 30 seconds."
-            : "Pinned: DNS, the domain locator and NetBIOS always hand out this address.")
+            : "Pinned: DNS, the domain locator and NetBIOS always hand out this address."
     }
 
     private func apply(_ ipv4: String?) {

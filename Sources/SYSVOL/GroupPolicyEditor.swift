@@ -265,19 +265,119 @@ extension GroupPolicyEditor {
     /// PCs — stays and Windows never sees a second policy after the rename to LabDC (1 Oct 2026).
     func keepingFormerName(_ policy: Dot1XPolicy, container: String) async throws -> Dot1XPolicy {
         guard policy.name == Dot1XPolicy.defaultName else { return policy }
+        var kept = policy
+        kept.name = try await appPolicyName(container: container)
+        return kept
+    }
+
+    /// The CN the app publishes under in `container`: `LabDC 802.1X`, or a former default when
+    /// only that object exists.
+    func appPolicyName(container: String) async throws -> String {
         let parent = try await dot1XContainerDN(container)
-        guard try await store.id(of: parent.child(RDN("CN", policy.name))) == nil else { return policy }
+        guard try await store.id(of: parent.child(RDN("CN", Dot1XPolicy.defaultName))) == nil else { return Dot1XPolicy.defaultName }
         for former in Dot1XPolicy.formerDefaultNames where try await store.id(of: parent.child(RDN("CN", former))) != nil {
-            var kept = policy
-            kept.name = former
-            return kept
+            return former
         }
-        return policy
+        return Dot1XPolicy.defaultName
     }
 
     private func setPolicy(_ name: String, container: String, objectClass: String,
                            guidAttribute: String, dataAttribute: String, data: String,
                            description: String, extension ext: (cse: String, tool: String), service: String) async throws {
+        try await writePolicyObject(name, container: container, objectClass: objectClass, guidAttribute: guidAttribute,
+                                    dataAttribute: dataAttribute, data: data, description: description)
+        try writeServiceStartup([service: 2], gpo: try await folder(.defaultDomainPolicy))
+        try await bumpMachineVersion(.defaultDomainPolicy, extensions: [ext, (GPOExtensionNames.securityCSE, GPOExtensionNames.securityTool)])
+    }
+
+    /// Group Policy page (1 Oct 2026): publishes the wireless profiles as one `<WLANPolicy>` (one
+    /// `<WLANProfile>` each, in order) named `wirelessName` / `wirelessDescription`, and the wired
+    /// profile as one `<LANPolicy>` (its `name` / `policyDescription`), in the app's policy
+    /// objects (`LabDC 802.1X`, or the SheepAuth-era object updated in place). The objects keep
+    /// their CN and GUID whatever the policy is named. An empty wireless list / nil wired removes
+    /// that object. WLAN AutoConfig / Wired AutoConfig are set to Automatic for what is published,
+    /// and the machine version is bumped once for the whole publish.
+    @discardableResult
+    public func publishDot1X(wireless: [Dot1XPolicy], wired: Dot1XPolicy?,
+                             wirelessName: String = Dot1XPolicy.defaultName,
+                             wirelessDescription: String = Dot1XProfileSet.defaultDescription) async throws -> GPOVersion {
+        var seen = Set<String>()
+        for p in wireless {
+            try p.validate()
+            let name = p.profileName ?? p.ssid
+            guard seen.insert(name).inserted else { throw Dot1XPolicy.Invalid.duplicateProfile(name) }
+        }
+        try await ensureDefaultGPOs()
+        let wlanName = try await appPolicyName(container: "IEEE80211")
+        let lanName = try await appPolicyName(container: "IEEE8023")
+        var extensions: [(cse: String, tool: String)] = []
+        var services: [String: Int] = [:]
+        var removing: [String] = []
+        if wireless.isEmpty {
+            try await deletePolicyObject(wlanName, container: "IEEE80211")
+            if try await containerIsEmpty("IEEE80211") { removing.append(GPOExtensionNames.wirelessCSE) }
+        } else {
+            try await writePolicyObject(wlanName, container: "IEEE80211", objectClass: "ms-net-ieee-80211-GroupPolicy",
+                                        guidAttribute: "ms-net-ieee-80211-GP-PolicyGUID",
+                                        dataAttribute: "ms-net-ieee-80211-GP-PolicyData",
+                                        data: Dot1XPolicy.wirelessPolicyXML(name: wirelessName, description: wirelessDescription,
+                                                                            profiles: wireless),
+                                        description: wirelessDescription)
+            extensions.append((GPOExtensionNames.wirelessCSE, GPOExtensionNames.wirelessTool))
+            services["Wlansvc"] = 2
+        }
+        if let wired {
+            try await writePolicyObject(lanName, container: "IEEE8023", objectClass: "ms-net-ieee-8023-GroupPolicy",
+                                        guidAttribute: "ms-net-ieee-8023-GP-PolicyGUID",
+                                        dataAttribute: "ms-net-ieee-8023-GP-PolicyData",
+                                        data: wired.wiredXML, description: wired.description)
+            extensions.append((GPOExtensionNames.wiredCSE, GPOExtensionNames.wiredTool))
+            services["dot3svc"] = 2
+        } else {
+            try await deletePolicyObject(lanName, container: "IEEE8023")
+            if try await containerIsEmpty("IEEE8023") { removing.append(GPOExtensionNames.wiredCSE) }
+        }
+        if !services.isEmpty {
+            try writeServiceStartup(services, gpo: try await folder(.defaultDomainPolicy))
+            extensions.append((GPOExtensionNames.securityCSE, GPOExtensionNames.securityTool))
+        }
+        let version = try await bumpMachineVersion(.defaultDomainPolicy, extensions: extensions, removing: removing)
+        Self.logger.notice("""
+            GPO 802.1X published: \(wireless.count) wireless profile(s), wired \(wired == nil ? "off" : "on", privacy: .public), \
+            version \(version.raw)
+            """)
+        return version
+    }
+
+    /// What the app's policy objects carry now (parsed from their XML), and the policy XML of
+    /// each (nil when that object does not exist).
+    public func publishedDot1XProfiles() async throws -> (set: Dot1XProfileSet, wirelessXML: String?, wiredXML: String?) {
+        var xml: [String: String] = [:]
+        for (container, attribute) in [("IEEE80211", "ms-net-ieee-80211-GP-PolicyData"), ("IEEE8023", "ms-net-ieee-8023-GP-PolicyData")] {
+            let dn = try await dot1XContainerDN(container).child(RDN("CN", try await appPolicyName(container: container)))
+            if let data = try await store.read(dn: dn)?.string(attribute) { xml[container] = data }
+        }
+        let dc = try? await store.domainInfo().dcDNSName
+        return (Dot1XProfileSet.parse(wirelessXML: xml["IEEE80211"], wiredXML: xml["IEEE8023"], labServerName: dc),
+                xml["IEEE80211"], xml["IEEE8023"])
+    }
+
+    /// No policy object left under `container` (another made with GPMC keeps its CSE listed).
+    private func containerIsEmpty(_ container: String) async throws -> Bool {
+        guard let window = try await store.read(dn: try await dot1XContainerDN(container)) else { return true }
+        return try await store.children(of: window.id).isEmpty
+    }
+
+    private func deletePolicyObject(_ name: String, container: String) async throws {
+        let dn = try await dot1XContainerDN(container).child(RDN("CN", name))
+        if let id = try await store.id(of: dn) { try await store.delete(id: id) }
+    }
+
+    /// Creates or updates one policy object (the container chain under CN=Machine as needed),
+    /// keeping its GUID. No version bump.
+    private func writePolicyObject(_ name: String, container: String, objectClass: String,
+                                   guidAttribute: String, dataAttribute: String, data: String,
+                                   description: String) async throws {
         try await ensureDefaultGPOs()
         let gpoDN = DefaultGPO.defaultDomainPolicy.dn(domainDN: try await store.domainInfo().domainDN)
         // An earlier build wrote the objects outside CN=Machine, where no client looks.
@@ -291,8 +391,10 @@ extension GroupPolicyEditor {
             parent = dn
         }
         let policyDN = parent.child(RDN("CN", name))
-        // The policy GUID is the profile's identity on the clients: minted once (braced), kept on
-        // every update — a new GUID each time made Windows treat each publish as a new policy.
+        // The policy GUID is minted once (braced) and kept on every update, as [MS-GPWL] §3.1.4.2
+        // modifies the existing object. Windows 10 downloads a changed policy at gpupdate but WLAN
+        // AutoConfig applies changes to a profile it already has only after it restarts — with
+        // the same GUID or a new one (tested 2 Oct 2026); new or renamed profiles apply at once.
         var attributes: [String: [String]] = [dataAttribute: [data], "description": [description]]
         if let existing = try await store.read(dn: policyDN) {
             if existing.string(guidAttribute) == nil { attributes[guidAttribute] = ["{\(UUID().uuidString)}"] }
@@ -301,8 +403,6 @@ extension GroupPolicyEditor {
             attributes[guidAttribute] = ["{\(UUID().uuidString)}"]
             _ = try await store.create(parent: parent, rdn: RDN("CN", name), objectClass: objectClass, strings: attributes)
         }
-        try writeServiceStartup([service: 2], gpo: try await folder(.defaultDomainPolicy))
-        try await bumpMachineVersion(.defaultDomainPolicy, extensions: [ext, (GPOExtensionNames.securityCSE, GPOExtensionNames.securityTool)])
     }
 
     private func removeLegacyDot1X(_ container: String, gpoDN: DN) async throws {
@@ -316,12 +416,17 @@ extension GroupPolicyEditor {
     /// then GPT.INI — MS-GPOL §3.3.5.2/§3.3.5.4) so clients re-read a policy that lives in the
     /// directory (802.1X), not in a Registry.pol.
     @discardableResult
-    func bumpMachineVersion(_ gpo: DefaultGPO, extensions: [(cse: String, tool: String)] = []) async throws -> GPOVersion {
+    /// `removing`: CSEs whose settings left the GPO — a CSE still listed with nothing to read
+    /// fails on the clients ("Windows failed to apply the Wireless Group Policy settings"), and
+    /// once it is gone Windows removes what that CSE applied, like GPMC's delete.
+    func bumpMachineVersion(_ gpo: DefaultGPO, extensions: [(cse: String, tool: String)] = [],
+                            removing: [String] = []) async throws -> GPOVersion {
         try await ensureDefaultGPOs()
         let current = try await state(gpo)
         let version = GPOVersion.newest(current.containerVersion, current.fileVersion).bumped(machine: true, user: false)
         var ops: [ModifyOp] = [.replace("versionNumber", strings: [version.directoryText])]
         var names = current.machineExtensions
+        for cse in removing { names.remove(cse: cse) }
         for ext in extensions where !names.contains(cse: ext.cse, tool: ext.tool) { names.add(cse: ext.cse, tools: [ext.tool]) }
         if names != current.machineExtensions { ops.append(.replace("gPCMachineExtensionNames", strings: [names.description])) }
         guard let id = try await store.id(of: current.dn) else { throw GroupPolicyError.missingGPO(current.dn.description) }
@@ -377,6 +482,22 @@ extension GroupPolicyEditor {
 
     /// Removes the 802.1X policy objects (wireless and wired) and bumps the version so clients
     /// drop the profiles.
+    /// Startup repair: a wireless/wired CSE listed in the Default Domain Policy with no policy
+    /// object under it (an earlier LabDC removed the object only) fails gpupdate on every PC.
+    /// Drops such CSEs and bumps the version so Windows removes the stale profiles. Returns the
+    /// CSEs removed (empty: nothing to do, no bump).
+    @discardableResult
+    public func dropOrphanDot1XExtensions() async throws -> [String] {
+        let current = try await state(.defaultDomainPolicy)
+        var orphans: [String] = []
+        for (cse, container) in [(GPOExtensionNames.wirelessCSE, "IEEE80211"), (GPOExtensionNames.wiredCSE, "IEEE8023")]
+        where current.machineExtensions.contains(cse: cse) {
+            if try await containerIsEmpty(container) { orphans.append(cse) }
+        }
+        if !orphans.isEmpty { try await bumpMachineVersion(.defaultDomainPolicy, removing: orphans) }
+        return orphans
+    }
+
     public func remove80211Policies() async throws {
         let gpoDN = DefaultGPO.defaultDomainPolicy.dn(domainDN: try await store.domainInfo().domainDN)
         for container in ["IEEE80211", "IEEE8023"] {
@@ -386,6 +507,6 @@ extension GroupPolicyEditor {
                 try? await store.delete(id: child.id)
             }
         }
-        try await bumpMachineVersion(.defaultDomainPolicy)
+        try await bumpMachineVersion(.defaultDomainPolicy, removing: [GPOExtensionNames.wirelessCSE, GPOExtensionNames.wiredCSE])
     }
 }

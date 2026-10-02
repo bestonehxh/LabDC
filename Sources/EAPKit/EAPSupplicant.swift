@@ -58,6 +58,10 @@ public final class EAPSupplicant {
     public var cryptoBinding = true
     /// The TLS 1.2 suites to offer (BoringSSL cipher-list syntax) instead of the default list.
     public var tls12Ciphers: String?
+    /// Behave like a device without ECDSA support (RSA suites and signature schemes only).
+    public var rsaOnly = false
+    /// The lowest TLS version offered (a legacy device: 0x0301).
+    public var minTLS: UInt16 = 0x0303
     private var engine: TLSEngine?
     private var inbound: [UInt8] = []
     private var pending: [TLSMethodMessage] = []
@@ -108,10 +112,10 @@ public final class EAPSupplicant {
             switch method {
             case .tls(let chain, let key):
                 ctx = try TLSContext(isServer: false, chain: chain, privateKeyDER: key, maxVersion: maxTLS, suiteBClient: suiteB,
-                                     cipherList: tls12Ciphers)
+                                     rsaOnlyClient: rsaOnly, minVersion: minTLS, cipherList: tls12Ciphers)
             default:
                 ctx = try TLSContext(isServer: false, chain: [], privateKeyDER: nil, maxVersion: maxTLS, suiteBClient: suiteB,
-                                     cipherList: tls12Ciphers)
+                                     rsaOnlyClient: rsaOnly, minVersion: minTLS, cipherList: tls12Ciphers)
             }
             let e = try TLSEngine(context: ctx, isServer: false, eapType: type, resume: resume)
             engine = e

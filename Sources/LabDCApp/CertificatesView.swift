@@ -34,18 +34,8 @@ struct CertificatesView: View {
 }
 
 extension CertificatesSection {
-    /// The tab's word in the Quiet look (the approved mock's wording).
-    var tabTitle: String {
-        switch self {
-        case .ca: "Authority"
-        case .issued: "Issued"
-        case .sign: "Sign a request"
-        case .templates: "Templates"
-        case .trustedRoots: "Trusted roots"
-        case .enrollment: "Enrollment"
-        case .converter: "Converter"
-        }
-    }
+    /// The tab's word in the Quiet look; the same as `title` everywhere (owner, 2 Oct 2026).
+    var tabTitle: String { title }
 }
 
 struct CertificatesDetail: View {

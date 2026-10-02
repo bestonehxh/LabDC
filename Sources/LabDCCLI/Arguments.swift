@@ -45,6 +45,8 @@ public enum CLICommand: Equatable, Sendable {
     case enrollment(data: URL, protocolName: String, EnrollmentCommand)
     /// `labdc radius …` (phase 4a): NAS clients, policies, dry-run test.
     case radius(data: URL, RadiusCommand)
+    /// `labdc dhcp …` (phase 5): scopes, reservations, leases, settings, test, simulate.
+    case dhcp(data: URL, DHCPCommand)
     case help
 }
 
@@ -54,7 +56,9 @@ public enum CLIParser {
           labdc serve [--data <dir>] [--provision realm=LAB.SHEEP dns=lab.sheep netbios=LABSHEEP dc=dc1 admin-password=<pw>]
                           [--ports dns=53,kdc=88,kpasswd=464,ldap=389,ldaps=636,gc=3268,gcs=3269,cldap=389,smb=445,sntp=123,epm=135,rpc=0,http=80,est=8443,https=443,nbns=137,nbss=139]
                           [--no-dns] [--no-smb] [--no-sntp] [--no-rpc-tcp] [--no-http] [--no-est] [--no-https] [--netbios] [--no-radius]
-                          [--advertise <ipv4>] [--forwarders system|<ip>[:port],…] [--verbose]
+                          [--no-dhcp] [--no-dhcpv6]
+                          [--advertise <ipv4>] [--forwarders system|<ip>[:port],…] [--dns-allow <cidr>,…]
+                          [--dns-updates secure|nonsecure|off] [--verbose]
                           [--ntlm-auth ntlmv2-only|mschapv2-and-ntlmv2-only|yes]
           labdc user add <sam> --password <pw> [--upn <upn>] [--ou <dn>] [--groups g1,g2] [--data <dir>]
           labdc user passwd <sam> --password <pw> [--data <dir>]
@@ -69,12 +73,14 @@ public enum CLIParser {
         \(CLIParser.pkiUsage)
         \(CLIParser.enrollmentUsage)
         \(CLIParser.radiusUsage)
+        \(CLIParser.dhcpUsage)
         \(CertCLIParser.usage)
 
         --data defaults to ~/Library/Application Support/LabDC (lab.sqlite and pki/ live there).
         Everything except serve works on the store file directly and may run while serve runs.
         serve leaves NetBIOS (nbns udp 137, nbss tcp 139) off unless --netbios is given (--no-netbios
-        is still accepted and changes nothing); RADIUS (udp 1812/1813) always runs unless --no-radius.
+        is still accepted and changes nothing); RADIUS (udp 1812/1813) always runs unless --no-radius; DHCP
+        (udp 67 + 547, ports dhcp= / dhcpv6=) runs once a scope exists unless --no-dhcp (--no-dhcpv6: v4 only).
         """
 
     /// `~/Library/Application Support/LabDC`.
@@ -148,6 +154,8 @@ public enum CLIParser {
             return try parseEnrollment(rest, protocolName: command, defaultData: defaultData)
         case "radius":
             return try parseRadius(rest, defaultData: defaultData)
+        case "dhcp":
+            return try parseDHCP(rest, defaultData: defaultData)
         default:
             throw CLIError.usage("unknown command \(command)")
         }
@@ -194,6 +202,10 @@ public enum CLIParser {
                 // RADIUS is on by default with the directory; --no-radius is for tests/scripts
                 // (--radius stays accepted for older scripts).
                 options.radiusEnabled = arg == "--radius"
+            case "--no-dhcp":
+                options.dhcpEnabled = false
+            case "--no-dhcpv6":
+                options.dhcpV6Enabled = false
             case "--netbios", "--no-netbios":
                 // Off by default (macOS's netbiosd owns 137 and nothing in the join needs it);
                 // --no-netbios stays for older scripts.
@@ -205,6 +217,21 @@ public enum CLIParser {
                 do { options.dnsForwarding = try DNSForwarding(parsing: text) } catch {
                     throw CLIError.usage("--forwarders: \(error)")
                 }
+            case "--dns-allow":
+                // Networks besides this Mac's own and the DHCP scopes that may resolve names
+                // outside the domain through this DNS, e.g. --dns-allow 10.8.0.0/16,fd00::/64.
+                let text = try value(arg)
+                do { options.dnsAllowedClients = try DNSNetwork.parseList(text) } catch {
+                    throw CLIError.usage("--dns-allow: \(error)")
+                }
+            case "--dns-updates":
+                // Dynamic DNS updates: nonsecure (GSS-TSIG plus unsigned own-address updates, the
+                // default), secure (GSS-TSIG only; unsigned ones are REFUSED) or off.
+                let v = try value(arg)
+                guard let mode = DNSDynamicUpdateMode(argument: v) else {
+                    throw CLIError.usage("--dns-updates takes secure, nonsecure or off, not \(v)")
+                }
+                options.dnsUpdateMode = mode
             case "--advertise":
                 let address = try value(arg)
                 guard isIPv4(address) else { throw CLIError.usage("--advertise needs a dotted IPv4 address, not \(address)") }

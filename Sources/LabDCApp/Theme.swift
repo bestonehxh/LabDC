@@ -22,6 +22,8 @@ enum Theme {
     static let control = dynamic(light: 0xD9D7D0, dark: 0x3A3A38)
     /// The one warning colour: what went wrong, destructive actions.
     static let attention = dynamic(light: 0x9B3B2E, dark: 0xE08A7C)
+    /// An action waiting to be taken (Group Policy ▸ Publish changes): the icon's bubble green.
+    static let go = dynamic(light: 0x2F7D4E, dark: 0x6FCB92)
     /// Inset fill for code and copyable values.
     static let inset = dynamic(light: 0xF1EFEA, dark: 0x1E1E1D)
     /// The selected row of a table (with a 2 pt ink edge on the left).
@@ -199,12 +201,15 @@ struct QuietField<Value: View>: View {
 struct QuietLinkStyle: ButtonStyle {
     var role: ButtonRole?
     var size: CGFloat = 13
+    /// Overrides the ink (or attention) colour, e.g. `Theme.go` for a pending action.
+    var tint: Color?
+    var weight: Font.Weight = .regular
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
-        let color = role == .destructive ? Theme.attention : Theme.ink
+        let color = tint ?? (role == .destructive ? Theme.attention : Theme.ink)
         configuration.label
-            .font(.system(size: size))
+            .font(.system(size: size, weight: weight))
             .foregroundStyle(color)
             .underline(true, color: color.opacity(0.3))
             .opacity(isEnabled ? (configuration.isPressed ? 0.55 : 1) : 0.35)

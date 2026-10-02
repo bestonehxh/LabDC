@@ -27,6 +27,12 @@ public final class HTTPNegotiateAuthenticator: Sendable {
 
     private let makeKerberos: @Sendable () -> KerberosAcceptor
     private let makeNTLM: (@Sendable () -> NTLMServer)?
+    /// Extended Protection for Kerberos (IIS `tokenChecking`): `whenSupported` checks a binding
+    /// the client sent, `always` requires one.
+    public let channelBinding: ChannelBindingPolicy
+    /// ESC8: NTLM is accepted only with a channel binding that matches this TLS connection, so an
+    /// NTLM authentication relayed from elsewhere (PetitPotam → CES) fails. On by default.
+    public let requireNTLMChannelBinding: Bool
 
     private enum Pending: Sendable {
         case spnego(SPNEGOAcceptor)
@@ -43,18 +49,42 @@ public final class HTTPNegotiateAuthenticator: Sendable {
     private let logger = Logger(subsystem: "dev.labdc.app", category: "negotiate")
 
     /// - Parameters: `makeNTLM` nil turns the NTLM fallback off.
-    public init(kerberos: @escaping @Sendable () -> KerberosAcceptor, ntlm: (@Sendable () -> NTLMServer)?) {
+    public init(kerberos: @escaping @Sendable () -> KerberosAcceptor, ntlm: (@Sendable () -> NTLMServer)?,
+                channelBinding: ChannelBindingPolicy = .whenSupported, requireNTLMChannelBinding: Bool = true) {
         makeKerberos = kerberos
         makeNTLM = ntlm
+        self.channelBinding = channelBinding
+        self.requireNTLMChannelBinding = requireNTLMChannelBinding
     }
 
     /// Convenience over one secret source (serve: `StoreSecretSource`).
-    public convenience init(source: any AuthSecretSource, allowNTLM: Bool = true) {
+    public convenience init(source: any AuthSecretSource, allowNTLM: Bool = true,
+                            channelBinding: ChannelBindingPolicy = .whenSupported) {
         let replay = ReplayCache()
         let kerberos: @Sendable () -> KerberosAcceptor = { KerberosAcceptor(source: source, replayCache: replay) }
         var ntlm: (@Sendable () -> NTLMServer)?
         if allowNTLM { ntlm = { NTLMServer(source: source, allowAnonymous: false) } }
-        self.init(kerberos: kerberos, ntlm: ntlm)
+        self.init(kerberos: kerberos, ntlm: ntlm, channelBinding: channelBinding)
+    }
+
+    /// A Kerberos acceptor checking `request`'s channel binding.
+    private func kerberos(for request: PKIHTTPServer.Request) -> KerberosAcceptor {
+        var k = makeKerberos()
+        k.channelBinding = ChannelBindingCheck(policy: channelBinding, expected: request.channelBindings)
+        return k
+    }
+
+    /// An NTLM server for `request`, nil when NTLM is off or (with `requireNTLMChannelBinding`)
+    /// the request did not come over TLS, so there is no channel to bind it to.
+    private func ntlm(for request: PKIHTTPServer.Request) -> NTLMServer? {
+        guard var n = makeNTLM?() else { return nil }
+        if requireNTLMChannelBinding {
+            guard let expected = request.channelBindings else { return nil }
+            n.channelBinding = ChannelBindingCheck(policy: .always, expected: expected)
+        } else {
+            n.channelBinding = ChannelBindingCheck(policy: channelBinding, expected: request.channelBindings)
+        }
+        return n
     }
 
     public func connectionClosed(_ id: UInt64) {
@@ -99,16 +129,18 @@ public final class HTTPNegotiateAuthenticator: Sendable {
                 store(id, pending: nil, now: now)
             case nil:
                 if token.first == 0x60, let (mech, _) = try? GSSFraming.unwrap(token), mech.isKerberos {
-                    let r = try await makeKerberos().accept(token)
+                    let r = try await kerberos(for: request).accept(token)
                     step = Step(done: true, output: r.outputToken, identity: r.identity, mechanism: "Kerberos")
                 } else if token.starts(with: Array("NTLMSSP\0".utf8)) {
-                    guard let makeNTLM else { throw AuthKitError.unsupported("NTLM is disabled") }
-                    var server = makeNTLM()
+                    guard makeNTLM != nil else { throw AuthKitError.unsupported("NTLM is disabled") }
+                    guard var server = ntlm(for: request) else {
+                        throw AuthKitError.unsupported("NTLM needs TLS here (Extended Protection binds it to the channel)")
+                    }
                     let challenge = try server.challenge(for: token)
                     store(id, pending: .ntlm(server, scheme: replyScheme), now: now)
                     return .challenge(header: "\(replyScheme) " + Data(challenge).base64EncodedString(), reason: nil)
                 } else {
-                    var acceptor = SPNEGOAcceptor(kerberos: makeKerberos(), ntlm: makeNTLM?())
+                    var acceptor = SPNEGOAcceptor(kerberos: kerberos(for: request), ntlm: ntlm(for: request))
                     step = try await Self.spnegoStep(&acceptor, token)
                     store(id, pending: step.done ? nil : .spnego(acceptor), now: now)
                 }

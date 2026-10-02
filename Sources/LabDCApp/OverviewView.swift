@@ -17,6 +17,10 @@ struct OverviewView: View {
                     .foregroundStyle(Theme.muted)
                 GreetingHeader()
                     .padding(.top, 6)
+                // "Network needs attention." says why underneath (owner, 1 Oct 2026).
+                if let why = model.controller.status.networkProblem {
+                    QuietNote(why, attention: true).padding(.top, 8)
+                }
                 OverviewNumbers()
                     .padding(.top, 56)
                 NextStepsList()
@@ -83,12 +87,22 @@ struct GreetingHeader: View {
     private var troubled: String? {
         let status = model.controller.status
         if let service = status.services.first(where: { $0.problemMessage != nil }) { return service.service.title }
+        if status.networkProblem != nil { return "Network" }
         if status.phase == .problem { return "LabDC" }
         return nil
     }
 
     /// What the headline says: a real problem first, then a "Try" problem.
     private var shownTrouble: String? { troubled ?? previewTrouble }
+    /// Services stopped with Services ▸ Stop while the rest runs ("Directory", "DNS and Time"):
+    /// not a problem, so the headline says so plainly instead of "needs attention" (owner, 1 Oct 2026).
+    private var stoppedServices: String? {
+        let status = model.controller.status
+        guard status.phase == .running else { return nil }
+        let names = status.services.filter { $0.state == .stopped }.map(\.service.title)
+        guard !names.isEmpty else { return nil }
+        return names.count == 1 ? names[0] : names.dropLast().joined(separator: ", ") + " and " + names.last!
+    }
     private var shownPeriod: GreetingPeriod { previewPeriod ?? period }
     /// Seconds the picture stays (nil = stays); a "Try" with the picture Off uses 5.
     private var artHold: Double? {
@@ -104,7 +118,7 @@ struct GreetingHeader: View {
                 .background(alignment: .bottomTrailing) {
                     // The picture and the wrench both follow what the headline says, so a problem
                     // headline never sits over a greeting picture (owner, 1 Oct 2026).
-                    if !smokeRendering, showGreetingArt, shownTrouble == nil {
+                    if !smokeRendering, showGreetingArt, shownTrouble == nil, stoppedServices == nil {
                         // The artwork view is `bleed` larger on every side than the picture, so its
                         // glows fade out inside the drawing instead of being cut at its edge (owner,
                         // 28 Sep 2026). It stops animating while the window cannot be seen.
@@ -202,6 +216,15 @@ struct GreetingHeader: View {
                 .tracking(-1)
                 .foregroundStyle(Theme.ink)
                 .lineLimit(1)
+                .accessibilityAddTraits(.isHeader)
+        } else if let stopped = stoppedServices {
+            let verb = stopped.contains(" and ") ? "are stopped." : "is stopped."
+            Text("\(stopped) \(Text(verb).foregroundStyle(Theme.muted))")
+                .font(Theme.greeting)
+                .tracking(-1)
+                .foregroundStyle(Theme.ink)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
                 .accessibilityAddTraits(.isHeader)
         } else {
             Text(shownPeriod.greeting)
@@ -413,7 +436,7 @@ struct NextStepsList: View {
         case .connectDevice:
             Button("Connect") { model.selection = .connect }.buttonStyle(.quietLink)
         case .publishCA:
-            Button(publishing ? "Publishing…" : "Publish CA") {
+            Button(publishing ? "Publishing…" : "Publish") {
                 publishing = true
                 publishError = nil
                 Task {
@@ -459,6 +482,8 @@ struct RecentSignIns: View {
                                 .font(Theme.body)
                                 .lineLimit(1)
                                 .truncationMode(.tail)
+                                // The red reason wins over the source when the window is narrow.
+                                .layoutPriority(1)
                             Spacer(minLength: 12)
                             Text(e.from)
                                 .font(Theme.detail)

@@ -24,9 +24,47 @@ public final class SAMRService: RPCInterface, @unchecked Sendable {
     let builtinSID = try! SID(string: "S-1-5-32")
     static let logger = Logger(subsystem: "dev.labdc.app", category: "samr")
 
-    public init(directory: DirectoryStore) { self.directory = directory }
+    /// Wrong old-password counts for SamrUnicodeChangePasswordUser2 (an online password oracle
+    /// otherwise). The DC passes Netlogon's tracker so both paths count towards one lockout.
+    let badPasswords: BadPasswordTracker
+    let lockoutThreshold: Int
+    let lockoutWindow: TimeInterval
+    let lockoutDuration: TimeInterval
+    let clock: @Sendable () -> Date
+
+    public init(directory: DirectoryStore, badPasswords: BadPasswordTracker = BadPasswordTracker(),
+                lockoutThreshold: Int = 20, lockoutWindow: TimeInterval = 900, lockoutDuration: TimeInterval = 900,
+                clock: @escaping @Sendable () -> Date = { Date() }) {
+        self.directory = directory
+        self.badPasswords = badPasswords
+        self.lockoutThreshold = lockoutThreshold
+        self.lockoutWindow = lockoutWindow
+        self.lockoutDuration = lockoutDuration
+        self.clock = clock
+    }
+
+    /// Opnums an anonymous caller may still use: the password change itself proves the old
+    /// password (Windows' "change password" at the logon screen and `smbpasswd -r` make it over a
+    /// null session), and the domain password policy it needs.
+    static let anonymousOpnums: Set<UInt16> = [SAMROpnum.unicodeChangePasswordUser2,
+                                               SAMROpnum.getDomainPasswordInformation]
+
+    /// Null-session SAMR (security audit, 1 Oct 2026): an anonymous identity — a null SMB session,
+    /// or an unauthenticated `ncacn_ip_tcp` bind — may not connect, enumerate or look anything up
+    /// (RestrictAnonymousSAM). A Netlogon schannel binding at integrity/privacy counts as
+    /// authenticated: winbind falls back to schannel over an anonymous SMB session.
+    static func refusesAnonymous(_ context: RPCCallContext, opnum: UInt16) -> Bool {
+        guard context.identity.isAnonymous, !anonymousOpnums.contains(opnum) else { return false }
+        let schannel = context.authType == .schannel
+            && (context.authLevel == .pktIntegrity || context.authLevel == .pktPrivacy)
+        return !schannel
+    }
 
     public func dispatch(opnum: UInt16, input: NDRReader, context: RPCCallContext) async throws -> NDRWriter {
+        if Self.refusesAnonymous(context, opnum: opnum) {
+            Self.logger.info("SAMR opnum \(opnum) denied to anonymous caller from \(context.clientAddress, privacy: .public)")
+            throw RPCError.fault(.accessDenied)
+        }
         switch opnum {
         case SAMROpnum.connect:                 return try await connect(input, ctx: context, variant: .connect)
         case SAMROpnum.connect2:                return try await connect(input, ctx: context, variant: .connect2)

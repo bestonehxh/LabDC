@@ -91,4 +91,6 @@ public final class ServeLog: Sendable {
 public enum ServeRuntimeEvent: Sendable, Equatable {
     /// The interface IPv4 list changed; `advertised` is what DNS/CLDAP/EPM now hand out.
     case addressesChanged(advertised: String?, addresses: [String], pinned: Bool)
+    /// DHCP's listeners changed by themselves (a busy port came free and the retry bound it).
+    case dhcpChanged
 }

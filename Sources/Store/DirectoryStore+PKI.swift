@@ -277,6 +277,14 @@ extension DirectoryStore {
             }
     }
 
+    /// Every CA's stored CRL.
+    public func pkiCRLs() throws -> [PKICRLRow] {
+        try db.query("SELECT ca, crl_number, this_update, next_update, der FROM pki_crls ORDER BY ca").map { r in
+            PKICRLRow(caName: r[0].text ?? "", crlNumber: r[1].int ?? 0, thisUpdate: Self.date(r[2]),
+                      nextUpdate: Self.date(r[3]), der: r[4].blob ?? [])
+        }
+    }
+
     public func savePKICRL(_ row: PKICRLRow) throws {
         try db.run("""
             INSERT INTO pki_crls(ca, crl_number, this_update, next_update, der) VALUES(?, ?, ?, ?, ?)
@@ -357,6 +365,7 @@ extension DirectoryStore {
         if !nasColumns.contains("require_ma") {
             try db.exec("ALTER TABLE radius_nas ADD COLUMN require_ma INTEGER NOT NULL DEFAULT 1")
         }
+        try createRadiusSessionSchema(db)
     }
 
     static func createPKIChallengeSchema(_ db: SQLiteConnection) throws {

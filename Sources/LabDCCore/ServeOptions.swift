@@ -1,8 +1,10 @@
 // UI-1: the `serve` configuration types, moved from LabDCCLI/Arguments.swift into LabDCCore
 // so the CLI and the app share them (CLIParser, in LabDCCLI, still fills them from argv).
 import DNSKit
+import AuthKit
 import Foundation
 import NetlogonService
+import PKIKit
 
 /// A command-line failure: `usage` exits 64 (EX_USAGE) with the usage text, `failure` exits 1.
 public enum CLIError: Error, Equatable, CustomStringConvertible {
@@ -52,6 +54,9 @@ public struct PortSet: Equatable, Sendable {
     /// Phase 4a: RADIUS authentication (udp 1812) and accounting (udp 1813).
     public var radius: UInt16 = 1812
     public var radacct: UInt16 = 1813
+    /// Phase 5: DHCPv4 (udp 67) and DHCPv6 (udp 547).
+    public var dhcp: UInt16 = 67
+    public var dhcpv6: UInt16 = 547
 
     public init() {}
 
@@ -64,11 +69,12 @@ public struct PortSet: Equatable, Sendable {
         p.smb = 0; p.sntp = 0; p.epm = 0; p.rpc = 0; p.http = 0; p.est = 0; p.https = 0
         p.nbns = 0; p.nbss = 0
         p.radius = 0; p.radacct = 0
+        p.dhcp = 0; p.dhcpv6 = 0
         return p
     }
 
     public static let names = ["dns", "kdc", "kpasswd", "ldap", "ldaps", "gc", "gcs", "cldap", "smb", "sntp", "epm", "rpc", "http", "est", "https",
-                               "nbns", "nbss", "radius", "radacct"]
+                               "nbns", "nbss", "radius", "radacct", "dhcp", "dhcpv6"]
 
     /// Applies `dns=53,kdc=88,...` (any subset, any order).
     public mutating func apply(_ spec: String) throws {
@@ -95,6 +101,8 @@ public struct PortSet: Equatable, Sendable {
             case "radius", "rad": radius = port
             case "radacct", "radius-acct": radacct = port
             case "nbss", "netbios-ssn": nbss = port
+            case "dhcp", "dhcp4", "bootps": dhcp = port
+            case "dhcpv6", "dhcp6": dhcpv6 = port
             default: throw CLIError.usage("unknown port name '\(kv[0])' (known: \(Self.names.joined(separator: ", ")))")
             }
         }
@@ -108,8 +116,12 @@ public struct ProvisionSpec: Equatable, Sendable {
     public var netbios: String
     public var dcName: String
     public var adminPassword: String
+    /// The lab CA's key (1 Oct 2026): P-384 by default, P-256 on request (`ca-key=p256`).
+    public var caKeyType: CAKeyType
 
-    public init(realm: String, dnsDomain: String, netbios: String, dcName: String, adminPassword: String) {
+    public init(realm: String, dnsDomain: String, netbios: String, dcName: String, adminPassword: String,
+                caKeyType: CAKeyType = LabPKI.defaultLabCAKeyType) {
+        self.caKeyType = caKeyType
         self.realm = realm
         self.dnsDomain = dnsDomain
         self.netbios = netbios
@@ -119,15 +131,15 @@ public struct ProvisionSpec: Equatable, Sendable {
 
     /// Parses `key=value` tokens. Defaults: `realm` = upper-case `dns`, `dns` = lower-case
     /// `realm`, `netbios` = the first DNS label upper-cased (15 characters at most), `dc` = `dc1`.
-    /// `admin-password` is required.
+    /// `admin-password` is required; `ca-key` is `p384` (default) or `p256`.
     public static func parse(_ tokens: [String]) throws -> ProvisionSpec {
         var kv: [String: String] = [:]
         for token in tokens {
             let parts = token.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
             guard parts.count == 2, !parts[0].isEmpty else { throw CLIError.usage("bad --provision item '\(token)' (want key=value)") }
             let key = parts[0].lowercased()
-            guard ["realm", "dns", "netbios", "dc", "admin-password"].contains(key) else {
-                throw CLIError.usage("unknown --provision key '\(parts[0])' (known: realm, dns, netbios, dc, admin-password)")
+            guard ["realm", "dns", "netbios", "dc", "admin-password", "ca-key"].contains(key) else {
+                throw CLIError.usage("unknown --provision key '\(parts[0])' (known: realm, dns, netbios, dc, admin-password, ca-key)")
             }
             kv[key] = parts[1]
         }
@@ -143,7 +155,14 @@ public struct ProvisionSpec: Equatable, Sendable {
         let dc = (kv["dc"] ?? "dc1").lowercased()
         guard netbios.count <= 15 else { throw CLIError.usage("netbios name '\(netbios)' is longer than 15 characters") }
         guard !dc.contains("."), !dc.isEmpty else { throw CLIError.usage("dc= must be a single host label, like dc1") }
-        return ProvisionSpec(realm: realm, dnsDomain: dns, netbios: netbios, dcName: dc, adminPassword: password)
+        var caKey = LabPKI.defaultLabCAKeyType
+        if let text = kv["ca-key"] {
+            guard let k = CAKeyType(rawValue: text.lowercased().replacingOccurrences(of: "-", with: "")), k == .p256 || k == .p384 else {
+                throw CLIError.usage("ca-key is p384 or p256, not \(text)")
+            }
+            caKey = k
+        }
+        return ProvisionSpec(realm: realm, dnsDomain: dns, netbios: netbios, dcName: dc, adminPassword: password, caKeyType: caKey)
     }
 }
 
@@ -171,8 +190,24 @@ public struct ServeOptions: Equatable, Sendable {
     /// Phase 4a: the RADIUS server (udp 1812/1813). Always on with the directory (owner,
     /// 30 Sep 2026); `labdc serve --no-radius` turns it off for tests and scripts.
     public var radiusEnabled: Bool = true
+    /// Phase 5: the DHCP server (udp 67 + 547). Starts with the directory once a scope exists;
+    /// `labdc serve --no-dhcp` keeps it off. `dhcpV6Enabled` (`--no-dhcpv6`) leaves udp 547 alone.
+    public var dhcpEnabled: Bool = true
+    public var dhcpV6Enabled: Bool = true
+    /// Started by the LabDC app (ServerSettings), not `labdc serve`: messages point at the app's
+    /// settings instead of command-line flags.
+    public var inApp: Bool = false
     /// UI-1 ("Allow plain LDAP"): simple binds with a password on 389 without TLS/StartTLS.
     public var allowPlainLDAP: Bool = true
+    /// "Require LDAP signing": SASL binds on 389 without TLS must sign or seal.
+    public var requireLDAPSigning: Bool = true
+    /// "LDAP channel binding" (EPA) for SASL binds on LDAPS / StartTLS.
+    public var ldapChannelBinding: ChannelBindingPolicy = .whenSupported
+    /// CES / CEP (HTTPS): accept NTLM (always with a channel binding that matches the TLS
+    /// connection — ESC8). Off leaves Kerberos only.
+    public var cesAllowNTLM: Bool = true
+    /// CES / CEP channel binding policy for Kerberos (NTLM always requires one).
+    public var cesChannelBinding: ChannelBindingPolicy = .whenSupported
     /// PK-1: seconds between checks that every CA's CRL is less than a day old; 0 disables.
     public var crlCheckInterval: Double = 3600
     /// The IPv4 DNS publishes for the DC and CLDAP/LDAP pings return (`--advertise`).
@@ -184,6 +219,12 @@ public struct ServeOptions: Equatable, Sendable {
     public var addressCheckInterval: Double
     /// Where DNS sends names outside the domain (`--forwarders`; default this Mac's DNS).
     public var dnsForwarding: DNSForwarding = .system
+    /// Networks besides this Mac's own and the DHCP scopes that may use DNS as a resolver
+    /// (`--dns-allow`); names in the domain are answered for everyone.
+    public var dnsAllowedClients: [DNSNetwork] = []
+    /// Dynamic DNS updates (`--dns-updates secure|nonsecure|off`): GSS-TSIG secure updates from
+    /// domain accounts plus unsigned own-address updates (default), secure only, or none.
+    public var dnsUpdateMode: DNSDynamicUpdateMode = .secureAndNonsecure
 
     public init(dataDirectory: URL, provision: ProvisionSpec? = nil, ports: PortSet = .standard, dnsEnabled: Bool = true,
                 smbEnabled: Bool = true, sntpEnabled: Bool = true, rpcTcpEnabled: Bool = true,

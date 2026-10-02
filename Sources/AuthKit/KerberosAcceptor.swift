@@ -204,6 +204,8 @@ public struct KerberosAcceptor: Sendable {
     public let maxSkew: TimeInterval
     /// Require a PAC in the ticket (a DC always issues one; phase 1 keeps it on).
     public var requirePAC: Bool
+    /// Extended Protection (EPA): the `Bnd` field of the GSS checksum on a TLS connection.
+    public var channelBinding: ChannelBindingCheck = .none
 
     static let logger = Logger(subsystem: "dev.labdc.app", category: "AuthKit")
 
@@ -321,15 +323,29 @@ public struct KerberosAcceptor: Sendable {
             throw AuthKitError.kerberos(code: KerberosErrorCode.krbApErrRepeat, reason: "authenticator replay")
         }
 
-        // 4. GSS checksum (RFC 4121 §4.1.1): Lgth (4 LE) = 16, Bnd (16, ignored), Flags (4 LE), [deleg].
+        // 4. GSS checksum (RFC 4121 §4.1.1): Lgth (4 LE) = 16, Bnd (16), Flags (4 LE), [deleg].
+        //    Bnd is the channel binding hash (EPA); the authenticator is encrypted with the
+        //    session key, so a relay cannot change it. With GSS_C_DELEG_FLAG the client appends
+        //    DlgOpt (2 LE) = 1, Dlgth (2 LE) and Deleg (a KRB-CRED with its forwarded TGT): Windows
+        //    does so for services whose ticket is OK-AS-DELEGATE (CES over Kerberos, 2 Oct 2026).
+        //    LabDC never acts as the client, so the credential is only bounds-checked and
+        //    dropped; anything after it (RFC 4121 Exts) is ignored.
         var requested: GSSContextFlags = []
+        var bindings: [UInt8]?
         if let ck = auth.cksum, ck.cksumtype == Self.gssChecksumType {
             let c = ck.checksum
             guard c.count >= 24, c.le32(0) == 16 else {
                 throw AuthKitError.kerberos(code: KerberosErrorCode.krbApErrInappCksum, reason: "bad GSS checksum")
             }
             requested = GSSContextFlags(rawValue: c.le32(20))
+            bindings = Array(c[4..<20])
+            if requested.contains(.delegate), c.count > 24 {
+                guard c.count >= 28, c.le16(24) == 1, 28 + Int(c.le16(26)) <= c.count else {
+                    throw AuthKitError.kerberos(code: KerberosErrorCode.krbApErrInappCksum, reason: "bad GSS delegation field")
+                }
+            }
         }
+        try channelBinding.verify(bindings, mechanism: "Kerberos")
         if apReq.apOptions.mutualRequired { requested.insert(.mutual) }
         let isDCE = requested.contains(.dceStyle)
         if isDCE && !dceStyle {
@@ -497,11 +513,14 @@ public struct KerberosInitiator: Sendable {
     public init(ticket: Ticket, sessionKey: KerberosKey, client: PrincipalName, realm: String,
                 flags: GSSContextFlags = [.mutual, .replay, .sequence, .confidentiality, .integrity],
                 subkey: KerberosKey?, seq: UInt32, ctime: KerberosTime, cusec: Int32 = 0,
-                mech: GSSMechanism = .kerberos, framed: Bool = true, rng: RandomBytes = RandomBytes()) throws {
+                mech: GSSMechanism = .kerberos, framed: Bool = true, rng: RandomBytes = RandomBytes(),
+                channelBindingHash: [UInt8]? = nil, checksumTail: [UInt8] = []) throws {
         var ck: [UInt8] = []
         ck.appendLE32(16)
-        ck += [UInt8](repeating: 0, count: 16)
+        ck += channelBindingHash ?? [UInt8](repeating: 0, count: 16)
         ck.appendLE32(flags.rawValue)
+        // `checksumTail`: what follows Flags, e.g. the DlgOpt/Dlgth/Deleg field (tests).
+        ck += checksumTail
         let auth = Authenticator(crealm: realm, cname: client,
                                  cksum: Checksum(cksumtype: KerberosAcceptor.gssChecksumType, checksum: ck),
                                  cusec: cusec, ctime: ctime,

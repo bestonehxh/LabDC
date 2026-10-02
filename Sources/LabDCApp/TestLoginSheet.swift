@@ -164,11 +164,11 @@ struct TestLoginContent: View {
                     .padding(.top, 10)
 
                 VStack(alignment: .leading, spacing: 18) {
-                    labeled("User") {
-                        TextField("User", text: $test.user, prompt: Text("alice"))
+                    labeled("Username") {
+                        TextField("Username", text: $test.user, prompt: Text("alice"))
                             .textFieldStyle(.quiet)
                             .textContentType(.username)
-                            .accessibilityLabel("User")
+                            .accessibilityLabel("Username")
                     }
                     labeled("Password") {
                         VStack(spacing: 4) {

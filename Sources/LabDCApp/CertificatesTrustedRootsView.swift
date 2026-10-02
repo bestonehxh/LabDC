@@ -9,6 +9,9 @@ struct CertificatesTrustedRootsView: View {
     @State private var selection: String?
     @State private var confirmRemove: TrustedRootInfo?
     @State private var report: String?
+    /// Files with several certificates, waiting for the pick sheet one after the other.
+    @State private var picking: CertificatePickRequest?
+    @State private var pickQueue: [CertificatePickRequest] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -36,14 +39,14 @@ struct CertificatesTrustedRootsView: View {
                     Text(r.notAfter.map(PKIText.day) ?? "?").font(Theme.detail).foregroundStyle(Theme.muted)
                 }
                 .width(88)
-                TableColumn("In Configuration") { r in
-                    CertStatusText(text: r.publishedInConfiguration ? "Published" : "Group Policy only",
+                TableColumn("Published") { r in
+                    CertStatusText(text: r.publishedInConfiguration ? "Yes" : "Group Policy only",
                                    dimmed: !r.publishedInConfiguration)
                         .accessibilityLabel(r.publishedInConfiguration ? "Published in Configuration" : "Group Policy only")
                 }
                 .width(120)
             }
-            .tableStyle(.inset)
+            .tableStyle(.inset(alternatesRowBackgrounds: false))
             .scrollContentBackground(.hidden)
             .contextMenu(forSelectionType: String.self) { ids in
                 if let r = editor.trustedRoots.first(where: { ids.contains($0.id) }) {
@@ -76,7 +79,7 @@ struct CertificatesTrustedRootsView: View {
             Rectangle().fill(Theme.line).frame(height: 1).padding(.top, 10)
             HStack(alignment: .firstTextBaseline, spacing: 24) {
                 Button("Add a certificate…") {
-                    add(CertificateFiles.choose(multiple: true, message: "Choose root CA certificates (PEM, DER or P7B); every self-signed one is added."))
+                    add(CertificateFiles.choose(multiple: true, message: "Choose certificates (PEM, DER or P7B): a root CA or a server's own certificate. A file with several asks which to add."))
                 }
                 .buttonStyle(.quietLink)
                 Button("Add the current CA") {
@@ -103,6 +106,18 @@ struct CertificatesTrustedRootsView: View {
             add(urls.filter(\.isFileURL))
             return true
         }
+        .sheet(item: $picking, onDismiss: nextPick) { request in
+            CertificatePickSheet(fileName: request.fileName, certificates: request.certificates) { picked in
+                let pick = Dot1XTrustCertificate.Pick.thumbprints(picked.map(\.thumbprint))
+                Task {
+                    var message: String?
+                    await model.perform("Add \(request.fileName)") { e in
+                        message = try await e.addTrustedRoots(from: request.bytes, fileName: request.fileName, pick: pick).message
+                    }
+                    if let message { report = [report, message].compactMap { $0 }.joined(separator: " ") }
+                }
+            }
+        }
         .confirmationDialog("Remove “\(confirmRemove?.title ?? "")” from the trusted roots?",
                             isPresented: Binding(get: { confirmRemove != nil }, set: { if !$0 { confirmRemove = nil } }),
                             presenting: confirmRemove) { r in
@@ -120,6 +135,8 @@ struct CertificatesTrustedRootsView: View {
         return editor.trustedRoots.contains { $0.thumbprint == t }
     }
 
+    /// Any certificate goes, as GPMC's Trusted Root import (1 Oct 2026); a file with several
+    /// asks which ones first.
     private func add(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
         Task {
@@ -127,10 +144,22 @@ struct CertificatesTrustedRootsView: View {
             for url in urls {
                 await model.perform("Add \(url.lastPathComponent)") { e in
                     let bytes = Array(try Data(contentsOf: url))
-                    messages.append(try await e.addTrustedRoots(from: bytes, fileName: url.lastPathComponent).message)
+                    let file = try Dot1XTrustCertificate.candidates(bytes, fileName: url.lastPathComponent)
+                    if file.certificates.count > 1 {
+                        pickQueue.append(CertificatePickRequest(fileName: url.lastPathComponent, certificates: file.certificates,
+                                                                serverNames: file.serverNames, bytes: bytes))
+                    } else {
+                        messages.append(try await e.addTrustedRoots(from: bytes, fileName: url.lastPathComponent).message)
+                    }
                 }
             }
             report = messages.isEmpty ? nil : messages.joined(separator: " ")
+            if picking == nil { nextPick() }
         }
+    }
+
+    private func nextPick() {
+        guard !pickQueue.isEmpty else { return }
+        picking = pickQueue.removeFirst()
     }
 }

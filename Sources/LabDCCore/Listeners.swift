@@ -2,7 +2,7 @@ import Foundation
 
 /// One listening socket group of `serve`, named like the `--ports` keys.
 public enum ServeListener: String, CaseIterable, Sendable, Codable, Identifiable {
-    case dns, kdc, kpasswd, ldap, ldaps, gc, gcs, cldap, smb, sntp, epm, rpc, http, est, https, nbns, nbss, radius, radacct
+    case dns, kdc, kpasswd, ldap, ldaps, gc, gcs, cldap, smb, sntp, epm, rpc, http, est, https, nbns, nbss, radius, radacct, dhcp, dhcpv6
 
     public var id: String { rawValue }
 
@@ -28,6 +28,8 @@ public enum ServeListener: String, CaseIterable, Sendable, Codable, Identifiable
         case .nbss: "NetBIOS session (SMB over 139)"
         case .radius: "RADIUS"
         case .radacct: "RADIUS accounting"
+        case .dhcp: "DHCP"
+        case .dhcpv6: "DHCPv6"
         }
     }
 
@@ -53,13 +55,15 @@ public enum ServeListener: String, CaseIterable, Sendable, Codable, Identifiable
         case .nbss: "NBSS"
         case .radius: "RADIUS"
         case .radacct: "RADIUS acct"
+        case .dhcp: "DHCP"
+        case .dhcpv6: "DHCPv6"
         }
     }
 
     public var transport: String {
         switch self {
         case .dns, .kdc, .kpasswd: "udp+tcp"
-        case .cldap, .sntp, .nbns, .radius, .radacct: "udp"
+        case .cldap, .sntp, .nbns, .radius, .radacct, .dhcp, .dhcpv6: "udp"
         default: "tcp"
         }
     }
@@ -75,11 +79,12 @@ public enum ServeListener: String, CaseIterable, Sendable, Codable, Identifiable
         case .epm, .rpc: "RPC"
         case .http, .est, .https: "HTTP"
         case .radius, .radacct: "RADIUS"
+        case .dhcp, .dhcpv6: "DHCP"
         }
     }
 
     /// The service families in Overview order.
-    public static let services = ["DNS", "Kerberos", "LDAP", "SMB", "RPC", "HTTP", "Time", "RADIUS"]
+    public static let services = ["DNS", "Kerberos", "LDAP", "SMB", "RPC", "HTTP", "Time", "RADIUS", "DHCP"]
 
     /// Listeners that move together (one server object behind them).
     public var restartsWith: [ServeListener] {
@@ -88,6 +93,7 @@ public enum ServeListener: String, CaseIterable, Sendable, Codable, Identifiable
         // NBSS is a second port of the SMB server; NBNS is its own server (restarts alone).
         case .smb, .sntp, .nbss: [.smb, .sntp, .nbss]
         case .epm, .rpc: [.epm, .rpc]
+        case .dhcp, .dhcpv6: [.dhcp, .dhcpv6]
         default: [self]
         }
     }
@@ -102,6 +108,8 @@ public enum ServeListener: String, CaseIterable, Sendable, Codable, Identifiable
         case .sntp: options.sntpEnabled
         case .epm, .rpc: options.rpcTcpEnabled
         case .radius, .radacct: options.radiusEnabled
+        case .dhcp: options.dhcpEnabled
+        case .dhcpv6: options.dhcpEnabled && options.dhcpV6Enabled
         case .http: options.httpEnabled
         case .est: options.estEnabled
         case .https: options.httpsEnabled
@@ -131,6 +139,8 @@ public enum ServeListener: String, CaseIterable, Sendable, Codable, Identifiable
         case .nbss: ports.nbss
         case .radius: ports.radius.map { Int($0) }
         case .radacct: ports.radacct.map { Int($0) }
+        case .dhcp: ports.dhcp
+        case .dhcpv6: ports.dhcpv6
         }
     }
 }
@@ -159,6 +169,8 @@ extension PortSet {
             case .nbss: nbss
             case .radius: radius
             case .radacct: radacct
+            case .dhcp: dhcp
+            case .dhcpv6: dhcpv6
             }
         }
         set {
@@ -182,6 +194,8 @@ extension PortSet {
             case .nbss: nbss = newValue
             case .radius: radius = newValue
             case .radacct: radacct = newValue
+            case .dhcp: dhcp = newValue
+            case .dhcpv6: dhcpv6 = newValue
             }
         }
     }

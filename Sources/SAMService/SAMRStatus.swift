@@ -20,6 +20,7 @@ public enum NTStatus: UInt32, Sendable {
     case noSuchGroup          = 0xC000_0066
     case noSuchAlias          = 0xC000_0151
     case memberNotInGroup     = 0xC000_0068
+    case accountLockedOut     = 0xC000_0234
     case userExists           = 0xC000_0063
     case groupExists          = 0xC000_0065
     case noneMapped           = 0xC000_0073

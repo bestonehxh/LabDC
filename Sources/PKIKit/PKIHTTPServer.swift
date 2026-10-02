@@ -1,3 +1,4 @@
+import AuthKit
 import Foundation
 import NIOConcurrencyHelpers
 import NIOCore
@@ -27,10 +28,14 @@ public final class PKIHTTPServer: Sendable {
         public var isTLS: Bool
         /// Identifies the TCP connection (PK-6: HTTP Negotiate/NTLM authentication is per connection).
         public var connectionID: UInt64
+        /// TLS only: the `tls-server-end-point` binding of the certificate the server presented
+        /// (Extended Protection for the CES / CEP's Negotiate authentication).
+        public var channelBindings: ChannelBindings?
 
         public init(method: String, uri: String, headers: [String: String] = [:], body: [UInt8] = [],
                     remoteAddress: String = "?", peerCertificateDER: [UInt8]? = nil, isTLS: Bool = false,
-                    connectionID: UInt64 = 0) {
+                    connectionID: UInt64 = 0, channelBindings: ChannelBindings? = nil) {
+            self.channelBindings = channelBindings
             self.method = method
             self.uri = uri
             var path = uri
@@ -136,6 +141,7 @@ public final class PKIHTTPServer: Sendable {
         let handler = self.handler
         let onRequest = self.onRequest
         let onClosed = self.onConnectionClosed
+        let bindings = tls?.tlsServerEndPoint
         var bound = requestedPort
         var boundAny = false
         for address in bindAddresses {
@@ -151,7 +157,8 @@ public final class PKIHTTPServer: Sendable {
                         }
                         try channel.pipeline.syncOperations.configureHTTPServerPipeline(withErrorHandling: true)
                         try channel.pipeline.syncOperations.addHandler(
-                            HTTPHandler(handler: handler, onRequest: onRequest, onClosed: onClosed, isTLS: sslContext != nil))
+                            HTTPHandler(handler: handler, onRequest: onRequest, onClosed: onClosed, isTLS: sslContext != nil,
+                                        channelBindings: bindings))
                     }
                 }
             if isV6 {
@@ -210,14 +217,16 @@ private final class HTTPHandler: ChannelInboundHandler, @unchecked Sendable {
     private let onRequest: (@Sendable (String) -> Void)?
     private let onClosed: (@Sendable (UInt64) -> Void)?
     private let isTLS: Bool
+    private let channelBindings: ChannelBindings?
     private let connectionID: UInt64
     private var head: HTTPRequestHead?
     private var body: [UInt8] = []
     private var tooLarge = false
 
     init(handler: @escaping PKIHTTPServer.RequestHandler, onRequest: (@Sendable (String) -> Void)?,
-         onClosed: (@Sendable (UInt64) -> Void)?, isTLS: Bool) {
+         onClosed: (@Sendable (UInt64) -> Void)?, isTLS: Bool, channelBindings: ChannelBindings?) {
         self.handler = handler
+        self.channelBindings = channelBindings
         self.onRequest = onRequest
         self.onClosed = onClosed
         self.isTLS = isTLS
@@ -273,7 +282,8 @@ private final class HTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                 peer = try? ssl.peerCertificate?.toDERBytes()
             }
             let request = PKIHTTPServer.Request(method: method, uri: uri, headers: headers, body: body, remoteAddress: remote,
-                                                peerCertificateDER: peer, isTLS: isTLS, connectionID: connectionID)
+                                                peerCertificateDER: peer, isTLS: isTLS, connectionID: connectionID,
+                                                channelBindings: isTLS ? channelBindings : nil)
             body = []
             let handler = self.handler
             Task {

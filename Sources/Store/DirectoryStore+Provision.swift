@@ -253,8 +253,8 @@ extension DirectoryStore {
                 "ldap/\(host)/ForestDnsZones.\(info.dnsDomain)", "ldap/\(host)/DomainDnsZones.\(info.dnsDomain)",
                 "ldap/\(info.dsaGUID)._msdcs.\(info.dnsDomain)",
                 "GC/\(host)/\(info.dnsDomain)", "RestrictedKrbHost/\(host)", "RestrictedKrbHost/\(info.dcName)",
-                "E3514235-4B06-11D1-AB04-00C04FC2DCD2/\(info.dsaGUID)/\(info.dnsDomain)", "DNS/\(host)",
-            ]),
+                "E3514235-4B06-11D1-AB04-00C04FC2DCD2/\(info.dsaGUID)/\(info.dnsDomain)",
+            ] + Self.dnsServicePrincipalNames(info)),  // GSS-TSIG: members ask for DNS/<dc fqdn>
         ]))
         let machinePassword = String(decoding: rng.next(96).map { UInt8(0x21 + Int($0) % 94) }, as: UTF8.self)
         try setPassword(id: dcAccount, password: machinePassword, enforcePolicy: false)

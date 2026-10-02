@@ -20,6 +20,11 @@ public enum CACommand: Equatable, Sendable {
     case template(name: String, enabled: Bool)
     /// PK-2: sign an external CSR.
     case sign(CASignOptions)
+    /// Change the lab CA key (1 Oct 2026): a new root of `key` issues; `keepOld` keeps the old
+    /// root trusted until `retire`, else it is retired at once (`--now`, the default).
+    case migrate(key: CAKeyType, keepOld: Bool)
+    /// Retire a root that no longer issues (GPO, NTAuth, 802.1X profiles, EAP-TLS).
+    case retire(name: String)
 }
 
 /// `labdc ca sign` (PK-2).
@@ -51,6 +56,8 @@ extension CLIParser {
           labdc ca list | templates [--data <dir>]
           labdc ca template <name> --enable|--disable [--data <dir>]
           labdc ca use <name> [--data <dir>]
+          labdc ca migrate --key p384|p256 [--now | --keep-old] [--data <dir>]
+          labdc ca retire <name> [--data <dir>]
           labdc ca export [--name <ca>] --out <file> [--format pem|der] [--data <dir>]
           labdc ca revoke <serial|cert-file> [--reason key-compromise|superseded|...] [--data <dir>]
           labdc ca crl [--name <ca>] [--out <file>] [--format pem|der] [--data <dir>]
@@ -62,7 +69,7 @@ extension CLIParser {
 
     static func parseCA(_ rest: [String], defaultData: URL) throws -> CLICommand {
         guard let sub = rest.first else {
-            throw CLIError.usage("ca needs create, list, use, export, revoke, crl, issued, templates, template or sign")
+            throw CLIError.usage("ca needs create, list, use, migrate, retire, export, revoke, crl, issued, templates, template or sign")
         }
         var args = Array(rest.dropFirst())
         func format(_ o: Options) throws -> CAExportFormat {
@@ -103,6 +110,19 @@ extension CLIParser {
         case "use":
             let o = try Options(args, valued: ["--data"], positionals: 1)
             return .ca(data: o.data(defaultData), .use(name: o.positionals[0]))
+        case "migrate":
+            let now = args.contains("--now"), keep = args.contains("--keep-old")
+            guard !(now && keep) else { throw CLIError.usage("ca migrate takes --now or --keep-old, not both") }
+            args.removeAll { $0 == "--now" || $0 == "--keep-old" }
+            let o = try Options(args, valued: ["--data", "--key"])
+            let text = try o.required("--key")
+            guard let key = CAKeyType(rawValue: text.lowercased().replacingOccurrences(of: "-", with: "")), key == .p256 || key == .p384 else {
+                throw CLIError.usage("--key is p384 or p256, not \(text)")
+            }
+            return .ca(data: o.data(defaultData), .migrate(key: key, keepOld: keep))
+        case "retire":
+            let o = try Options(args, valued: ["--data"], positionals: 1)
+            return .ca(data: o.data(defaultData), .retire(name: o.positionals[0]))
         case "export":
             let o = try Options(args, valued: ["--data", "--out", "--format", "--name"])
             return .ca(data: o.data(defaultData), .export(name: o.values["--name"], out: try o.required("--out"), format: try format(o)))
@@ -207,6 +227,30 @@ public enum CACommands {
             if FileManager.default.fileExists(atPath: dir.storeURL.path) {
                 try await publish(try await openService(dir, pki: pki), out: out)
             }
+
+        case let .migrate(key, keepOld):
+            let pki = try await openPKI(dir)
+            let service = try await openService(dir, pki: pki)
+            let lines = CALines()
+            let report: LabCASwitch.Report
+            do {
+                report = try await LabCASwitch.change(to: key, keepOldTrusted: keepOld, data: dir, pki: pki, store: service.store,
+                                                      service: service) { lines.append($0) }
+            } catch let e as CLIError { throw e } catch { throw CLIError.failure("\(error)") }
+            lines.all.forEach(out)
+            out("lab CA key changed: \(report.from) -> \(report.to) (\(report.keyType.displayName)); "
+                + (report.oldRootKeptTrusted ? "\(report.from) stays trusted until `labdc ca retire \(report.from)`"
+                   : "\(report.from) retired (\(report.stillActiveOnOldRoot) of its certificates still unexpired)"))
+            out("restart `labdc serve` (or the app) to serve the new DC certificate; Windows PCs re-enrol at gpupdate / the next auto-enrollment pulse")
+
+        case .retire(let name):
+            let pki = try await openPKI(dir)
+            let service = try await openService(dir, pki: pki)
+            let lines = CALines()
+            do {
+                _ = try await LabCASwitch.retire(name: name, data: dir, pki: pki, store: service.store, service: service) { lines.append($0) }
+            } catch let e as CLIError { throw e } catch { throw CLIError.failure("\(error)") }
+            lines.all.forEach(out)
 
         case let .export(name, path, format):
             let pki = try await openPKI(dir)
@@ -392,4 +436,12 @@ public enum CACommands {
     static func stamp(_ date: Date) -> String {
         date.formatted(Date.ISO8601FormatStyle())
     }
+}
+
+/// Lines a `LabCASwitch` step logs (collected off the caller's closure, printed in order).
+final class CALines: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+    func append(_ line: String) { lock.lock(); lines.append(line); lock.unlock() }
+    var all: [String] { lock.lock(); defer { lock.unlock() }; return lines }
 }

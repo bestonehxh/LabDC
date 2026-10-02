@@ -195,7 +195,7 @@ public enum TemplateDirectory {
             "displayName": [s(t.displayName)],
             "showInAdvancedViewOnly": [s("TRUE")],
             "flags": [s(String(generalFlags(t)))],
-            "revision": [s(String(CertificateTemplate.majorVersion))],
+            "revision": [s(String(t.majorRevision))],
             "msPKI-Template-Schema-Version": [s(String(schema))],
             "msPKI-Template-Minor-Revision": [s(String(CertificateTemplate.minorVersion))],
             "msPKI-Cert-Template-OID": [s(t.oid)],

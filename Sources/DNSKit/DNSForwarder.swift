@@ -54,7 +54,15 @@ public actor DNSForwarder {
     private var cache: [CacheKey: CacheEntry] = [:]
     /// Upstream exchanges performed (cache misses), for tests and stats.
     public private(set) var upstreamQueries = 0
+    /// Queries answered by joining an identical one already on its way upstream.
+    public private(set) var joinedQueries = 0
+    private var inFlight: [InFlightKey: Task<DNSMessage, any Error>] = [:]
     private static let logger = Logger(subsystem: "dev.labdc.app", category: "DNS")
+
+    struct InFlightKey: Hashable {
+        var key: CacheKey
+        var checkingDisabled: Bool
+    }
 
     struct CacheKey: Hashable {
         var name: DNSName
@@ -141,8 +149,42 @@ public actor DNSForwarder {
             cache[key] = nil
         }
 
+        // One upstream exchange per (name, type, class, CD) at a time: identical queries arriving
+        // while it runs wait for its answer instead of sending their own. Fewer outstanding
+        // queries with random IDs for the same name shrink a spoofer's birthday-attack surface.
+        let flightKey = InFlightKey(key: key, checkingDisabled: query.checkingDisabled)
+        let flight: Task<DNSMessage, any Error>
+        let leader: Bool
+        if let running = inFlight[flightKey] {
+            flight = running
+            leader = false
+            joinedQueries += 1
+        } else {
+            flight = Task { try await self.fetch(q, checkingDisabled: query.checkingDisabled, key: key) }
+            inFlight[flightKey] = flight
+            leader = true
+        }
+        let reply: DNSMessage
+        do {
+            reply = try await flight.value
+            if leader { inFlight[flightKey] = nil }
+        } catch {
+            if leader { inFlight[flightKey] = nil }
+            throw error
+        }
+        var response = query.responseSkeleton(rcode: reply.rcode)
+        response.recursionAvailable = true
+        response.authenticData = false
+        response.answers = reply.answers
+        response.authority = reply.authority
+        response.additional = reply.additional
+        return response
+    }
+
+    /// Asks the upstreams in turn; caches and returns the first usable reply.
+    private func fetch(_ q: DNSQuestion, checkingDisabled: Bool, key: CacheKey) async throws -> DNSMessage {
         var outbound = DNSMessage(id: UInt16.random(in: 0...UInt16.max), recursionDesired: true,
-                                  checkingDisabled: query.checkingDisabled, questions: [q],
+                                  checkingDisabled: checkingDisabled, questions: [q],
                                   edns: DNSEDNS(udpPayloadSize: 4096))
         var lastError: any Error = DNSKitError.upstream("no upstream configured")
         for upstream in currentPlan().upstreams(for: q.name) {
@@ -154,13 +196,7 @@ public actor DNSForwarder {
                     reply = try await exchange(outbound, with: upstream, tcp: true)
                 }
                 store(reply, key: key)
-                var response = query.responseSkeleton(rcode: reply.rcode)
-                response.recursionAvailable = true
-                response.authenticData = false
-                response.answers = reply.answers
-                response.authority = reply.authority
-                response.additional = reply.additional
-                return response
+                return reply
             } catch {
                 Self.logger.notice("upstream \(upstream, privacy: .public) for \(q.name, privacy: .public): \(String(describing: error), privacy: .public)")
                 lastError = error

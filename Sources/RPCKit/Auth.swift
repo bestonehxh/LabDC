@@ -45,6 +45,9 @@ public protocol RPCAuthProvider: Sendable {
     mutating func bind(authType: RPCAuthType, authData: [UInt8], authLevel: RPCAuthLevel) async throws -> [UInt8]?
     /// True once the security context is complete and per-PDU protection applies.
     var isEstablished: Bool { get }
+    /// The principal the established context is bound to, if the provider names one (Netlogon
+    /// schannel: the secure channel's computer name). Defaults to nil.
+    var boundPrincipal: String? { get }
 
     /// Produces the auth value (signature) for an outgoing PDU whose protected body is `body`
     /// (the request/response header fields + stub, per the provider's covered range).
@@ -55,6 +58,10 @@ public protocol RPCAuthProvider: Sendable {
     func verify(body: [UInt8], auth: [UInt8], sequence: UInt32) throws
     /// Unseals an incoming `body`, returning the plaintext.
     func unseal(body: [UInt8], auth: [UInt8], sequence: UInt32) throws -> [UInt8]
+}
+
+extension RPCAuthProvider {
+    public var boundPrincipal: String? { nil }
 }
 
 /// The no-authentication provider used for RPC over authenticated SMB pipes, where SMB already

@@ -45,6 +45,13 @@ public struct DirectoryServerConfig: Sendable {
     /// UI-1 ("Allow plain LDAP"): false refuses a simple bind with a password on a connection that is
     /// neither TLS nor SASL-sealed (strongerAuthRequired, like AD's LDAP signing requirement).
     public var allowPlainSimpleBind: Bool = true
+    /// "Require LDAP signing" (AD's `LDAPServerIntegrity` = 2): a SASL bind on a connection without
+    /// TLS must negotiate integrity (sign) or confidentiality (seal); one that completes without a
+    /// layer is answered strongerAuthRequired. Simple binds stay governed by `allowPlainSimpleBind`.
+    public var requireLDAPSigning: Bool = true
+    /// "LDAP channel binding" (AD's `LdapEnforceChannelBinding`): how NTLM and Kerberos SASL binds
+    /// over LDAPS / StartTLS must be bound to the TLS channel (EPA).
+    public var ldapChannelBinding: ChannelBindingPolicy = .whenSupported
 
     public init(ldapPort: Int? = 389, ldapsPort: Int? = 636, globalCatalogPort: Int? = 3268,
                 globalCatalogTLSPort: Int? = 3269, bindAddresses: [String] = ["0.0.0.0", "::"],
@@ -94,18 +101,27 @@ final class ServerContext: Sendable {
     let config: DirectoryServerConfig
     let secrets: StoreSecretSource
     let tls: NIOSSLContext?
+    /// `tls-server-end-point` of the certificate `tls` presents (EPA).
+    let channelBindings: ChannelBindings?
     let replayCache = ReplayCache()
     let logger = Logger(subsystem: "dev.labdc.app", category: "LDAP")
 
-    init(store: DirectoryStore, info: DomainInfo, config: DirectoryServerConfig, secrets: StoreSecretSource, tls: NIOSSLContext?) {
+    init(store: DirectoryStore, info: DomainInfo, config: DirectoryServerConfig, secrets: StoreSecretSource, tls: NIOSSLContext?,
+         channelBindings: ChannelBindings? = nil) {
         self.store = store
         self.info = info
         self.config = config
         self.secrets = secrets
         self.tls = tls
+        self.channelBindings = channelBindings
     }
 
     var kerberosAcceptor: KerberosAcceptor { KerberosAcceptor(source: secrets, replayCache: replayCache, clock: config.clock) }
+
+    /// The EPA check of a bind on a connection that is (`tls`) or is not on TLS.
+    func channelBindingCheck(tls: Bool) -> ChannelBindingCheck {
+        tls ? ChannelBindingCheck(policy: config.ldapChannelBinding, expected: channelBindings) : .none
+    }
 }
 
 /// The AD-shaped LDAP server: SwiftNIO listeners for LDAP (389, StartTLS), LDAPS (636) and
@@ -142,14 +158,18 @@ public final class DirectoryServer: Sendable {
         let info = try await store.domainInfo()
         let secrets = try await StoreSecretSource(store: store)
         var tls: NIOSSLContext?
+        var bindings: ChannelBindings?
         if let pki {
             do {
-                tls = try NIOSSLContext(configuration: try await pki.serverTLSConfiguration())
+                let configuration = try await pki.serverTLSConfiguration()
+                tls = try NIOSSLContext(configuration: configuration)
+                bindings = configuration.tlsServerEndPoint
             } catch {
                 throw DirectoryKitError.tls("\(error)")
             }
         }
-        let context = ServerContext(store: store, info: info, config: config, secrets: secrets, tls: tls)
+        let context = ServerContext(store: store, info: info, config: config, secrets: secrets, tls: tls,
+                                    channelBindings: bindings)
         let group = MultiThreadedEventLoopGroup(numberOfThreads: max(1, config.eventLoopThreads))
         let started = state.withLock { s -> Bool in
             if s.group != nil { return true }

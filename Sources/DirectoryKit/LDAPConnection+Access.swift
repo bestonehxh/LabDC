@@ -46,6 +46,7 @@ enum SelfWriteRights {
     static let attributeIDs: [String: String] = [
         "dnshostname": "9026b (dNSHostName)", "msds-additionaldnshostname": "906b5 (msDS-AdditionalDnsHostName)",
         "serviceprincipalname": "90303 (servicePrincipalName)", "userprincipalname": "90290 (userPrincipalName)",
+        "samaccountname": "900dd (sAMAccountName)",
     ]
 
     /// The self-writable attributes (lower case) of an object of class `objectClass`.
@@ -93,14 +94,25 @@ extension LDAPConnection {
 
         let sam = entry.samAccountName ?? ""
         let computerName = sam.hasSuffix("$") ? String(sam.dropLast()) : sam
-        let suffixes = try await allowedDNSSuffixes()
-
-        // 1. Host names (validated write to DNS host name, MS-ADTS §3.1.1.5.3.1.1.2).
         var hostNames = Set([computerName.lowercased()])
         for name in SelfWriteRights.hostNameAttributes {
             hostNames.formUnion(entry.strings(name).map { $0.lowercased() })
         }
-        for (name, values) in Self.writtenValues(ops) where SelfWriteRights.hostNameAttributes.contains(name) {
+        try await checkComputerNames(computerName: computerName, hostNames: hostNames, written: Self.writtenValues(ops),
+                                     excluding: entry.id)
+    }
+
+    /// The validated writes of a computer's names (MS-ADTS §3.1.1.5.3.1.1.2 / .4), shared by a
+    /// modify of the account by itself (or its creator) and the add of a machine account under
+    /// ms-DS-MachineAccountQuota. `hostNames` are the names the object already has (at least the
+    /// computer name); `excluding` is the object itself for the uniqueness checks.
+    func checkComputerNames(computerName: String, hostNames existing: Set<String>, written: [(String, [String])],
+                            excluding: ObjectID?) async throws {
+        let suffixes = try await allowedDNSSuffixes()
+        var hostNames = existing
+
+        // 1. Host names (validated write to DNS host name, MS-ADTS §3.1.1.5.3.1.1.2).
+        for (name, values) in written where SelfWriteRights.hostNameAttributes.contains(name) {
             for value in values {
                 let host = value.lowercased()
                 guard Self.isValidHostName(host, computerName: computerName, suffixes: suffixes) else {
@@ -108,25 +120,25 @@ extension LDAPConnection {
                 }
                 try await requireUnique(host, filter: .or([.equality(attribute: "dNSHostName", value: Array(host.utf8)),
                                                            .equality(attribute: "msDS-AdditionalDnsHostName", value: Array(host.utf8))]),
-                                        entry: entry, attribute: name, code: "0000202F")
+                                        excluding: excluding, attribute: name, code: "0000202F")
                 hostNames.insert(host)
             }
         }
 
         // 2. SPNs (validated write to service principal name, §3.1.1.5.3.1.1.4): the instance
         //    must be one of the object's own names (current or set in this same request).
-        for (name, values) in Self.writtenValues(ops) where name == "serviceprincipalname" {
+        for (name, values) in written where name == "serviceprincipalname" {
             for value in values {
                 guard Self.isValidSPN(value, hostNames: hostNames, domainNames: domainNames()) else {
                     throw validatedWriteFailure(name, "\(value) does not name this computer")
                 }
                 try await requireUnique(value, filter: .equality(attribute: "servicePrincipalName", value: Array(value.utf8)),
-                                        entry: entry, attribute: name, code: "000021C7")
+                                        excluding: excluding, attribute: name, code: "000021C7")
             }
         }
 
         // 3. userPrincipalName: may not shadow another account's implicit `sam@domain` name.
-        for (name, values) in Self.writtenValues(ops) where name == "userprincipalname" {
+        for (name, values) in written where name == "userprincipalname" {
             for value in values {
                 guard let at = value.lastIndex(of: "@"), at != value.startIndex, value.index(after: at) != value.endIndex else {
                     throw validatedWriteFailure(name, "\(value) is not user@suffix")
@@ -135,7 +147,7 @@ extension LDAPConnection {
                 let suffix = value[value.index(after: at)...].lowercased()
                 if suffix == info.dnsDomain.lowercased() || suffix == info.realm.lowercased() {
                     for candidate in [local, local + "$"] {
-                        if let other = try await store.read(sam: candidate), other.id != entry.id {
+                        if let other = try await store.read(sam: candidate), other.id != excluding {
                             throw validatedWriteFailure(name, "\(value) is the name of \(other.dn)", code: "000021C8")
                         }
                     }
@@ -203,9 +215,9 @@ extension LDAPConnection {
     }
 
     /// No other live object may hold `value` (SPNs and host names are unique in AD).
-    func requireUnique(_ value: String, filter: FilterAST, entry: DirectoryEntry, attribute: String, code: String) async throws {
+    func requireUnique(_ value: String, filter: FilterAST, excluding: ObjectID?, attribute: String, code: String) async throws {
         let others = try await store.search(base: info.domainDN, scope: .subtree, filter: filter, attrs: ["1.1"], sizeLimit: 2)
-        if others.contains(where: { $0.id != entry.id }) {
+        if others.contains(where: { $0.id != excluding }) {
             throw validatedWriteFailure(attribute, "\(value) is already used by another object", code: code)
         }
     }
@@ -232,7 +244,7 @@ extension LDAPConnection {
     /// account (never a DC or trust account). Existing computer objects whose `mS-DS-CreatorSID`
     /// is the caller's SID count against the quota; over quota is `insufficientAccessRights`.
     /// Returns the SID to stamp as `mS-DS-CreatorSID`.
-    func authorizeMachineAccountCreation(_ me: BoundIdentity, cls: String,
+    func authorizeMachineAccountCreation(_ me: BoundIdentity, cls: String, rdn: RDN,
                                          attributes: [String: [[UInt8]]]) async throws -> SID {
         let chain = DirectorySchema.classChain(cls).map { $0.lowercased() }
         guard !me.identity.isAnonymous, chain.contains("computer") else {
@@ -247,6 +259,9 @@ extension LDAPConnection {
         }
         // A creator may not set privileged or protected attributes on the new account.
         try checkOperatorWrite(attributes.map { ($0.key, $0.value) })
+        // Certifried / noPac (CVE-2022-26923, CVE-2021-42278): the names are checked at add time
+        // exactly as the validated writes check them later.
+        try await checkNewMachineAccountNames(rdn: rdn, attributes: attributes)
 
         let sid = me.identity.sid
         let quota = try await machineAccountQuota()
@@ -258,6 +273,57 @@ extension LDAPConnection {
             throw LDAPFailure(.insufficientAccessRights, ADDiagnostic.machineAccountQuotaExceeded)
         }
         return sid
+    }
+
+    /// The names of a machine account a non-administrator adds (KB5008102 / KB5014754):
+    /// - `sAMAccountName` (the store's default is `RDN$`) ends with `$`, and the computer name is
+    ///   a plain NetBIOS-style name, not a domain controller's, the domain's or `krbtgt`, and not
+    ///   another account's `sAMAccountName` (the KDC's `name` -> `name$` fallback);
+    /// - `dNSHostName` / `msDS-AdditionalDnsHostName` are `<computer name>.<domain>` and unique,
+    ///   `servicePrincipalName` values name this computer and are unique, `userPrincipalName`
+    ///   shadows no account (the validated-write rules).
+    func checkNewMachineAccountNames(rdn: RDN, attributes: [String: [[UInt8]]]) async throws {
+        func values(_ name: String) -> [String] {
+            attributes.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+                .map { String(decoding: $0, as: UTF8.self) } ?? []
+        }
+        let sam = values("sAMAccountName").first ?? (rdn.value.uppercased() + "$")
+        guard sam.count >= 2, sam.hasSuffix("$") else {
+            throw validatedWriteFailure("samaccountname", "\(sam) does not end with $")
+        }
+        let computerName = String(sam.dropLast())
+        guard computerName.count <= 19, computerName.first != "-",
+              computerName.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }) else {
+            throw validatedWriteFailure("samaccountname", "\(sam) is not a valid computer name")
+        }
+        let lower = computerName.lowercased()
+        if try await reservedComputerNames().contains(lower) {
+            throw validatedWriteFailure("samaccountname", "\(sam) is a domain controller's or the domain's name")
+        }
+        if try await store.read(sam: computerName) != nil {
+            throw validatedWriteFailure("samaccountname", "\(computerName) is another account's name")
+        }
+        var written: [(String, [String])] = []
+        for name in ["dnshostname", "msds-additionaldnshostname", "serviceprincipalname", "userprincipalname"] {
+            let v = values(name)
+            if !v.isEmpty { written.append((name, v)) }
+        }
+        try await checkComputerNames(computerName: computerName, hostNames: [lower], written: written, excluding: nil)
+    }
+
+    /// Lower-case names a machine account may never take: every domain controller's computer
+    /// name and host-name label, the domain's NetBIOS name and first DNS label, `krbtgt`.
+    func reservedComputerNames() async throws -> Set<String> {
+        var names: Set<String> = [info.netbiosDomain.lowercased(), "krbtgt", info.dcName.lowercased()]
+        if let label = info.dnsDomain.lowercased().split(separator: ".").first { names.insert(String(label)) }
+        let dcs = try await store.search(base: info.domainDN, scope: .subtree,
+                                         filter: .or([.eq("primaryGroupID", "516"), .eq("primaryGroupID", "521")]),
+                                         attrs: ["sAMAccountName", "dNSHostName"])
+        for dc in dcs {
+            if let sam = dc.samAccountName?.lowercased() { names.insert(sam.hasSuffix("$") ? String(sam.dropLast()) : sam) }
+            if let label = dc.string("dNSHostName")?.lowercased().split(separator: ".").first { names.insert(String(label)) }
+        }
+        return names
     }
 
     /// The effective `userAccountControl` of an add: the value supplied, else the store's computer

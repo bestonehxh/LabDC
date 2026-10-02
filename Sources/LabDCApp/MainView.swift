@@ -118,10 +118,14 @@ struct DetailPage: View {
             OverviewView()
         case .services:
             ServicesView()
+        case .groupPolicy:
+            GroupPolicyView()
         case .users:
             UsersView()
         case .radius:
             RadiusView()
+        case .dhcp:
+            DHCPView()
         case .certificates:
             CertificatesView()
         case .activity:

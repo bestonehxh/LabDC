@@ -11,6 +11,8 @@ struct CertificatesCAView: View {
     @State private var createForm: CreateCAForm?
     @State private var confirmUse: CAInfo?
     @State private var regenerating = false
+    @State private var changeKey: ChangeKeyForm?
+    @State private var confirmRetire: CAService.RootStatus?
 
     var body: some View {
         ScrollView {
@@ -38,6 +40,7 @@ struct CertificatesCAView: View {
                             .padding(.top, 6)
                     }
                 }
+                roots
                 otherCAs
             }
             .padding(.bottom, 24)
@@ -52,6 +55,31 @@ struct CertificatesCAView: View {
                 if ok { model.notice = "Created CA \(f.name). It is not used until you choose Use as current." }
                 return ok
             }
+        }
+        .sheet(item: $changeKey) { form in
+            ChangeKeySheet(form: form) { f in
+                var report: LabCASwitch.Report?
+                let ok = await model.perform("Change the lab CA key") {
+                    report = try await $0.changeLabCAKey(to: f.keyType, keepOldTrusted: f.keepOldTrusted)
+                }
+                if ok, let report {
+                    model.notice = "The lab CA is now \(report.to) (\(report.keyType.signatureDescription)). "
+                        + (report.oldRootKeptTrusted ? "\(report.from) stays trusted until you retire it."
+                           : "\(report.from) is retired; \(report.stillActiveOnOldRoot) of its certificates are still unexpired.")
+                        + " Windows PCs re-enroll at their next gpupdate."
+                }
+                return ok
+            }
+        }
+        .confirmationDialog("Retire “\(confirmRetire?.name ?? "")”?",
+                            isPresented: Binding(get: { confirmRetire != nil }, set: { if !$0 { confirmRetire = nil } }),
+                            presenting: confirmRetire) { root in
+            Button("Retire", role: .destructive) {
+                Task { await model.perform("Retire the old root") { _ = try await $0.retireCA(name: root.name) } }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { root in
+            Text(retireMessage(root))
         }
         .confirmationDialog("Use “\(confirmUse?.title ?? "")” as the current CA?",
                             isPresented: Binding(get: { confirmUse != nil }, set: { if !$0 { confirmUse = nil } }),
@@ -94,13 +122,17 @@ struct CertificatesCAView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 8)
                 .padding(.bottom, 24)
-            InfoRow(label: "Key", value: ca.keyType.displayName)
-            InfoRow(label: "Valid until", value: ca.validityText(), attention: ca.expiresSoon())
+            InfoRow(label: "Key", value: ca.keyType.signatureDescription)
+            InfoRow(label: "Valid until", value: ca.validUntilText(), attention: ca.expiresSoon())
             InfoRow(label: "Fingerprint", value: ca.sha256, copyable: true, monospaced: true)
             revocationLine(ca)
             Rectangle().fill(Theme.line).frame(height: 1)
             HStack(spacing: 24) {
                 saveMenu(ca, title: "Save CA")
+                Button("Change the lab CA key…") { changeKey = ChangeKeyForm(current: ca.keyType) }
+                    .buttonStyle(.quietLink)
+                    .disabled(editor.migration != nil)
+                    .accessibilityHint("Moves issuing to a new P-256 or P-384 root")
                 Button("Create a new CA") { newCA() }
                     .buttonStyle(.quietLink)
             }
@@ -193,19 +225,60 @@ struct CertificatesCAView: View {
             VStack(alignment: .leading, spacing: 0) {
                 InfoRow(label: "Name", value: ca.name + (ca.isLab ? " (lab CA)" : ""))
                 InfoRow(label: "Subject", value: ca.subject)
-                InfoRow(label: "Validity", value: ca.validityText(), attention: ca.expiresSoon())
-                InfoRow(label: "SHA-256", value: ca.sha256, copyable: true, monospaced: true)
+                // Validity, SHA-256 and the revocation list are on the left already (owner, 2 Oct 2026).
                 InfoRow(label: "SHA-1", value: ca.sha1, copyable: true, monospaced: true)
                 InfoRow(label: "Download", value: editor.endpoints.caCertificateURL(ca.name), copyable: true)
                 if let crl = editor.crls[ca.name] {
-                    InfoRow(label: "Revocation list", value: crl.summary(), attention: crl.isStale())
                     InfoRow(label: "Address (CDP)", value: crl.url, copyable: true)
-                } else {
-                    InfoRow(label: "Revocation list", value: "No CRL has been generated for \(ca.title) yet.")
                 }
             }
             QuietNote("The revocation list is regenerated after every revocation and daily; it is valid for 7 days.")
         }
+    }
+
+    /// Roots: which one issues, which are trusted, how many active certificates each has.
+    private var roots: some View {
+        Card(title: "Roots") {
+            if let m = editor.migration {
+                Text("Changing roots: \(m.to) issues, \(m.from) is still trusted. Retire \(m.from) once its devices have re-enrolled.")
+                    .font(Theme.detail).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
+            }
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(editor.roots.enumerated()), id: \.element.name) { index, root in
+                    QuietRow(first: index == 0) {
+                        HStack(alignment: .firstTextBaseline, spacing: 24) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(root.name).font(Theme.body).foregroundStyle(Theme.ink)
+                                Text(Self.rootLine(root)).font(Theme.detail).foregroundStyle(Theme.muted)
+                            }
+                            Spacer(minLength: 12)
+                            if !root.isCurrent, root.trusted, root.name != LabPKI.rsaCompatCAName {
+                                Button("Retire…") { confirmRetire = root }
+                                    .buttonStyle(.quietLink)
+                            }
+                        }
+                        .accessibilityElement(children: .contain)
+                    }
+                }
+            }
+        }
+    }
+
+    /// `P-384 · ECDSA SHA-384 · issues · trusted · 12 active`.
+    static func rootLine(_ root: CAService.RootStatus) -> String {
+        var parts = [root.keyType.signatureDescription]
+        if root.isCurrent { parts.append("issues") }
+        parts.append(root.retired ? "retired (CRL still published)" : root.trusted ? "trusted" : "not trusted")
+        parts.append("\(root.activeCertificates) active")
+        return parts.joined(separator: " · ")
+    }
+
+    private func retireMessage(_ root: CAService.RootStatus) -> String {
+        let active = editor.activeCertificates(caName: root.name)
+        let names = active.prefix(8).map(\.subject).joined(separator: ", ")
+        return "\(root.name) leaves the trusted roots (Group Policy, NTAuth) and the 802.1X profiles, and EAP-TLS refuses its client certificates. "
+            + (active.isEmpty ? "It has no active certificates." : "\(active.count) certificate(s) it issued are still active: \(names)\(active.count > 8 ? ", …" : "").")
+            + " Its key stays and its revocation list keeps being published."
     }
 
     private var otherCAs: some View {
@@ -250,7 +323,7 @@ struct CertificatesCAView: View {
             ForEach(CAExportFormat.allCases) { format in
                 Button(format.menuTitle) {
                     Task {
-                        await model.perform("Export CA") { e in
+                        await model.perform("Save CA") { e in
                             let data = try await e.exportCA(format, caName: ca.name)
                             try CertificateFiles.save(data, suggestedName: format.fileName(for: ca),
                                                       message: format == .mobileconfig
@@ -329,5 +402,80 @@ struct CreateCASheet: View {
         }
         .frame(width: 460)
         .background(Theme.background)
+    }
+}
+
+/// "Change the lab CA key…": the new key (the current one is not offered) and whether the old
+/// root stays trusted for a while.
+@MainActor @Observable
+final class ChangeKeyForm: Identifiable {
+    let current: CAKeyType
+    var keyType: CAKeyType
+    var keepOldTrusted = false
+
+    init(current: CAKeyType) {
+        self.current = current
+        keyType = current == .p384 ? .p256 : .p384
+    }
+}
+
+struct ChangeKeySheet: View {
+    @Bindable var form: ChangeKeyForm
+    let onChange: (ChangeKeyForm) async -> Bool
+    @Environment(\.dismiss) private var dismiss
+    @State private var working = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Form {
+                Section {
+                    Picker("New key", selection: $form.keyType) {
+                        ForEach([CAKeyType.p384, .p256], id: \.self) { k in
+                            Text(k.signatureDescription + (k == form.current ? " (current)" : "")).tag(k)
+                                .selectionDisabled(k == form.current)
+                        }
+                    }
+                    Toggle("Keep the old root trusted for a while", isOn: $form.keepOldTrusted)
+                } header: {
+                    Text("Change the lab CA key")
+                } footer: {
+                    Text(Self.explanation(form))
+                        .font(Theme.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            HStack(spacing: 24) {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .buttonStyle(.quietLink)
+                    .keyboardShortcut(.cancelAction)
+                Button(working ? "Changing…" : "Change") {
+                    working = true
+                    Task {
+                        if await onChange(form) { dismiss() }
+                        working = false
+                    }
+                }
+                .buttonStyle(.quietPrimary)
+                .keyboardShortcut(.defaultAction)
+                .disabled(working || form.keyType == form.current)
+            }
+            .padding([.horizontal, .bottom], 20)
+        }
+        .frame(width: 520)
+        .background(Theme.background)
+    }
+
+    static func explanation(_ form: ChangeKeyForm) -> String {
+        "A new \(form.keyType.displayName) root is created and issues from now on (the old root is never re-keyed or deleted). "
+            + "The DC certificate (LDAPS, HTTPS, RADIUS) is reissued from it and every service restarts for a moment. "
+            + "Group Policy trusts the new root, the 802.1X profiles point at it, and joined Windows PCs re-enroll their "
+            + "machine and user certificates at the next gpupdate. "
+            + (form.keepOldTrusted
+               ? "The old root stays trusted (Group Policy, NTAuth, 802.1X, EAP-TLS) until you retire it under Roots."
+               : "The old root is retired at once: devices still using its certificates must re-enroll before they connect again.")
+            + " Non-Windows devices need the new root installed."
     }
 }

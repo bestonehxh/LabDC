@@ -32,7 +32,10 @@ struct CertificatesTemplatesView: View {
                 TableColumn("Template") { r in
                     VStack(alignment: .leading, spacing: 1) {
                         Text(r.template.displayName).font(Theme.emphasis).foregroundStyle(Theme.ink)
-                        Text(r.template.name + (r.template.builtIn ? " · built in" : "")).font(Theme.caption).foregroundStyle(Theme.muted)
+                        // The internal name only when it differs ("Computer · Computer" said it twice).
+                        if let caption = Self.caption(r.template) {
+                            Text(caption).font(Theme.caption).foregroundStyle(Theme.muted)
+                        }
                     }
                 }
                 .width(min: 110, ideal: 150, max: 220)
@@ -44,7 +47,7 @@ struct CertificatesTemplatesView: View {
                         .font(Theme.body)
                 }
                 .width(84)
-                TableColumn("Who may enrol") { r in
+                TableColumn("Who may enroll") { r in
                     Text(r.template.enrolAllowedGroupSIDs.map(editor.groupName).joined(separator: ", "))
                         .font(Theme.detail)
                         .foregroundStyle(Theme.muted)
@@ -52,7 +55,7 @@ struct CertificatesTemplatesView: View {
                 }
                 .width(min: 110, ideal: 160)
             }
-            .tableStyle(.inset)
+            .tableStyle(.inset(alternatesRowBackgrounds: false))
             .scrollContentBackground(.hidden)
             .contextMenu(forSelectionType: String.self) { ids in
                 if let name = ids.first, let t = editor.templates.first(where: { $0.name == name }) {
@@ -82,7 +85,7 @@ struct CertificatesTemplatesView: View {
                 .disabled(selection == nil)
                 Spacer(minLength: 12)
                 syncStatus
-                Button("Publish now") { Task { await editor.publishToDirectory() } }
+                Button("Publish") { Task { await editor.publishToDirectory() } }
                     .buttonStyle(.quietLink)
                     .help("Re-sync the Configuration NC objects (templates, CAs, enrollment services); runs by itself after every change")
             }
@@ -107,13 +110,23 @@ struct CertificatesTemplatesView: View {
         }
     }
 
+    /// Empty for no names: the cell stays blank rather than saying "None".
     static func sanShort(_ p: SANPolicy) -> String {
         switch p {
         case .dnsHostName: "Computer DNS name"
         case .upn: "User UPN"
         case .fromRequest: "Request"
-        case .none: "None"
+        case .none: ""
         }
+    }
+
+    /// "WebServer · built in", "built in", or nil when the internal name is the display name
+    /// and the template is the admin's own.
+    static func caption(_ t: CertificateTemplate) -> String? {
+        var parts: [String] = []
+        if t.name != t.displayName { parts.append(t.name) }
+        if t.builtIn { parts.append("built in") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 
@@ -184,7 +197,7 @@ struct TemplateEditorSheet: View {
                 } header: {
                     Text("Enrollment")
                 } footer: {
-                    Text("Groups that may enrol for this template (their members, computers included).").font(Theme.caption)
+                    Text("Groups that may enroll for this template (their members, computers included).").font(Theme.caption)
                 }
                 Section {
                     Button(advanced ? "Hide advanced" : "Advanced") { advanced.toggle() }
@@ -200,6 +213,12 @@ struct TemplateEditorSheet: View {
                             }
                         }
                         TextField("Other purposes (OIDs)", text: $draft.customEKUs, prompt: Text("1.3.6.1.5.5.7.3.9"))
+                    }
+                }
+                if let warning = draft.template.esc1Warning() {
+                    Section {
+                        Text(warning).font(Theme.detail).foregroundStyle(Theme.attention)
+                            .accessibilityLabel("Warning: \(warning)")
                     }
                 }
                 if !draft.errors.isEmpty {

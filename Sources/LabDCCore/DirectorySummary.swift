@@ -77,9 +77,9 @@ public enum NextStep: String, CaseIterable, Identifiable, Sendable {
 
     public var title: String {
         switch self {
-        case .addUser: "Add a user"
+        case .addUser: "Add a person"
         case .connectDevice: "Connect a device"
-        case .publishCA: "Publish CA"
+        case .publishCA: "Publish the lab CA"
         }
     }
 

@@ -100,7 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Menu bar: Domain ▸ Open Data Folder, Export CA…; Help ▸ Join Guides.
+/// Menu bar: Domain ▸ Open Data Folder, Save CA…; Help ▸ Connect a Device, Server Log.
 struct AppCommands: Commands {
     let model: AppModel
     @Environment(\.openWindow) private var openWindow
@@ -111,7 +111,7 @@ struct AppCommands: Commands {
                 .keyboardShortcut("o", modifiers: [.command, .shift])
             Button("Open Log Folder") { model.openLogFolder() }
             Divider()
-            Button("Export CA…") { model.exportCA() }
+            Button("Save CA…") { model.exportCA() }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
                 .disabled(!model.controller.isSetUp)
             Divider()
@@ -123,16 +123,26 @@ struct AppCommands: Commands {
         }
         // UI-3: Window ▸ Certificate Converter.
         CommandGroup(before: .windowArrangement) {
-            Button("Certificate Converter") { ConverterWindowController.shared.show() }
+            // Once the domain exists it is the Certificates ▸ Converter tab in the main window,
+            // not a second copy (owner, 2 Oct 2026); before that, the standalone window.
+            Button("Certificate Converter") {
+                if model.screen == .main {
+                    openWindow(id: "main")
+                    model.certificates.section = .converter
+                    model.selection = .certificates
+                } else {
+                    ConverterWindowController.shared.show()
+                }
+            }
                 .keyboardShortcut("c", modifiers: [.command, .shift])
             Divider()
         }
         CommandGroup(replacing: .help) {
-            Button("Join Guides") {
+            Button("Connect a Device") {
                 openWindow(id: "main")
                 model.selection = .connect
             }
-            Button("Activity Log") {
+            Button("Server Log") {
                 openWindow(id: "main")
                 model.selection = .activity
                 model.authentications.tab = .log

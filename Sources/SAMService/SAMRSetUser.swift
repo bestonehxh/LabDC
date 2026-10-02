@@ -2,6 +2,7 @@ import Foundation
 import RPCKit
 import Store
 import MSPAC
+import SheepCrypto
 
 /// The fields WP-U reads out of an incoming `SAMPR_USER_ALL_INFORMATION` (levels 21/23/25); the
 /// rest of the struct is consumed but ignored.
@@ -118,10 +119,22 @@ extension SAMRService {
         do {
             let user = try ctx.userState(handle)
             guard let entry = try await directory.read(id: user.objectID) else { throw SAMRError(.noSuchUser) }
-            try await authorizePasswordSet(ctx, target: entry)
+            let privileges = try await authorizePasswordSet(ctx, target: entry)
             if needsSessionKey, ctx.sessionKey.isEmpty { throw SAMRError(.noUserSessionKey) }
 
             let oldUAC = UInt32(truncatingIfNeeded: entry.int("userAccountControl") ?? 0)
+            if let acb = newACB {
+                try Self.checkACBChange(old: UserAccountControl.toACB(oldUAC), new: acb, privileges: privileges)
+            }
+            // The primary group confers membership (and lands in the PAC), so it must name a group
+            // the account already belongs to — for every caller, administrators included (AD
+            // answers STATUS_MEMBER_NOT_IN_GROUP the same way).
+            let becomesServerTrust = (newACB ?? UserAccountControl.toACB(oldUAC)) & ACB.serverTrust != 0
+            if let pg = newPrimaryGroup, pg != 0, !(pg == 516 && becomesServerTrust),
+               !(try await directory.isValidPrimaryGroup(pg, for: entry)) {
+                Self.logger.notice("SAMR set \(entry.samAccountName ?? "?", privacy: .public) primaryGroupID \(pg) refused: not a member")
+                throw SAMRError(.memberNotInGroup)
+            }
             let isComputer = (oldUAC & (UserAccountControl.workstationTrustAccount | UserAccountControl.serverTrustAccount)) != 0
                 || entry.strings("objectClass").contains { $0.caseInsensitiveCompare("computer") == .orderedSame }
 
@@ -215,12 +228,30 @@ extension SAMRService {
             guard let entry, let secrets = try await directory.secrets(id: entry.id), let oldNTHash = secrets.ntHash else {
                 throw SAMRError(.wrongPassword)
             }
+            // Bad-password lockout (security audit, 1 Oct 2026): this call is an online oracle for
+            // the old password, so wrong guesses count like a failed logon and a locked account is
+            // refused before any check runs.
+            let lockKey = entry.samAccountName ?? userName
+            let now = clock()
+            if badPasswords.lockedUntil(lockKey, now: now) != nil {
+                Self.logger.notice("SAMR password change \(userName, privacy: .public) -> ACCOUNT_LOCKED_OUT")
+                throw SAMRError(.accountLockedOut)
+            }
+            func wrongPassword() -> SAMRError {
+                let locked = badPasswords.recordFailure(lockKey, now: now, threshold: lockoutThreshold,
+                                                        window: lockoutWindow, duration: lockoutDuration)
+                Self.logger.notice("SAMR password change \(userName, privacy: .public) -> WRONG_PASSWORD\(locked ? "; account now locked out" : "", privacy: .public)")
+                return SAMRError(.wrongPassword)
+            }
             // Recover the new cleartext with the stored old NT hash, then verify the caller knew the
             // old password: SamEncrypt(oldHash, newHash) must equal the supplied cross-encryption.
-            let newClear = try SAMRPassword.decryptUserPassword(newBlob, rc4Key: oldNTHash)
+            guard let newClear = try? SAMRPassword.decryptUserPassword(newBlob, rc4Key: oldNTHash) else {
+                throw wrongPassword()
+            }
             let newNTHash = DirectoryStore.ntHash(newClear)
             let expected = SAMRPassword.encryptOWF(oldNTHash, key: newNTHash)
-            guard expected == oldOwfCross else { throw SAMRError(.wrongPassword) }
+            guard ConstantTime.equal(expected, oldOwfCross) else { throw wrongPassword() }
+            badPasswords.recordSuccess(lockKey)
             do { try await directory.setPassword(id: entry.id, password: newClear, enforcePolicy: true) }
             catch let e as StoreError {
                 if case .passwordPolicy = e { throw SAMRError(.passwordRestriction) }

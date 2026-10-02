@@ -169,18 +169,27 @@ struct FolderFilter: View {
     var body: some View {
         let model = app.usersModel
         let counts = folderCounts(model)
-        HStack(alignment: .firstTextBaseline, spacing: 20) {
-            if model.loaded {
-                ForEach(visibleFolders(model), id: \.folder.id) { item in
-                    FolderChip(folder: item.folder, count: counts[item.folder.id] ?? 0,
-                               acceptsTab: item.folder.accepts(tab: model.tab.rawValue),
-                               sheet: $sheet, confirmDelete: $confirmDeleteFolder)
+        HStack(alignment: .center, spacing: 20) {
+            // Many folders scroll sideways instead of truncating, and New folder stays on one
+            // line at the end (owner, 2 Oct 2026: wrapped at 1280 pt).
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .firstTextBaseline, spacing: 20) {
+                    if model.loaded {
+                        ForEach(visibleFolders(model), id: \.folder.id) { item in
+                            FolderChip(folder: item.folder, count: counts[item.folder.id] ?? 0,
+                                       acceptsTab: item.folder.accepts(tab: model.tab.rawValue),
+                                       sheet: $sheet, confirmDelete: $confirmDeleteFolder)
+                                .fixedSize()
+                        }
+                    }
                 }
             }
+            .layoutPriority(0)
             Button("New folder") { sheet = .newFolder(parent: model.newFolderParent) }
                 .buttonStyle(.quietLink)
+                .fixedSize()
+                .layoutPriority(1)
                 .help("New folder (OU) in \(model.currentFolder.canHoldFolders ? model.currentFolder.name : model.snapshot.dnsDomain)")
-            Spacer(minLength: 0)
         }
         .padding(.bottom, 2)
         .accessibilityElement(children: .contain)
@@ -293,14 +302,16 @@ struct ObjectTable: View {
             case .groups: GroupsTable()
             case .computers: ComputersTable()
             }
-            Text(model.footer)
-                .font(Theme.caption)
-                .foregroundStyle(Theme.faint)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 12)
-                .accessibilityLabel(model.footer)
+            if !model.footer.isEmpty {
+                Text(model.footer)
+                    .font(Theme.caption)
+                    .foregroundStyle(Theme.faint)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 12)
+                    .accessibilityLabel(model.footer)
+            }
         }
         .onDeleteCommand { if !model.deletableSelection.isEmpty { confirmDelete = true } }
     }
@@ -386,7 +397,7 @@ private struct ComputersTable: View {
             ListColumn("DNS name", drop: 4, sort: .text("DNS name", \DirectoryComputer.dnsText)),
             ListColumn("OS", drop: 1, sort: .text("OS", \DirectoryComputer.osText)),
             ListColumn("Status", width: 84, drop: 3),
-            ListColumn("Last logon", width: 92, alignment: .trailing, drop: 2, sort: .value("Last logon", \DirectoryComputer.lastLogonKey)),
+            ListColumn("Last sign-in", width: 92, alignment: .trailing, drop: 2, sort: .value("Last sign-in", \DirectoryComputer.lastLogonKey)),
         ]
         FittedColumns(columns) { columns in
         VStack(alignment: .leading, spacing: 0) {

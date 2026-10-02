@@ -173,6 +173,11 @@ public struct GPOExtensionNames: Sendable, Hashable, CustomStringConvertible {
         }
     }
 
+    /// Drops a CSE and its tools (its settings were removed from the GPO).
+    public mutating func remove(cse: String) {
+        pairs.removeAll { $0.cse == cse.uppercased() }
+    }
+
     public func contains(cse: String, tool: String? = nil) -> Bool {
         guard let p = pairs.first(where: { $0.cse == cse.uppercased() }) else { return false }
         return tool.map { p.tools.contains($0.uppercased()) } ?? true

@@ -60,6 +60,8 @@ public enum CLICommands {
             try await EnrollmentCommands.run(data: data, protocolName: protocolName, sub, out: out)
         case let .radius(data, sub):
             try await RadiusCommands.run(data: data, sub, out: out)
+        case let .dhcp(data, sub):
+            try await DHCPCommands.run(data: data, sub, out: out)
         case .status(let data):
             let dir = DataDirectory(data)
             let store = try dir.openExistingStore()

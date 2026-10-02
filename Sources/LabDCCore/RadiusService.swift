@@ -2,6 +2,7 @@ import EAPKit
 import Foundation
 import MSPAC
 import Network
+import PKIKit
 import Synchronization
 import RADIUSKit
 import Store
@@ -158,8 +159,20 @@ public final class RadiusServer: @unchecked Sendable {
         /// Interim-Update floods: one summary line per NAS every 15 minutes.
         var interim = RADIUSLogLimiter(interval: 900)
         var configProblem: String?
+        /// Automatic CoA: at most one per MAC per 10 minutes.
+        var coaLimiter = CoARateLimiter(interval: RadiusServer.autoCoAInterval)
+        /// Accounting retention: the purge runs at most hourly.
+        var lastPurge = Date.distantPast
     }
     private let state = Mutex(State())
+    /// Phase 5: device profiles (DHCP) — facts for the policies, and the change feed that
+    /// triggers CoA.
+    private let profiles: DeviceProfileSource
+    private let profileWatch = Mutex<Task<Void, Never>?>(nil)
+    static let autoCoAInterval: TimeInterval = 600
+    /// CoA transport timing (tests shorten it).
+    var coaTimeout = RadiusCoAClient.defaultTimeout
+    var coaAttempts = RadiusCoAClient.defaultAttempts
     /// Wrong RADIUS passwords (PAP and MS-CHAPv2) lock an account for a while, as Netlogon does.
     let badPasswords = BadPasswordTracker()
     static let lockoutThreshold = 20
@@ -175,9 +188,11 @@ public final class RadiusServer: @unchecked Sendable {
     public init(store: DirectoryStore, clock: @escaping @Sendable () -> Date = { Date() },
                 eapCredentials: (@Sendable () async -> EAPCredentials?)? = nil,
                 trustRoots: @escaping @Sendable () async -> [[UInt8]] = { [] },
+                profiles: DeviceProfileSource = NoDeviceProfiles(),
                 log: @escaping @Sendable (String) -> Void) {
         self.store = store
         self.clock = clock
+        self.profiles = profiles
         self.log = log
         self.trustRoots = trustRoots
         if let eapCredentials {
@@ -208,6 +223,7 @@ public final class RadiusServer: @unchecked Sendable {
     }
 
     public func stop() {
+        profileWatch.withLock { $0?.cancel(); $0 = nil }
         authListener?.cancel(); acctListener?.cancel()
         authListener = nil; acctListener = nil
         authPort = 0; acctPort = 0
@@ -280,6 +296,11 @@ public final class RadiusServer: @unchecked Sendable {
             limitedLog("unknown \(source)", "unknown NAS \(source) dropped")
             return nil
         }
+        // Authenticators first, the duplicate cache after (CVE audit 1 Oct 2026): an unverified
+        // packet must neither get a cached reply back nor occupy a cache slot (an off-path
+        // sender could otherwise pin a key — same source, port, Identifier, authenticator —
+        // as in progress and have the real retransmission dropped).
+        guard verifyAuthenticators(packet, nas: nas) else { return nil }
         let key = RADIUSDuplicateCache.Key(source: (accounting ? "acct " : "auth ") + source, port: port, id: packet.id,
                                            authenticator: packet.authenticator)
         let started = ContinuousClock.now
@@ -293,15 +314,40 @@ public final class RadiusServer: @unchecked Sendable {
         return reply
     }
 
-    private func answer(_ packet: RADIUSPacket, nas: DirectoryStore.NASClient, config: RadiusConfig, source: String,
-                        started: ContinuousClock.Instant) async -> [UInt8]? {
+    /// The Request Authenticator (Accounting-Request) and Message-Authenticator checks; false
+    /// (logged) = drop. Access-Request: a Message-Authenticator that is present must verify; it is
+    /// REQUIRED with EAP (RFC 3579) and, unless the NAS is marked as unable to send it, for
+    /// everything else (Blast-RADIUS, CVE-2024-3596).
+    private func verifyAuthenticators(_ packet: RADIUSPacket, nas: DirectoryStore.NASClient) -> Bool {
         let secret = Array(nas.secret.utf8)
         if packet.code == .accountingRequest {
             guard packet.verifyAccountingRequestAuthenticator(secret: secret),
                   packet.messageAuthenticator == nil || packet.verifyMessageAuthenticator(secret: secret) else {
                 limitedLog("bad auth \(nas.name)", "Accounting-Request from \(nas.name): bad Request Authenticator, dropped")
-                return nil
+                return false
             }
+            return true
+        }
+        let isEAP = packet.first(.eapMessage) != nil
+        if packet.messageAuthenticator == nil {
+            if isEAP || nas.requireMessageAuthenticator {
+                limitedLog("no MA \(isEAP ? "eap " : "")\(nas.name)", "Access-Request from \(nas.name) without Message-Authenticator dropped"
+                           + (isEAP ? " (EAP requires it, RFC 3579)" : " (Require Message-Authenticator is on for this client — Blast-RADIUS)"))
+                return false
+            }
+        } else if !packet.verifyMessageAuthenticator(secret: secret) {
+            limitedLog("bad MA \(nas.name)", "Access-Request from \(nas.name): Message-Authenticator does not verify (wrong shared secret?), dropped")
+            return false
+        }
+        return true
+    }
+
+    /// Answers a packet whose authenticators `verifyAuthenticators` accepted.
+    private func answer(_ packet: RADIUSPacket, nas: DirectoryStore.NASClient, config: RadiusConfig, source: String,
+                        started: ContinuousClock.Instant) async -> [UInt8]? {
+        let secret = Array(nas.secret.utf8)
+        if packet.code == .accountingRequest {
+            await recordAccounting(packet, nas: nas, source: source)
             logAccounting(packet, nas: nas)
             var reply = RADIUSPacket(code: .accountingResponse, id: packet.id, authenticator: packet.authenticator)
             reply.echoProxyState(from: packet)
@@ -310,27 +356,26 @@ public final class RadiusServer: @unchecked Sendable {
             return try? reply.encode()
         }
 
-        // Access-Request: a Message-Authenticator that is present must verify; it is REQUIRED with
-        // EAP (RFC 3579) and, unless the NAS is marked as unable to send it, for everything else
-        // (Blast-RADIUS, CVE-2024-3596).
-        let isEAP = packet.first(.eapMessage) != nil
-        if packet.messageAuthenticator == nil {
-            if isEAP || nas.requireMessageAuthenticator {
-                limitedLog("no MA \(isEAP ? "eap " : "")\(nas.name)", "Access-Request from \(nas.name) without Message-Authenticator dropped"
-                           + (isEAP ? " (EAP requires it, RFC 3579)" : " (Require Message-Authenticator is on for this client — Blast-RADIUS)"))
-                return nil
-            }
-        } else if !packet.verifyMessageAuthenticator(secret: secret) {
-            limitedLog("bad MA \(nas.name)", "Access-Request from \(nas.name): Message-Authenticator does not verify (wrong shared secret?), dropped")
-            return nil
-        }
         let now = clock()
         if packet.first(.eapMessage) != nil, let eap {
             return await answerEAP(packet, eap: eap, nas: nas, config: config, source: source, started: started, now: now)
         }
         var request = RequestContext(packet: packet, sourceIP: source, date: now)
         let user = request.userName ?? ""
+        // MAC Authentication Bypass: recognised by shape, decided by MAB rules only — never a
+        // password check against a directory account.
+        if let mab = MABDetector.detect(packet, secret: secret) {
+            return await answerMAB(packet, mab: mab, request: request, nas: nas, config: config, started: started)
+        }
+        if let mac = request.callingStationId.flatMap(RADIUSMAC.normalize) {
+            request.merge(await RadiusDeviceFacts.lookup(mac: mac, store: store, profiles: profiles))
+        }
         let outcome = await authenticate(packet, user: user, secret: secret, now: now)
+        switch outcome.method {
+        case "PAP": request.authMethod = "pap"
+        case "MS-CHAPv2": request.authMethod = "mschapv2"
+        default: break
+        }
 
         var decision = RADIUSDecision(accept: false, rule: nil, attributes: [])
         var reason: String
@@ -365,6 +410,120 @@ public final class RadiusServer: @unchecked Sendable {
         return try? reply.encode()
     }
 
+    // MARK: MAB (phase 5)
+
+    /// A MAB request: device facts by MAC, `auth_method = mab`, MAB rules only (no match =
+    /// Reject whatever the no-match action), no directory account.
+    private func answerMAB(_ packet: RADIUSPacket, mab: MABDetector.Result, request context: RequestContext,
+                           nas: DirectoryStore.NASClient, config: RadiusConfig, started: ContinuousClock.Instant) async -> [UInt8]? {
+        var request = context
+        request.authMethod = "mab"
+        request.merge(await RadiusDeviceFacts.lookup(mac: mab.mac, store: store, profiles: profiles))
+        let decision = Self.decide(request: &request, facts: nil, config: config)
+        var reply = RADIUSPacket(code: decision.accept ? .accessAccept : .accessReject, id: packet.id,
+                                 authenticator: packet.authenticator)
+        if decision.accept { reply.attributes += decision.attributes }
+        reply.echoProxyState(from: packet)
+        do {
+            try reply.signResponse(requestAuthenticator: packet.authenticator, secret: Array(nas.secret.utf8), messageAuthenticator: true)
+        } catch {
+            log("Access-Request \(mab.mac) from \(nas.name): reply does not fit (\(error)), dropped")
+            return nil
+        }
+        let reason = decision.rule == nil ? "no MAB rule matched" : decision.ruleText
+        let device = request.deviceCategory.map { "device \($0)" } ?? "device unknown"
+        log("Access-Request \(mab.mac) from \(nas.name) → \(reason), \(decision.accept ? "Accept" : "Reject") "
+            + "(MAB \(mab.form), \(device)\(request.registeredDevice ? ", registered" : ""), "
+            + "\(Self.elapsedText(ContinuousClock.now - started)))")
+        return try? reply.encode()
+    }
+
+    // MARK: Accounting storage (phase 4c)
+
+    /// Start / Interim-Update / Stop go into `radius_sessions`; Accounting-On/Off closes the
+    /// NAS's open sessions. Sessions older than 30 days are purged (at most hourly).
+    private func recordAccounting(_ packet: RADIUSPacket, nas: DirectoryStore.NASClient, source: String) async {
+        guard let record = AccountingRecord(packet: packet, source: source) else { return }
+        let now = clock()
+        do {
+            let result = try await store.recordAccounting(record, nasName: nas.name, now: now)
+            if result.closed > 0 {
+                log("Accounting \(record.status == .nasOn ? "On" : "Off") from \(nas.name): \(result.closed) open session\(result.closed == 1 ? "" : "s") ended")
+            }
+        } catch {
+            limitedLog("acct store \(nas.name)", "Accounting-Request from \(nas.name) not stored (\(error))")
+        }
+        let purge = state.withLock { s -> Bool in
+            guard now.timeIntervalSince(s.lastPurge) > 3600 else { return false }
+            s.lastPurge = now
+            return true
+        }
+        if purge, let n = try? await store.purgeRadiusSessions(before: now.addingTimeInterval(-DirectoryStore.radiusSessionRetention)), n > 0 {
+            log("accounting: \(n) session\(n == 1 ? "" : "s") older than 30 days removed")
+        }
+    }
+
+    // MARK: CoA / Disconnect (RFC 5176)
+
+    /// Sends `action` for a stored session to its NAS (the NAS's CoA port, vendor flavour and
+    /// shared secret). One Activity line with the ACK/NAK.
+    public func sendCoA(_ action: CoAAction, session: DirectoryStore.RadiusSession, reason: String) async -> CoAResult {
+        let config = await config()
+        guard let nas = config.nas(for: session.nasSource) else {
+            let result = CoAResult(request: action.title, outcome: nil,
+                                   problem: "no enabled RADIUS client for \(session.nasSource)", attempts: 0)
+            log("\(action.title) \(session.mac ?? session.userName ?? session.sessionId): \(result.text)")
+            return result
+        }
+        let result = await RadiusCoAClient.send(action, session: session, nas: nas, now: clock(),
+                                                timeout: coaTimeout, attempts: coaAttempts)
+        let who = session.mac ?? session.userName ?? "-"
+        log("\(result.request) \(who) on \(nas.name) (\(session.nasSource):\(nas.coaPort), session \(session.sessionId)) — \(reason) → \(result.text)")
+        return result
+    }
+
+    /// Subscribes to the profile change feed: a MAC with an open session whose profile was
+    /// created or changed gets a CoA (reauthenticate in the NAS's flavour), at most once per
+    /// 10 minutes. Because 802.1X/MAB come before DHCP, this is how a new profile reaches the
+    /// policy.
+    public func watchDeviceProfiles() {
+        let stream = profiles.changes
+        let task = Task { [weak self] in
+            for await mac in stream {
+                guard let self else { return }
+                await self.profileChanged(mac)
+            }
+        }
+        profileWatch.withLock { $0?.cancel(); $0 = task }
+    }
+
+    /// One profile change (also what the tests drive directly).
+    @discardableResult
+    func profileChanged(_ rawMAC: String) async -> [CoAResult] {
+        guard let mac = RADIUSMAC.normalize(rawMAC) ?? DeviceProfile.normalizeMAC(rawMAC),
+              let sessions = try? await store.activeRadiusSessions(mac: mac), !sessions.isEmpty else { return [] }
+        let profile = try? await profiles.deviceProfile(mac: mac)
+        // A profile that went (back) to unknown never triggers a CoA: a forged DHCP packet with
+        // no fingerprint must not be able to bounce a device that is already in.
+        guard let profile, profile.category != .unknown else {
+            limitedLog("coa unknown \(mac)", "profile of \(mac) is unknown; no CoA")
+            return []
+        }
+        let now = clock()
+        guard state.withLock({ $0.coaLimiter.admit(mac, now: now) }) else {
+            limitedLog("coa limit \(mac)", "profile of \(mac) changed; no CoA (one per MAC per 10 minutes)")
+            return []
+        }
+        let what = "profile \(profile.category.rawValue)" + (profile.os.map { ", \($0)" } ?? "")
+        // The newest open session per NAS.
+        var seen: Set<String> = []
+        var results: [CoAResult] = []
+        for session in sessions where seen.insert(session.nasSource).inserted {
+            results.append(await sendCoA(.reauthenticate, session: session, reason: what))
+        }
+        return results
+    }
+
     // MARK: EAP (phase 4b/4c)
 
     /// One step of an EAP exchange: Access-Challenge (EAP-Request + State), or the end —
@@ -374,6 +533,7 @@ public final class RadiusServer: @unchecked Sendable {
                            source: String, started: ContinuousClock.Instant, now: Date) async -> [UInt8]? {
         let secret = Array(nas.secret.utf8)
         let message = packet.all(.eapMessage).flatMap(\.value)
+        await eap.setRequirePEAPCryptoBinding(config.requirePEAPCryptoBinding)
         let result = await eap.handle(eap: message, state: packet.first(.state)?.value,
                                       framedMTU: packet.integer(.framedMTU).map(Int.init), now: now)
         var request = RequestContext(packet: packet, sourceIP: source, date: now)
@@ -399,6 +559,10 @@ public final class RadiusServer: @unchecked Sendable {
             // The policy's "account" is the authenticated one (inner identity / certificate);
             // User-Name stays the outer identity the NAS sent.
             request.account = account
+            request.authMethod = "eap"
+            if let mac = request.callingStationId.flatMap(RADIUSMAC.normalize) {
+                request.merge(await RadiusDeviceFacts.lookup(mac: mac, store: store, profiles: profiles))
+            }
             let decision = Self.decide(request: &request, facts: dirFacts, config: config)
             let how = Self.eapText(facts, account: account)
             if decision.accept {
@@ -433,6 +597,7 @@ public final class RadiusServer: @unchecked Sendable {
         if let account, account.caseInsensitiveCompare(facts.outerIdentity) != .orderedSame { text += " as \(account)" }
         if let v = facts.tlsVersion { text += ", \(v)" }
         if facts.suiteB { text += ", 192-bit" }
+        if facts.rsaCompatibility { text += ", RSA compatibility chain" }
         if facts.resumed { text += ", fast reconnect" }
         if facts.cryptoBinding { text += ", crypto binding" }
         if facts.passwordChanged { text += ", password changed" }
@@ -488,7 +653,10 @@ public final class RadiusServer: @unchecked Sendable {
     ///   template whose SAN comes from the account) maps to the requester's SID; other templates
     ///   map by the UPN / dNSName SAN, then the CN. Server/RA/CA templates are refused.
     /// - not in `pki_issued` (signed by a lab CA key elsewhere): only a UPN or dNSName SAN maps —
-    ///   a bare CN never does.
+    ///   a bare CN never does — and only with a current CRL of its CA that does not list it
+    ///   (no CRL, a stale one or one that does not verify refuses: revocation is never skipped).
+    /// - KB5014754 strong mapping: a certificate carrying the SID extension
+    ///   (szOID_NTDS_CA_SECURITY_EXT) maps only to the account with that SID.
     /// Domain controllers never sign in with a certificate here.
     func certificateAuth(chain: [[UInt8]], identity: String) async -> EAPAuthResult {
         let now = clock()
@@ -511,6 +679,13 @@ public final class RadiusServer: @unchecked Sendable {
         if let record, record.revoked { return .failure("certificate revoked (serial \(serial))") }
         if let record, Self.nonClientTemplates.contains(record.templateName.lowercased()) {
             return .failure("a \(record.templateName) certificate cannot sign in over 802.1X (serial \(serial))")
+        }
+        if record == nil, let problem = await revocationProblem(leaf, serial: serial, issuers: roots + intermediates, now: now) {
+            return .failure(problem)
+        }
+        let strongSID = NTDSSecurityExtension.sid(in: leaf)
+        if strongSID == nil, NTDSSecurityExtension.isPresent(in: leaf) {
+            return .failure("certificate \(serial) has an unreadable SID extension (strong mapping)")
         }
 
         var entry: DirectoryEntry?
@@ -541,6 +716,11 @@ public final class RadiusServer: @unchecked Sendable {
             return .failure("no account for certificate \(leaf.subject)" + (record == nil ? " (not issued by this DC: only a UPN or DNS name maps)" : ""))
         }
         let sam = entry.samAccountName ?? entry.dn.description
+        if let strongSID, entry.sid.map({ $0.description.caseInsensitiveCompare(strongSID) != .orderedSame }) ?? true {
+            // KB5014754 / ESC9-10: the certificate was issued to another account (renamed or
+            // re-pointed names); the SID it carries is the account it belongs to.
+            return .failure("certificate \(serial) belongs to \(strongSID), not \(sam) (strong mapping)")
+        }
         let uac = UInt32(truncatingIfNeeded: entry.int("userAccountControl") ?? 0)
         if uac & UserAccountControl.serverTrustAccount != 0 {
             return .failure("a domain controller account (\(sam)) cannot sign in with a certificate")
@@ -551,6 +731,24 @@ public final class RadiusServer: @unchecked Sendable {
         if let refusal = store.accountRefusal(entry, now: now) { return .denied("\(refusal.description) (\(sam))", .accountDisabled) }
         if !store.logonHoursAllow(entry, now: now) { return .denied("outside the logon hours (\(sam))", .restrictedLogonHours) }
         return .success(account: sam, mschap: nil)
+    }
+
+    /// Revocation of a lab-CA certificate this DC has no record of: the stored CRL of its issuer
+    /// must exist, verify with that issuer, be current and not list the serial. Returns why the
+    /// certificate is refused, nil when it is not revoked.
+    func revocationProblem(_ leaf: Certificate, serial: String, issuers: [Certificate], now: Date) async -> String? {
+        let candidates = issuers.filter { $0.subject == leaf.issuer }
+        let rows = (try? await store.pkiCRLs()) ?? []
+        for row in rows {
+            guard let crl = try? CertificateRevocationList(derEncoded: row.der), crl.issuer == leaf.issuer,
+                  candidates.contains(where: { crl.isSignatureValid(issuer: $0) }) else { continue }
+            guard (crl.nextUpdate ?? row.nextUpdate) > now else {
+                return "certificate \(serial) was not issued by this DC and its CA's CRL is out of date (\(row.caName)); revocation cannot be checked"
+            }
+            if crl.entry(serialHex: serial) != nil { return "certificate revoked (serial \(serial), CRL of \(row.caName))" }
+            return nil
+        }
+        return "certificate \(serial) was not issued by this DC and there is no CRL of its CA (\(leaf.issuer)) to check it against"
     }
 
     /// `812 µs` / `4.1 ms` from a Duration (seconds and attoseconds both count).
@@ -798,6 +996,8 @@ public struct RadiusConfig: Sendable {
     public var clients: [DirectoryStore.NASClient]
     public var policies: [RADIUSPolicy]
     public var defaultAction: RADIUSDefaultAction
+    /// "Require PEAP crypto binding" (RADIUS ▸ 802.1X; default off).
+    public var requirePEAPCryptoBinding = false
 
     public init(clients: [DirectoryStore.NASClient] = [], policies: [RADIUSPolicy] = [], defaultAction: RADIUSDefaultAction = .reject) {
         self.clients = clients; self.policies = policies; self.defaultAction = defaultAction
@@ -834,7 +1034,9 @@ public struct RadiusConfig: Sendable {
             complete = false
             problems.append("cannot read the default action (\(error))")
         }
-        return (RadiusConfig(clients: clients, policies: policies, defaultAction: action), complete, problems)
+        var config = RadiusConfig(clients: clients, policies: policies, defaultAction: action)
+        config.requirePEAPCryptoBinding = (try? await store.radiusRequirePEAPCryptoBinding()) ?? false
+        return (config, complete, problems)
     }
 
     /// The enabled client whose address/CIDR/range covers `source`.

@@ -160,7 +160,7 @@ final class SignCSRModel {
     }
 
     /// Where to import the certificate (the result card's hint).
-    static let importHint = "Windows: double-click the .p7b ▸ Install Certificate (or `certreq -accept`). "
+    static let importHint = "Windows: double-click the .p7b ▸ Install Certificate (or certreq -accept). "
         + "ClearPass: Administration ▸ Certificates ▸ Certificate Store ▸ Import, the PEM with its chain."
 }
 
@@ -274,7 +274,7 @@ struct TemplateDraft: Equatable {
         for oid in customEKUList where !Self.isOID(oid) { e.append("“\(oid)” is not an OID (like 1.3.6.1.5.5.7.3.9).") }
         if keyUsage.isEmpty && ekus.isEmpty && customEKUList.isEmpty { e.append("Choose at least one key usage or purpose.") }
         if autoEnroll && manualApproval { e.append("Auto-enrollment cannot wait for manual approval.") }
-        if autoEnroll && groupSIDs.isEmpty { e.append("Auto-enrollment needs at least one group that may enrol.") }
+        if autoEnroll && groupSIDs.isEmpty { e.append("Auto-enrollment needs at least one group that may enroll.") }
         if autoEnroll && sanPolicy == .fromRequest { e.append("Auto-enrolled certificates take their name from the directory (computer DNS name or UPN).") }
         return e
     }

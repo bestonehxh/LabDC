@@ -186,7 +186,8 @@ extension DirectoryStore {
         let e = try entry(row)
         let kind: KerberosAccount.Kind = sam.caseInsensitiveCompare("krbtgt") == .orderedSame
             ? .krbtgt : (try isComputerAccount(row) ? .computer : .user)
-        let primary = UInt32(truncatingIfNeeded: e.int("primaryGroupID") ?? 513)
+        // Validated against explicit membership: a forged primaryGroupID never reaches the PAC.
+        let primary = try effectivePrimaryGroupRID(e) ?? 513
         var rids = [primary]
         for gid in try transitiveGroups(of: row.id) {
             guard let g = try self.row(id: gid), let sid = g.sid.flatMap({ try? SID(bytes: $0) }),

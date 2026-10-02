@@ -305,7 +305,11 @@ extension CAService {
             guard label == deviceLabel else {
                 throw DeviceEnrollmentError.badRequest("\(what) \(host) is not the device \(device); a device certificate names only its device")
             }
-            if !boundByAdmin, (try? await store.read(sam: label)) != nil {
+            // A user, group or computer (`NAME$`) account's name: the certificate could sign in
+            // as that account through a name mapping (resolveSignInName tries both).
+            let asAccount = (try? await store.read(sam: label)) ?? nil
+            let asComputer = (try? await store.read(sam: label + "$")) ?? nil
+            if !boundByAdmin, asAccount != nil || asComputer != nil {
                 throw DeviceEnrollmentError.badRequest("\(what) \(host) is an existing account's name; create a challenge bound to this device to allow it")
             }
         }

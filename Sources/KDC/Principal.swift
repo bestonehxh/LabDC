@@ -64,13 +64,21 @@ public struct Principal: Sendable, CustomStringConvertible {
     /// The account's `primaryGroupID` (users and computers from the directory); nil when the
     /// store has none. The PAC then uses 513 for users and the first group RID for computers.
     public var primaryGroupID: UInt32?
+    /// TRUSTED_FOR_DELEGATION (UAC 0x80000): service tickets for this account carry
+    /// OK-AS-DELEGATE (MS-KILE §3.3.5.7), so clients forward their TGT to it (unconstrained
+    /// delegation; Windows' CES client refuses a Kerberos endpoint without it).
+    public var trustedForDelegation: Bool
+    /// NOT_DELEGATED (UAC 0x100000, "account is sensitive and cannot be delegated"): tickets
+    /// issued to this client are never FORWARDABLE (MS-KILE §3.3.5.7).
+    public var notDelegated: Bool
 
     /// `flags` defaults to what `keys` contains.
     public init(name: PrincipalName, realm: String, keys: [KerberosKey], kvno: UInt32, kind: Kind,
                 passwordSet: Date = Date(timeIntervalSince1970: 0), enabled: Bool = true,
                 flags: Flags? = nil, salt: String? = nil, accountExpires: Date? = nil,
                 mustChangePassword: Bool = false, supportedEncryptionTypes: UInt32? = nil,
-                hasExplicitUPN: Bool = false, directoryID: Int64? = nil, primaryGroupID: UInt32? = nil) {
+                hasExplicitUPN: Bool = false, directoryID: Int64? = nil, primaryGroupID: UInt32? = nil,
+                trustedForDelegation: Bool = false, notDelegated: Bool = false) {
         self.name = name
         self.realm = realm
         self.keys = keys
@@ -89,6 +97,8 @@ public struct Principal: Sendable, CustomStringConvertible {
         self.hasExplicitUPN = hasExplicitUPN
         self.directoryID = directoryID
         self.primaryGroupID = primaryGroupID
+        self.trustedForDelegation = trustedForDelegation
+        self.notDelegated = notDelegated
     }
 
     /// `msDS-SupportedEncryptionTypes` as stored, else derived from `flags`

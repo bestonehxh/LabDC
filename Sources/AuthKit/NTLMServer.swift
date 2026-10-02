@@ -136,6 +136,9 @@ public struct NTLMServer: Sendable {
     public let rng: RandomBytes
     /// Fixed server challenge (tests only).
     public var fixedChallenge: [UInt8]?
+    /// Extended Protection (EPA): the MsvAvChannelBindings the AUTHENTICATE must carry on a TLS
+    /// connection. The AV pairs are covered by NTProofStr, so a relay cannot change them.
+    public var channelBinding: ChannelBindingCheck = .none
 
     private(set) var negotiate: NTLMNegotiateMessage?
     private(set) var challengeBytes: [UInt8]?
@@ -268,6 +271,13 @@ public struct NTLMServer: Sendable {
                 throw AuthKitError.ntlm(status: AuthKitError.NTStatus.logonFailure, reason: "MIC does not verify")
             }
             micVerified = true
+        }
+        // EPA (MS-NLMP §3.2.5.1.2): checked after the proof, so a wrong password stays 52e.
+        do {
+            try channelBinding.verify(clientPairs.first { $0.id == NTLMAVPair.channelBindings }?.value, mechanism: "NTLM")
+        } catch {
+            Self.logger.info("NTLM: \(auth.domain, privacy: .public)\\\(auth.user, privacy: .public) refused: \(String(describing: error), privacy: .public)")
+            throw error
         }
         Self.logger.info("NTLM: authenticated \(auth.domain, privacy: .public)\\\(auth.user, privacy: .public)")
         return Result(identity: account.identity,

@@ -341,6 +341,7 @@ public final class RPCServerAuthNegotiator: RPCAuthenticator, @unchecked Sendabl
     public var authType: RPCAuthType { chosen?.authType ?? .none }
     public var authLevel: RPCAuthLevel { chosen?.authLevel ?? .none }
     public var isEstablished: Bool { chosen?.isEstablished ?? false }
+    public var boundPrincipal: String? { chosen?.boundPrincipal }
     public var establishedIdentity: AuthenticatedIdentity? { chosen?.establishedIdentity }
     public var establishedSessionKey: [UInt8]? { chosen?.establishedSessionKey }
 
@@ -424,6 +425,7 @@ final class StubProtectedRPCAuthenticator: RPCAuthenticator, @unchecked Sendable
     var authType: RPCAuthType { locked { inner.authType } }
     var authLevel: RPCAuthLevel { locked { inner.authLevel } }
     var isEstablished: Bool { locked { inner.isEstablished } }
+    var boundPrincipal: String? { locked { inner.boundPrincipal } }
     var establishedIdentity: AuthenticatedIdentity? { locked { (inner as? RPCConnectionIdentity)?.establishedIdentity } }
     var establishedSessionKey: [UInt8]? { locked { (inner as? RPCConnectionIdentity)?.establishedSessionKey } }
 

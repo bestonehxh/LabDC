@@ -28,7 +28,7 @@ let package = Package(
             .product(name: "SwiftASN1", package: "swift-asn1"),
         ]),
         .target(name: "MSPAC", dependencies: ["SheepCrypto"]),
-        .target(name: "Store", dependencies: ["SheepCrypto", "KerberosCrypto", "MSPAC", "RADIUSKit",
+        .target(name: "Store", dependencies: ["SheepCrypto", "KerberosCrypto", "MSPAC", "RADIUSKit", "DHCPKit",
             .product(name: "Crypto", package: "swift-crypto")]),  // RADIUS secrets sealed at rest
         .target(name: "KDC", dependencies: [
             "SheepCrypto", "KerberosCrypto", "KerberosASN1", "MSPAC", "Store",
@@ -54,7 +54,11 @@ let package = Package(
             .product(name: "X509", package: "swift-certificates"),
             .product(name: "SwiftASN1", package: "swift-asn1"),
         ]),
-        .target(name: "DNSKit"),
+        // GSS-TSIG (RFC 3645): TKEY contexts through AuthKit's Kerberos/SPNEGO acceptors.
+        .target(name: "DNSKit", dependencies: ["AuthKit", "MSPAC"]),
+        // Phase 5: DHCPv4/DHCPv6 wire formats, the server state machines, option 43 builders
+        // and the light device classifier (no dependencies: every parser is bounds-checked).
+        .target(name: "DHCPKit"),
         // Phase 4a: RADIUS wire format, MS-CHAPv2 and the policy evaluator.
         .target(name: "RADIUSKit", dependencies: ["SheepCrypto",
             .product(name: "Crypto", package: "swift-crypto")]),
@@ -76,6 +80,14 @@ let package = Package(
         .target(name: "NetlogonService", dependencies: [
             "RPCKit", "Store", "AuthKit", "MSPAC", "SheepCrypto", "KerberosCrypto",
         ]),
+        // MS-BKRP: DPAPI master-key backup (RSA ClientWrap certificate, legacy ServerWrap).
+        .target(name: "BackupKeyService", dependencies: [
+            "RPCKit", "Store", "MSPAC", "SheepCrypto",
+            .product(name: "Crypto", package: "swift-crypto"),
+            .product(name: "_CryptoExtras", package: "swift-crypto"),
+            .product(name: "X509", package: "swift-certificates"),
+            .product(name: "SwiftASN1", package: "swift-asn1"),
+        ]),
         .target(name: "LDAPCore", dependencies: ["Store"]),
         .target(name: "SYSVOL", dependencies: ["Store"]),
         .target(name: "SNTPKit"),
@@ -91,7 +103,7 @@ let package = Package(
             .product(name: "NIOPosix", package: "swift-nio"),
         ]),
         .target(name: "RPCPipes", dependencies: [
-            "SMBKit", "RPCKit", "LSAService", "SAMService", "NetlogonService", "DRSService", "Store",
+            "SMBKit", "RPCKit", "LSAService", "SAMService", "NetlogonService", "DRSService", "BackupKeyService", "Store",
         ]),
         .target(name: "RPCTCP", dependencies: [
             "RPCKit",
@@ -101,7 +113,7 @@ let package = Package(
         // UI-1: the embedded server (ServeRuntime, ServeLog, DataDirectory, serve options) shared by
         // the CLI and the app, plus the app's observable status/log model.
         .target(name: "LabDCCore", dependencies: [
-            "Store", "DNSKit", "RADIUSKit", "EAPKit", "PKIKit", "KDC", "DirectoryKit", "MSPAC", "KerberosCrypto", "AuthKit",
+            "Store", "DNSKit", "DHCPKit", "RADIUSKit", "EAPKit", "PKIKit", "KDC", "DirectoryKit", "MSPAC", "KerberosCrypto", "AuthKit",
             "SMBKit", "RPCKit", "RPCPipes", "RPCTCP", "LSAService", "SAMService", "NetlogonService", "DRSService", "SYSVOL", "SNTPKit",
             "CertConvert",  // UI-3: PKIEditor (trusted-root files)
             // UI-5: Test login (Kerberos AS client, LDAP bind client, NTLM/MS-CHAPv2 responses).
@@ -110,14 +122,14 @@ let package = Package(
             .product(name: "SwiftASN1", package: "swift-asn1"),   // EAP-TLS certificate mapping (UPN otherName)
         ]),
         .target(name: "LabDCCLI", dependencies: [
-            "LabDCCore", "Store", "RADIUSKit", "DNSKit", "PKIKit", "CertConvert", "KDC", "DirectoryKit", "MSPAC", "KerberosCrypto",
+            "LabDCCore", "Store", "RADIUSKit", "DNSKit", "DHCPKit", "PKIKit", "CertConvert", "KDC", "DirectoryKit", "MSPAC", "KerberosCrypto",
             "SMBKit", "RPCKit", "RPCPipes", "RPCTCP", "LSAService", "SAMService", "NetlogonService", "DRSService", "SYSVOL", "SNTPKit",
         ]),
         .executableTarget(name: "labdc", dependencies: ["LabDCCLI"]),
         // UI-1: the SwiftUI app. Named LabDCApp (not LabDC) because `labdc` and
         // `LabDC` would share one build product path on a case-insensitive disk.
         .executableTarget(name: "LabDCApp", dependencies: [
-            "LabDCCore", "Store", "PKIKit", "NetlogonService",
+            "LabDCCore", "Store", "PKIKit", "NetlogonService", "DHCPKit", "AuthKit", "DNSKit",
             "CertConvert", "SYSVOL", .product(name: "X509", package: "swift-certificates"),  // UI-3
         ], path: "Sources/LabDCApp", exclude: ["Bundle"]),
 

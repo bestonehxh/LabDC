@@ -1,4 +1,5 @@
 import Foundation
+import PKIKit
 
 /// Setup wizard step 1: everything derived from the domain name the owner types
 /// (`lab.sheep` → realm `LAB.SHEEP`, NetBIOS `LAB`, base DN `DC=lab,DC=sheep`, DC `dc1.lab.sheep`).
@@ -9,6 +10,8 @@ public struct DomainSetup: Equatable, Sendable {
     public var baseDN: String
     public var dcName: String
     public var dcFQDN: String
+    /// The lab CA's key (wizard ▸ Done: P-384 by default, or P-256).
+    public var caKeyType: CAKeyType = LabPKI.defaultLabCAKeyType
 
     public static let suggested = "lab.sheep"
 
@@ -69,7 +72,8 @@ public struct DomainSetup: Equatable, Sendable {
 
     /// The `--provision` spec for these names.
     public func provisionSpec(adminPassword: String) -> ProvisionSpec {
-        ProvisionSpec(realm: realm, dnsDomain: dnsDomain, netbios: netbios, dcName: dcName, adminPassword: adminPassword)
+        ProvisionSpec(realm: realm, dnsDomain: dnsDomain, netbios: netbios, dcName: dcName, adminPassword: adminPassword,
+                      caKeyType: caKeyType)
     }
 }
 

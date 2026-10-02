@@ -1,5 +1,6 @@
 import Observation
 import LabDCCore
+import PKIKit
 import SwiftUI
 
 /// §7.2: 1 Domain → 2 Administrator → 3 Done (create the domain and start).
@@ -30,6 +31,8 @@ final class SetupWizardModel {
     /// UI-1c: the network devices reach this Mac on (nil = automatic, the first address).
     var advertise: String?
     var interfaces: [NetworkInterfaceChoice]
+    /// The lab CA's key (1 Oct 2026): P-384 / ECDSA SHA-384 by default, P-256 for old gear.
+    var caKeyType: CAKeyType = LabPKI.defaultLabCAKeyType
 
     init(interfaces: [NetworkInterfaceChoice] = NetworkInterfaces.current()) {
         self.interfaces = interfaces
@@ -46,6 +49,7 @@ final class SetupWizardModel {
     /// letters, digits or hyphens, upper-cased).
     var setup: DomainSetup? {
         guard var s = try? derivation.get() else { return nil }
+        s.caKeyType = caKeyType
         guard !netbiosTyped else {
             guard let name = DomainSetup.validNetbios(netbios) else { return nil }
             s.netbios = name
@@ -345,7 +349,7 @@ struct AdministratorStep: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             WizardTitle(text: "Choose the Administrator password.")
-            WizardText(text: "Administrator manages the domain and is the lookup account devices use for LDAP. You can change it later in Settings.")
+            WizardText(text: "Administrator manages the domain and is the lookup account devices use for LDAP. You can change it later in Directory.")
             FieldBox {
                 VStack(alignment: .leading, spacing: 4) {
                     WizardFieldLabel(text: "Password")
@@ -441,6 +445,23 @@ struct DoneStep: View {
                     }
                 }
                 QuietNote("Pick the network your PCs, switches and NAC are on. A Tailscale or VPN address only reaches devices on that VPN.")
+                FieldBox {
+                    HStack(alignment: .center, spacing: 16) {
+                        Text("Lab CA key")
+                            .font(Theme.detail)
+                            .foregroundStyle(Theme.muted)
+                            .frame(width: 150, alignment: .leading)
+                        Picker("Lab CA key", selection: $wizard.caKeyType) {
+                            Text("P-384 · ECDSA SHA-384").tag(CAKeyType.p384)
+                            Text("P-256 · ECDSA SHA-256").tag(CAKeyType.p256)
+                        }
+                        .labelsHidden()
+                        .frame(width: 220)
+                        .accessibilityHint("The key of the root that issues every certificate of the domain")
+                        Spacer(minLength: 0)
+                    }
+                }
+                QuietNote("P-384 is the default and also serves WPA3-Enterprise 192-bit. P-256 suits older network gear; the key can be changed later under Certificates.")
             }
             QuietNote("Next, Overview lists what is still empty: add a user, connect a device, publish the CA.")
         }

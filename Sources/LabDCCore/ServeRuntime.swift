@@ -7,6 +7,7 @@ import KDC
 import LSAService
 import NetlogonService
 import PKIKit
+import RADIUSKit
 import RPCKit
 import RPCPipes
 import RPCTCP
@@ -59,6 +60,9 @@ public struct ServeBoundPorts: Sendable, Equatable {
     public var radacct: Int?
     /// WP-AR2: the NetBIOS session service (tcp 139, the SMB server's second port).
     public var nbss: Int?
+    /// Phase 5: DHCPv4 (udp 67) and DHCPv6 (udp 547); nil until a scope exists.
+    public var dhcp: Int?
+    public var dhcpv6: Int?
 
     public init() {}
 }
@@ -82,6 +86,7 @@ public struct ServeBoundPorts: Sendable, Equatable {
 ///     MS-XCEP `/ADPolicyProvider_CEP_Kerberos/service.svc/CEP` and MS-WSTEP
 ///     `/<CA>_CES_Kerberos/service.svc/CES` (Windows certificate auto-enrollment)
 /// 13. Phase 4a: RADIUS (udp 1812 auth + 1813 accounting), always with the directory
+/// 14. Phase 5: DHCP (udp 67 + 547), once at least one scope exists
 public actor ServeRuntime {
     public static let vendorVersion = "LabDC 1.0 (phase 1)"
 
@@ -104,9 +109,13 @@ public actor ServeRuntime {
     private var httpsPortBox: HTTPSPortBox?
     private var crlTimer: Task<Void, Never>?
     private var dns: DNSServer?
+    /// The running DNS server's responder (Settings ▸ DNS "Dynamic updates" is applied to it live).
+    private var dnsResponder: DNSResponder?
     /// Where names outside the domain go (Settings ▸ Directory ▸ Other names, `--forwarders`).
     private var dnsForwarder: DNSForwarder?
     private let forwardingState = DNSForwardingState()
+    /// Who may use DNS as a resolver (this Mac's networks, the DHCP scopes, `--dns-allow`).
+    private var dnsRecursionACL: DNSRecursionACL?
     private var kdc: KDCServer?
     private var kpasswd: KPasswdServer?
     private var ldap: DirectoryServer?
@@ -117,12 +126,33 @@ public actor ServeRuntime {
     private var nbns: NBNSServer?
     /// Phase 4a: the RADIUS server (auth + accounting listeners live inside it).
     private var radius: RadiusServer?
+    /// Phase 5: where RADIUS reads device profiles (policy facts) and their change feed (CoA).
+    /// `NoDeviceProfiles` until the DHCP side's store profiles are wired in.
+    public private(set) var deviceProfiles: DeviceProfileSource = NoDeviceProfiles()
     /// Why RADIUS did not start with the rest (a held udp 1812/1813). RADIUS never stops the
     /// directory from starting; the Services row shows the problem and offers Restart.
     public private(set) var radiusStartFailure: String?
+    /// Phase 5: the DHCP server (nil while no scope exists).
+    public private(set) var dhcp: DHCPServer?
+    /// Why DHCPv4 did not start (udp 67 held, e.g. by bootpd for Internet Sharing). Like
+    /// RADIUS, it never stops the directory from starting.
+    public private(set) var dhcpStartFailure: String?
+    /// The pinned advertised address the DHCP server hands out (nil = first interface address).
+    private let dhcpAdvertise = AdvertisedAddressBox()
+    /// Why DHCPv6 did not start (udp 547 held, e.g. by InternetSharing). v4 and v6 are
+    /// independent listeners: either runs without the other.
+    public private(set) var dhcpv6StartFailure: String?
+    /// While a DHCP family failed only because its port is busy, binding is retried this often
+    /// in the background (it comes up by itself once Internet Sharing exits).
+    public private(set) var dhcpRetryInterval: Duration = .seconds(30)
+    private var dhcpRetryTask: Task<Void, Never>?
+    /// Services ▸ Stop on DHCP: a new scope does not start it again until Start.
+    public private(set) var dhcpStoppedByOwner = false
     /// On-demand issuance of the 192-bit RADIUS certificate (`eapCredentials`): after a failure
     /// it is tried again at most every 10 minutes, with one log line per attempt.
     var suiteBIssuance = RetryWindow(interval: .seconds(600))
+    /// The same for the RSA RADIUS certificate ("Allow RSA-only devices").
+    var rsaIssuance = RetryWindow(interval: .seconds(600))
     /// The shared dynamic `ncacn_ip_tcp` endpoint (LSARPC/SAMR/NETLOGON) and the endpoint mapper (135).
     private var rpcTCP: RPCTCPServer?
     private var epm: RPCTCPServer?
@@ -164,7 +194,10 @@ public actor ServeRuntime {
                 throw CLIError.failure("provisioning failed: \(error)")
             }
             let info = try await store.domainInfo()
-            log.event("Store", "provisioned \(info.realm) (DNS \(info.dnsDomain), NetBIOS \(info.netbiosDomain), DC \(info.dcDNSName), SID \(info.domainSID))")
+            // The lab CA is made at the first start (`ensureCA`) with this key.
+            try await store.setDomainValue(provision.caKeyType.rawValue, forKey: CAService.labCAKeyTypeKey)
+            log.event("Store", "provisioned \(info.realm) (DNS \(info.dnsDomain), NetBIOS \(info.netbiosDomain), DC \(info.dcDNSName), SID \(info.domainSID), "
+                      + "lab CA \(provision.caKeyType.displayName))")
         } else if !provisioned {
             throw CLIError.failure("the store at \(data.storeURL.path) is not provisioned; start once with "
                                    + "--provision realm=LAB.SHEEP dns=lab.sheep netbios=LABSHEEP dc=dc1 admin-password=<pw>")
@@ -188,6 +221,9 @@ public actor ServeRuntime {
         // 1. Store
         let store = try await Self.openStore(data, provision: options.provision, log: log)
         self.store = store
+        // Phase 5: RADIUS reads the DHCP side's device profiles (policy facts, auto-CoA) unless
+        // a test or the app handed in another source.
+        if deviceProfiles is NoDeviceProfiles { deviceProfiles = StoreDeviceProfileSource(store: store) }
         let info = try await store.domainInfo()
         log.event("Store", "\(data.storeURL.path): realm \(info.realm), DC \(info.dcDNSName)")
 
@@ -196,8 +232,12 @@ public actor ServeRuntime {
         let caService: CAService
         do {
             pki = try await LabPKI.open(directory: data.pkiURL)
+            // A new domain's lab CA gets the key chosen at provisioning (P-384 by default); an
+            // existing lab CA is kept as it is (never re-keyed: `labdc ca migrate` changes roots).
+            let keyType = ((try? await store.domainValue(forKey: CAService.labCAKeyTypeKey)) ?? nil)
+                .flatMap(CAKeyType.init(rawValue:)) ?? LabPKI.defaultLabCAKeyType
             let ca = try await pki.ensureCA(name: "LabDC Lab CA (\(info.realm))",
-                                            alsoAccepting: ["SheepAuth Lab CA (\(info.realm))"])  // never re-key a live CA
+                                            alsoAccepting: ["SheepAuth Lab CA (\(info.realm))"], keyType: keyType)
             let current = try await pki.currentAuthority()
             let previous = try? await pki.serverCertificate()
             let names = serverNames(info)
@@ -210,6 +250,7 @@ public actor ServeRuntime {
             }
             caService = try await CAService.open(pki: pki, store: store)
             await prepareSuiteB(caService: caService, pki: pki, info: info)
+            await prepareRSACompatibility(caService: caService, pki: pki, info: info)
             if options.httpEnabled, options.ports.http != 0 { try? await caService.setPublicationPort(Int(options.ports.http)) }
             await recordServerCertificate(caService, pki: pki, info: info)
             let refreshed = try await caService.refreshCRLs()
@@ -233,9 +274,16 @@ public actor ServeRuntime {
         // 3. DNS
         if options.dnsEnabled {
             let log = self.log
+            // GSS-TSIG: members ask for a ticket to DNS/<dc fqdn> before a secure update.
+            do {
+                let added = try await store.ensureDNSServicePrincipalNames()
+                if !added.isEmpty { log.event("DNS", "service principal names added to the DC account: \(added.joined(separator: ", "))") }
+            } catch {
+                log.warning("DNS", "cannot add the DNS service principal names to the DC account: \(error)")
+            }
             let source = StoreZoneSource(store: store, advertise: options.advertise,
                                          onChange: { line in log.event("DNS", line) })
-            let server = makeDNSServer(source: source, port: ports.dns)
+            let server = await makeDNSServer(source: source, port: ports.dns)
             do { try await server.start() } catch {
                 throw CLIError.failure("DNS udp+tcp \(ports.dns): \(error)")
             }
@@ -302,6 +350,15 @@ public actor ServeRuntime {
             }
         }
 
+        // 14. DHCP (phase 5): with the directory once a scope exists; a held port is a problem
+        // on its Services row.
+        if options.dhcpEnabled {
+            do { try await startDHCPIfNeeded(store: store) } catch {
+                recordDHCPError(error)
+                log.warning("DHCP", "\(error)")
+            }
+        }
+
         if options.addressCheckInterval > 0 {
             let interval = options.addressCheckInterval
             watcher = Task { [weak self] in
@@ -335,6 +392,15 @@ public actor ServeRuntime {
             } catch {
                 throw CLIError.failure("SYSVOL \(data.sysvolURL.path): \(error)")
             }
+            do {
+                let dropped = try await GroupPolicyEditor(root: data.sysvolURL, store: store).dropOrphanDot1XExtensions()
+                if !dropped.isEmpty {
+                    log.event("GPO", "802.1X: removed \(dropped.count == 2 ? "the wireless and wired" : dropped[0] == GPOExtensionNames.wirelessCSE ? "the wireless" : "the wired") "
+                              + "extension left without a policy (gpupdate reported it failed); PCs drop the old profiles at their next gpupdate")
+                }
+            } catch {
+                log.warning("GPO", "cannot check the 802.1X extensions: \(error)")
+            }
 
             if let problem = PortProbe.problem(port: ports.smb, protos: [.tcp]) {
                 throw CLIError.failure("SMB tcp \(ports.smb): \(problem)")
@@ -350,7 +416,6 @@ public actor ServeRuntime {
                     netbiosPort = Int(ports.nbss)
                 }
             }
-            let pipes = dcServicesShared(store: store, info: info).pipeServices()
             var config: SMBServerConfig
             do { config = try await SMBServerConfig.from(store: store) } catch {
                 throw CLIError.failure("SMB config from store: \(error)")
@@ -360,6 +425,11 @@ public actor ServeRuntime {
             do { secrets = try await StoreSecretSource(store: store) } catch {
                 throw CLIError.failure("SMB secret source: \(error)")
             }
+            // MS-BKRP: `\protected_storage` needs RPC-level NTLMSSP / SPNEGO / Kerberos at packet
+            // privacy (DPAPI binds that way), so that pipe gets the same negotiator as the TCP endpoint.
+            let pipes = dcServicesShared(store: store, info: info).pipeServices(rpcAuth: RPCServerAuthConfig(
+                makeNTLMServer: { NTLMServer(source: secrets, allowAnonymous: false) },
+                makeKerberosAcceptor: { KerberosAcceptor(source: secrets) }))
             let server = SMBServer(port: Int(ports.smb), netbiosPort: netbiosPort,
                                    shares: SMBShare.domainController(sysvol: data.sysvolURL.path, dnsDomain: info.dnsDomain),
                                    pipes: pipes, auth: SMBAuthPolicy(), secrets: secrets, config: config)
@@ -370,7 +440,7 @@ public actor ServeRuntime {
             bound.smb = server.boundPort
             bound.nbss = server.boundNetbiosPort
             log.event("SMB", "tcp \(server.boundPort ?? Int(ports.smb)): IPC$, SYSVOL, NETLOGON; "
-                      + "pipes \\samr \\lsarpc \\netlogon \\srvsvc \\wkssvc")
+                      + "pipes \\samr \\lsarpc \\netlogon \\srvsvc \\wkssvc \\protected_storage")
             if let nb = server.boundNetbiosPort {
                 log.event("NBSS", "tcp \(nb): NetBIOS session service (SMB over NetBIOS)")
             }
@@ -441,7 +511,9 @@ public actor ServeRuntime {
             netlogonConfig: NetlogonServiceConfig(ntlmAuth: options.ntlmAuth,
                                                   onEvent: { line in log.event("NETLOGON", line) }),
             // WP-AM: DsBind / DsCrackNames / DsUnbind outcomes (`DRSUAPI DsCrackNames offered=7(CANONICAL) ...`).
-            drsOnEvent: { line in log.event("DRSUAPI", line) })
+            drsOnEvent: { line in log.event("DRSUAPI", line) },
+            // MS-BKRP: `BKRP RetrieveBackupKey from best@192.0.2.10 -> OK key {…}`.
+            backupKeyOnEvent: { line in log.event("BKRP", line) })
         dcServices = s
         return s
     }
@@ -495,7 +567,7 @@ public actor ServeRuntime {
         }
         epm = epmServer
         bound.epm = epmServer.boundPort
-        log.event("RPC", "ncacn_ip_tcp \(dynPort): lsarpc, dssetup, samr, netlogon, drsuapi "
+        log.event("RPC", "ncacn_ip_tcp \(dynPort): lsarpc, dssetup, samr, netlogon, drsuapi, backupkey "
                   + "(NTLMSSP / SPNEGO / Kerberos DCE-style / Netlogon schannel auth); "
                   + "endpoint mapper tcp \(epmServer.boundPort ?? Int(ports.epm))")
     }
@@ -615,7 +687,8 @@ public actor ServeRuntime {
                                    onEvent: { line in log.event("XCEP", Self.dropPrefix(line, "XCEP ")) })
             let wstep = WSTEPService(ca: caService, onEvent: { line in log.event("WSTEP", Self.dropPrefix(line, "WSTEP ")) })
             service = EnrollmentWebService(xcep: xcep, wstep: wstep,
-                                           authenticator: HTTPNegotiateAuthenticator(source: secrets),
+                                           authenticator: HTTPNegotiateAuthenticator(source: secrets, allowNTLM: options.cesAllowNTLM,
+                                                                                     channelBinding: options.cesChannelBinding),
                                            onEvent: { line in log.event("HTTPS", line) })
             enrollmentWeb = service
             httpsPortBox = portBox
@@ -634,7 +707,7 @@ public actor ServeRuntime {
         let base = "https://\(info.dcDNSName)\(httpsPort == 443 ? "" : ":\(httpsPort)")"
         let ca = (try? await pki.currentAuthority().name) ?? LabPKI.labCAName
         log.event("HTTPS", "tcp \(httpsPort): CEP \(base)\(XCEPService.path), CES \(base)/\(ca)_CES_Kerberos/service.svc/CES "
-                  + "(Negotiate: Kerberos HTTP/\(info.dcDNSName), NTLM)")
+                  + "(Negotiate: Kerberos HTTP/\(info.dcDNSName)\(options.cesAllowNTLM ? ", NTLM with channel binding" : ", NTLM off"))")
     }
 
     static func dropPrefix(_ line: String, _ prefix: String) -> String {
@@ -647,6 +720,8 @@ public actor ServeRuntime {
     /// a 192-bit profile is published or a 192-bit template enabled.
     private func prepareSuiteB(caService: CAService, pki: LabPKI, info: DomainInfo) async {
         do {
+            // A P-384 current CA (new domains) serves 192-bit with the DC certificate itself.
+            if try await pki.mainCAServesSuiteB() { return }
             var created = false
             if try await !pki.hasSuiteBCA() {
                 let wanted = (try? await caService.templates())?.contains { $0.enabled && $0.issuingCA == LabPKI.suiteBCAName } ?? false
@@ -661,6 +736,53 @@ public actor ServeRuntime {
         } catch {
             log.warning("PKI", "802.1X 192-bit CA / RADIUS certificate: \(error) — WPA3-Enterprise 192-bit clients cannot connect")
         }
+    }
+
+    /// "Allow RSA-only devices" at start: the RSA compatibility root (made when the toggle was
+    /// switched on) gets its RSA RADIUS certificate renewed. Nothing while the toggle is off.
+    private func prepareRSACompatibility(caService: CAService, pki: LabPKI, info: DomainInfo) async {
+        guard await caService.rsaCompatibilityEnabled() else { return }
+        do {
+            let created = try await caService.ensureRSACompatAuthority()
+            if try await pki.ensureRSAServerCertificate(hostname: info.dcDNSName) == .issued || created {
+                log.event("PKI", "RSA compatibility CA (RSA-3072) \(created ? "created" : "loaded"), RSA RADIUS certificate issued for \(info.dcDNSName)")
+                await recordRSAServerCertificate(caService, pki: pki, info: info)
+            }
+        } catch {
+            log.warning("PKI", "RSA compatibility CA / RADIUS certificate: \(error) — RSA-only devices cannot connect")
+        }
+    }
+
+    private func recordRSAServerCertificate(_ service: CAService, pki: LabPKI, info: DomainInfo) async {
+        guard let certificate = await pki.rsaServerCertificate() else { return }
+        let dcSID = try? await store?.read(dn: info.dcComputerDN)?.sid?.description
+        do {
+            try await service.record(certificate, caName: LabPKI.rsaCompatCAName, templateName: "RadiusServerRSA",
+                                     requester: RequesterIdentity(name: info.dcName.uppercased() + "$", sid: dcSID))
+        } catch {
+            log.warning("PKI", "cannot record the RSA RADIUS certificate: \(error)")
+        }
+    }
+
+    /// The RSA credential while "Allow RSA-only devices" is on, its certificate issued here on
+    /// first need (the toggle switched on while running).
+    private func rsaCredential() async -> TLSContext.Credential? {
+        guard let pki, let caService, await caService.rsaCompatibilityEnabled() else { return nil }
+        if let c = (try? await pki.eapRSACredentials()) ?? nil { return TLSContext.Credential(chain: c.chain, keyDER: c.keyDER) }
+        guard rsaIssuance.allows(), let store, let info = try? await store.domainInfo(), rsaIssuance.begin() else { return nil }
+        do {
+            try await caService.ensureRSACompatAuthority()
+            if try await pki.ensureRSAServerCertificate(hostname: info.dcDNSName) == .issued {
+                log.event("PKI", "RSA RADIUS certificate issued for \(info.dcDNSName)")
+                await recordRSAServerCertificate(caService, pki: pki, info: info)
+            }
+            rsaIssuance.succeeded()
+        } catch {
+            rsaIssuance.failed()
+            log.warning("PKI", "RSA RADIUS certificate: \(error) — RSA-only devices cannot connect; next try in \(rsaIssuance.intervalText)")
+            return nil
+        }
+        return ((try? await pki.eapRSACredentials()) ?? nil).map { TLSContext.Credential(chain: $0.chain, keyDER: $0.keyDER) }
     }
 
     /// The EAP credentials, read per use: the DC certificate and, once the 802.1X 192-bit CA
@@ -687,7 +809,8 @@ public actor ServeRuntime {
             }
         }
         return EAPCredentials(chain: c.chain, keyDER: c.keyDER,
-                              suiteB: suiteB.map { TLSContext.Credential(chain: $0.chain, keyDER: $0.keyDER) })
+                              suiteB: suiteB.map { TLSContext.Credential(chain: $0.chain, keyDER: $0.keyDER) },
+                              rsa: await rsaCredential())
     }
 
     private func recordSuiteBServerCertificate(_ service: CAService, pki: LabPKI, info: DomainInfo) async {
@@ -729,6 +852,8 @@ public actor ServeRuntime {
         let log = self.log
         config.onBind = { line in log.event("LDAP", "bind " + line) }
         config.allowPlainSimpleBind = options.allowPlainLDAP
+        config.requireLDAPSigning = options.requireLDAPSigning
+        config.ldapChannelBinding = options.ldapChannelBinding
         let server = DirectoryServer(store: store, pki: pki, config: config)
         do { try await server.start() } catch {
             throw CLIError.failure("LDAP tcp \(p.ldap)/\(p.ldaps)/\(p.gc)/\(p.gcs): \(error)")
@@ -785,7 +910,9 @@ public actor ServeRuntime {
         } catch {
             log.warning("PKI", "certificate reissue / LDAP restart failed: \(error)")
         }
-        if now.count > 1, options.advertise == nil { log.warning("serve", Self.multipleAddressWarning(Array(now))) }
+        if now.count > 1, options.advertise == nil {
+            log.warning("serve", Self.multipleAddressWarning(Array(now), app: options.inApp))
+        }
     }
 
     /// Stops everything, in reverse order. Safe to call twice.
@@ -812,6 +939,12 @@ public actor ServeRuntime {
         dcServices = nil
         await nbns?.stop()
         nbns = nil
+        dhcpRetryTask?.cancel()
+        dhcpRetryTask = nil
+        await dhcp?.stop()
+        dhcp = nil
+        dhcpStartFailure = nil
+        dhcpv6StartFailure = nil
         radius?.stop()
         radius = nil
         radiusStartFailure = nil
@@ -833,9 +966,12 @@ public actor ServeRuntime {
         bound = ServeBoundPorts()
     }
 
-    public static func multipleAddressWarning(_ addresses: [String]) -> String {
+    /// `app`: the LabDC app says where its setting is instead of the CLI flag (owner, 2 Oct 2026).
+    public static func multipleAddressWarning(_ addresses: [String], app: Bool = false) -> String {
         "this Mac has \(addresses.count) LAN IPv4 addresses (\(addresses.sorted().joined(separator: ", "))); DNS publishes all of them "
-            + "and CLDAP answers with the address a ping arrived on. Pass --advertise <ipv4> to pin the one Windows clients should use."
+            + "and CLDAP answers with the address a ping arrived on. "
+            + (app ? "Choose the one Windows clients should use in Settings ▸ System ▸ Network."
+                   : "Pass --advertise <ipv4> to pin the one Windows clients should use.")
     }
 
     /// The startup banner: realm, every bound port, the store and the CA.
@@ -865,6 +1001,8 @@ public actor ServeRuntime {
         row("HTTP", "tcp", bound.http)
         row("EST", "tcp", bound.est)
         row("HTTPS", "tcp", bound.https)
+        row("DHCP", "udp", bound.dhcp)
+        row("DHCPv6", "udp", bound.dhcpv6)
         lines.append("  store     \(data.storeURL.path)")
         lines.append("  lab CA    \(data.caURL.path)")
         let current = try? await pki?.currentAuthority()
@@ -915,6 +1053,7 @@ extension ServeRuntime {
     public func setAdvertise(_ address: String?, label: String? = nil) async throws {
         guard address != options.advertise else { return }
         options.advertise = address
+        dhcpAdvertise.set(address)
         let advertised = advertisedIPv4
         let how = address == nil ? "automatic, first address" : "pinned in Settings"
         log.event("serve", "advertising \(advertised ?? "no address (127.0.0.1)")" + (label.map { " on \($0)" } ?? "") + " (\(how))")
@@ -928,12 +1067,45 @@ extension ServeRuntime {
 
     /// A DNS server whose forwarder follows `forwardingState` (the setting, this Mac's addresses
     /// and the bound port, so it never forwards to itself).
-    private func makeDNSServer(source: StoreZoneSource, port: UInt16) -> DNSServer {
+    private func makeDNSServer(source: StoreZoneSource, port: UInt16) async -> DNSServer {
         forwardingState.update(forwarding: options.dnsForwarding, port: port, advertise: options.advertise)
         let state = forwardingState
         let forwarder = DNSForwarder(plan: { state.plan() })
         dnsForwarder = forwarder
-        return DNSServer(source: source, port: port, forwarder: forwarder)
+        let acl = DNSRecursionACL(store: source.store, extra: options.dnsAllowedClients)
+        dnsRecursionACL = acl
+        // GSS-TSIG secure updates: TKEY contexts from DNS/<dc> tickets (one replay cache).
+        var secure: DNSSecureUpdateConfig?
+        if let secrets = try? await StoreSecretSource(store: source.store) {
+            let replay = ReplayCache()
+            secure = DNSSecureUpdateConfig(kerberos: { KerberosAcceptor(source: secrets, replayCache: replay) },
+                                           directory: StoreDNSUpdateDirectory(store: source.store))
+        } else {
+            log.warning("DNS", "secure dynamic updates (GSS-TSIG) are unavailable: the directory has no Kerberos secrets")
+        }
+        // Recursion only for this Mac's networks, the DHCP scopes and `--dns-allow`; UDP response
+        // rate limiting on (DNSRateLimit defaults); unsigned updates under `.ownAddress` (or none,
+        // per Settings ▸ DNS "Dynamic updates").
+        let log = self.log
+        let responder = DNSResponder(source: source, forwarder: forwarder, recursion: acl.policy, rateLimit: DNSRateLimit(),
+                                     updateMode: options.dnsUpdateMode, secure: secure,
+                                     onEvent: { line in log.event("DNS", line) })
+        dnsResponder = responder
+        return DNSServer(responder: responder, port: port)
+    }
+
+    /// Settings ▸ DNS "Dynamic updates": applied live, DNS keeps running.
+    public func setDNSUpdateMode(_ mode: DNSDynamicUpdateMode) async {
+        guard mode != options.dnsUpdateMode else { return }
+        options.dnsUpdateMode = mode
+        await dnsResponder?.setUpdateMode(mode)
+        log.event("DNS", "dynamic updates: \(mode.settingsLabel.lowercased())")
+    }
+
+    /// Settings ▸ the networks allowed to resolve names outside the domain: applied live.
+    public func setDNSAllowedClients(_ networks: [DNSNetwork]) {
+        options.dnsAllowedClients = networks
+        dnsRecursionACL?.setExtra(networks)
     }
 
     private func dnsServerStarted(_ server: DNSServer) async {
@@ -997,6 +1169,68 @@ extension ServeRuntime {
         log.event("serve", "restart \(name) -> OK" + (ports.isEmpty ? "" : " (\(ports))"))
     }
 
+    /// Services ▸ Stop (owner, 1 Oct 2026): stops the listeners of one service and leaves the
+    /// others running; `restartInPlace` starts them again.
+    public func stopInPlace(_ listeners: [ServeListener], name: String) async {
+        var groups: [ServeListener] = []
+        for l in listeners {
+            let head = l.restartsWith.first ?? l
+            if !groups.contains(head) { groups.append(head) }
+        }
+        // Ephemeral ports are pinned first, so Start brings the service back on the same port.
+        for group in groups {
+            for l in group.restartsWith where options.ports[l] == 0 {
+                if let p = l.bound(in: bound) { options.ports[l] = UInt16(truncatingIfNeeded: p) }
+            }
+        }
+        for group in groups { await stopListener(group) }
+        log.event("serve", "stop \(name) -> OK")
+    }
+
+    private func stopListener(_ listener: ServeListener) async {
+        switch listener {
+        case .dns:
+            dns?.stop(); dns = nil; bound.dns = nil
+        case .kdc:
+            kdc?.stop(); kdc = nil; bound.kdc = nil
+        case .kpasswd:
+            kpasswd?.stop(); kpasswd = nil; bound.kpasswd = nil
+        case .ldap, .ldaps, .gc, .gcs:
+            await ldap?.stop(); ldap = nil
+            bound.ldap = nil; bound.ldaps = nil; bound.gc = nil; bound.gcs = nil
+        case .cldap:
+            cldap?.stop(); cldap = nil; bound.cldap = nil
+        case .smb, .sntp, .nbss:
+            await smb?.stop(); smb = nil; bound.smb = nil; bound.nbss = nil
+            sntp?.stop(); sntp = nil; bound.sntp = nil
+            await nbns?.stop(); nbns = nil; bound.nbns = nil
+        case .nbns:
+            await nbns?.stop(); nbns = nil; bound.nbns = nil
+        case .radius, .radacct:
+            radius?.stop(); radius = nil
+            bound.radius = nil; bound.radacct = nil
+            radiusStartFailure = nil
+        case .dhcp, .dhcpv6:
+            dhcpRetryTask?.cancel(); dhcpRetryTask = nil
+            await dhcp?.stop(); dhcp = nil
+            bound.dhcp = nil; bound.dhcpv6 = nil
+            dhcpStartFailure = nil
+            dhcpv6StartFailure = nil
+            dhcpStoppedByOwner = true
+        case .epm, .rpc:
+            await epm?.stop(); epm = nil; bound.epm = nil
+            await rpcTCP?.stop(); rpcTCP = nil; bound.rpc = nil
+        case .http:
+            crlTimer?.cancel(); crlTimer = nil
+            await http?.stop(); http = nil; bound.http = nil
+            scepService = nil
+        case .est:
+            await est?.stop(); est = nil; bound.est = nil
+        case .https:
+            await https?.stop(); https = nil; bound.https = nil; enrollmentWeb = nil
+        }
+    }
+
     private func restartListener(_ listener: ServeListener) async throws {
         guard let store, let pki, let info = try? await store.domainInfo() else { return }
         let ports = options.ports
@@ -1007,7 +1241,7 @@ extension ServeRuntime {
             dns?.stop(); dns = nil; bound.dns = nil
             await Self.waitUntilFree(ports.dns, [.udp, .tcp])
             let source = StoreZoneSource(store: store, advertise: options.advertise, onChange: { line in log.event("DNS", line) })
-            let server = makeDNSServer(source: source, port: ports.dns)
+            let server = await makeDNSServer(source: source, port: ports.dns)
             do { try await server.start() } catch { throw CLIError.failure("DNS udp+tcp \(ports.dns): \(error)") }
             dns = server
             bound.dns = server.port
@@ -1073,6 +1307,20 @@ extension ServeRuntime {
             await Self.waitUntilFree(ports.radius, [.udp])
             await Self.waitUntilFree(ports.radacct, [.udp])
             try await startRadius(store: store)
+        case .dhcp, .dhcpv6:
+            // Wait only for ports this server held: a port someone else holds (Internet
+            // Sharing) does not come free by waiting here, and the start reports it at once.
+            let had4 = bound.dhcp != nil, had6 = bound.dhcpv6 != nil
+            dhcpRetryTask?.cancel(); dhcpRetryTask = nil
+            await dhcp?.stop(); dhcp = nil
+            bound.dhcp = nil; bound.dhcpv6 = nil
+            dhcpStartFailure = nil
+            dhcpv6StartFailure = nil
+            dhcpStoppedByOwner = false
+            guard options.dhcpEnabled else { return }
+            if had4 { await Self.waitUntilFree(ports.dhcp, [.udp]) }
+            if had6 { await Self.waitUntilFree(ports.dhcpv6, [.udp]) }
+            try await startDHCPIfNeeded(store: store)
         case .epm, .rpc:
             try await restartRPC(store: store, info: info)
         case .http:
@@ -1098,7 +1346,8 @@ extension ServeRuntime {
     static func waitUntilFree(_ port: UInt16, _ protos: [PortProbe.Proto]) async {
         guard port != 0 else { return }
         for _ in 0..<100 {
-            if PortProbe.problem(port: port, protos: protos) == nil { return }
+            // `isFree`, not `problem`: the latter runs lsof/pgrep for the holder on every try.
+            if PortProbe.isFree(port: port, protos: protos) { return }
             try? await Task.sleep(for: .milliseconds(50))
         }
     }
@@ -1115,15 +1364,18 @@ extension ServeRuntime {
         let log = self.log
         // Phase 4b: EAP (TLS, PEAP, TTLS) with the DC certificate; client certificates must
         // chain to one of this DC's CAs. Read per use, so a reissued certificate (or a 192-bit
-        // CA created while running) is picked up.
-        let pki = self.pki
+        // CA created while running) is picked up. Trusted: every CA except a retired root and the
+        // RSA compatibility root while RSA-only devices are not allowed.
+        let caService = self.caService
         let server = RadiusServer(store: store,
                                   eapCredentials: { [weak self] in await self?.eapCredentials() },
-                                  trustRoots: { (try? await pki?.authorityCertificatesDER()) ?? [] },
+                                  trustRoots: { (try? await caService?.eapTrustedRootsDER()) ?? [] },
+                                  profiles: deviceProfiles,
                                   log: { line in log.event("RADIUS", line) })
         do { try server.start(authPort: ports.radius, acctPort: ports.radacct) } catch {
             throw CLIError.failure("RADIUS udp \(ports.radius)+\(ports.radacct): \(error)")
         }
+        server.watchDeviceProfiles()
         radius = server
         bound.radius = Int(server.authPort)
         bound.radacct = Int(server.acctPort)
@@ -1132,6 +1384,183 @@ extension ServeRuntime {
     /// A RADIUS client or policy changed (app, CLI through the app): the server reloads its config.
     public func radiusConfigChanged() {
         radius?.configChanged()
+    }
+
+    /// Phase 5: binds DHCP when at least one scope exists (errors name `DHCP udp 67` /
+    /// `DHCPv6 udp 547` for the Services row). v4 and v6 are independent listeners: v4 binds
+    /// once any scope exists, v6 only when DHCPv6 is on AND a v6 scope exists (the same rule at
+    /// start, on a scope change and on Restart). A busy port of one family leaves the other
+    /// running and is recorded in `dhcpStartFailure` / `dhcpv6StartFailure` (logged unless
+    /// `quiet`); this throws only when no family could bind. A busy port is retried in the
+    /// background (`dhcpRetryInterval`).
+    private func startDHCPIfNeeded(store: DirectoryStore, quiet: Bool = false) async throws {
+        guard dhcp == nil else { return }
+        dhcpStartFailure = nil
+        dhcpv6StartFailure = nil
+        let scopes = try await store.dhcpScopes()
+        guard !scopes.isEmpty else { return }
+        defer { scheduleDHCPRetryIfNeeded() }
+        let ports = options.ports
+        let v6Setting = (try? await store.dhcpSettings())?.enableV6 ?? false
+        let wantV6 = options.dhcpV6Enabled && v6Setting && scopes.contains { $0.family == .v6 }
+        if ports.dhcp != 0, let problem = PortProbe.problem(port: ports.dhcp, protos: [.udp]) {
+            dhcpStartFailure = "DHCP udp \(ports.dhcp): \(problem)"
+        }
+        if wantV6, ports.dhcpv6 != 0, let problem = PortProbe.problem(port: ports.dhcpv6, protos: [.udp]) {
+            dhcpv6StartFailure = "DHCPv6 udp \(ports.dhcpv6): \(problem)"
+        }
+        let use4 = dhcpStartFailure == nil, use6 = wantV6 && dhcpv6StartFailure == nil
+        guard use4 || use6 else {
+            // Nothing binds: the caller logs (and Restart reports) the v4 problem; v6's here.
+            if let why6 = dhcpv6StartFailure, !quiet { log.warning("DHCP", why6) }
+            throw CLIError.failure(dhcpStartFailure ?? "DHCP: nothing to bind")
+        }
+        let log = self.log
+        // Read at every reply, not captured at start: a new address in Settings (owner, 1 Oct
+        // 2026: DNS/NTP options kept the old Tailscale address) applies without a DHCP restart.
+        let advertise = dhcpAdvertise
+        advertise.set(options.advertise)
+        let server = DHCPServer(store: store,
+                                options: DHCPServer.Options(v4Port: ports.dhcp, v6Port: ports.dhcpv6, enableV4: use4, enableV6: use6),
+                                advertised: { advertise.get() ?? ServeAddresses.current().first },
+                                log: { line in log.event("DHCP", line) }, warn: { line in log.warning("DHCP", line) })
+        do {
+            try await server.start()
+        } catch {
+            recordDHCPError(error)
+            throw error
+        }
+        dhcp = server
+        bound.dhcp = use4 ? Int(server.v4Port) : nil
+        bound.dhcpv6 = use6 ? Int(server.v6Port) : nil
+        if !quiet {
+            for why in [dhcpStartFailure, dhcpv6StartFailure].compactMap({ $0 }) { log.warning("DHCP", why) }
+        }
+    }
+
+    /// Records a DHCP start error on the family it names.
+    private func recordDHCPError(_ error: Error) {
+        let message = "\(error)"
+        if message.hasPrefix("DHCPv6 ") { dhcpv6StartFailure = message } else { dhcpStartFailure = message }
+    }
+
+    /// Whether a recorded DHCP failure is only a busy port (worth retrying in the background).
+    static func isBusyPort(_ failure: String?) -> Bool { failure?.contains("is in use") ?? false }
+
+    /// Tests: a shorter background retry.
+    func setDHCPRetryInterval(_ interval: Duration) {
+        dhcpRetryInterval = interval
+    }
+
+    /// Starts the background retry while a family failed on a busy port; stops it otherwise.
+    private func scheduleDHCPRetryIfNeeded() {
+        let busy = Self.isBusyPort(dhcpStartFailure) || Self.isBusyPort(dhcpv6StartFailure)
+        guard busy else {
+            dhcpRetryTask?.cancel()
+            dhcpRetryTask = nil
+            return
+        }
+        guard dhcpRetryTask == nil else { return }
+        dhcpRetryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let interval = await self?.dhcpRetryInterval else { return }
+                try? await Task.sleep(for: interval)
+                guard !Task.isCancelled, let self, await self.retryDHCPBind() else { return }
+            }
+        }
+    }
+
+    /// One background retry: when a port that was busy is free now, DHCP binds again with every
+    /// family it wants. Logs only when a family comes up (once per change); true while the
+    /// caller should keep retrying.
+    func retryDHCPBind() async -> Bool {
+        guard options.dhcpEnabled, !dhcpStoppedByOwner, let store else { dhcpRetryTask = nil; return false }
+        let busy4 = Self.isBusyPort(dhcpStartFailure), busy6 = Self.isBusyPort(dhcpv6StartFailure)
+        guard busy4 || busy6 else { dhcpRetryTask = nil; return false }
+        let ports = options.ports
+        let free4 = busy4 && PortProbe.isFree(port: ports.dhcp, protos: [.udp])
+        let free6 = busy6 && PortProbe.isFree(port: ports.dhcpv6, protos: [.udp])
+        guard free4 || free6 else { return true }
+        let before4 = dhcpStartFailure, before6 = dhcpv6StartFailure
+        let had4 = bound.dhcp != nil, had6 = bound.dhcpv6 != nil
+        // This task stays the retry task through the rebind (startDHCPIfNeeded keeps it).
+        let me = dhcpRetryTask
+        await dhcp?.stop(); dhcp = nil
+        bound.dhcp = nil; bound.dhcpv6 = nil
+        if had4 { await Self.waitUntilFree(ports.dhcp, [.udp]) }
+        if had6 { await Self.waitUntilFree(ports.dhcpv6, [.udp]) }
+        do { try await startDHCPIfNeeded(store: store, quiet: true) } catch { recordDHCPError(error) }
+        if before4 != nil, dhcpStartFailure == nil, bound.dhcp != nil {
+            log.event("DHCP", "udp \(ports.dhcp) is free again: DHCP (IPv4) started")
+        }
+        if before6 != nil, dhcpv6StartFailure == nil, bound.dhcpv6 != nil {
+            log.event("DHCP", "udp \(ports.dhcpv6) is free again: DHCPv6 started")
+        }
+        log.runtimeEvent(.dhcpChanged)
+        return dhcpRetryTask != nil && dhcpRetryTask == me
+    }
+
+    /// A scope, reservation or DHCP setting changed: the running server reloads; the first
+    /// scope starts it, removing the last one stops it.
+    public func dhcpConfigChanged() async {
+        guard options.dhcpEnabled, let store else { return }
+        let scopes = (try? await store.dhcpScopes()) ?? []
+        if let dhcp {
+            let v6Setting = (try? await store.dhcpSettings())?.enableV6 ?? false
+            let wantV6 = options.dhcpV6Enabled && v6Setting && scopes.contains { $0.family == .v6 }
+            if scopes.isEmpty {
+                dhcpRetryTask?.cancel(); dhcpRetryTask = nil
+                await dhcp.stop()
+                self.dhcp = nil
+                bound.dhcp = nil; bound.dhcpv6 = nil
+                dhcpStartFailure = nil
+                dhcpv6StartFailure = nil
+                log.event("DHCP", "stopped: no scope left")
+            } else if wantV6 != (bound.dhcpv6 != nil || dhcpv6StartFailure != nil) {
+                // The first v6 scope (or the last one gone): v6 binds (or unbinds) by the same
+                // rule as at start.
+                let had4 = bound.dhcp != nil, had6 = bound.dhcpv6 != nil
+                await dhcp.stop()
+                self.dhcp = nil
+                bound.dhcp = nil; bound.dhcpv6 = nil
+                if had4 { await Self.waitUntilFree(options.ports.dhcp, [.udp]) }
+                if had6 { await Self.waitUntilFree(options.ports.dhcpv6, [.udp]) }
+                do { try await startDHCPIfNeeded(store: store) } catch {
+                    recordDHCPError(error)
+                    log.warning("DHCP", "\(error)")
+                }
+            } else {
+                await dhcp.configChanged()
+            }
+            return
+        }
+        guard !scopes.isEmpty else {
+            dhcpRetryTask?.cancel(); dhcpRetryTask = nil
+            dhcpStartFailure = nil
+            dhcpv6StartFailure = nil
+            return
+        }
+        guard !dhcpStoppedByOwner else { return }
+        do {
+            try await startDHCPIfNeeded(store: store)
+        } catch {
+            recordDHCPError(error)
+            log.warning("DHCP", "\(error)")
+        }
+    }
+
+    /// Uses `source` for device facts and profile-change CoA from the next RADIUS start on
+    /// (call before `start`, or restart RADIUS).
+    public func setDeviceProfiles(_ source: DeviceProfileSource) {
+        deviceProfiles = source
+    }
+
+    /// RADIUS ▸ Sessions: Reauthenticate / Disconnect one stored session (RFC 5176).
+    public func radiusCoA(_ action: CoAAction, session: DirectoryStore.RadiusSession) async -> CoAResult {
+        guard let radius else {
+            return CoAResult(request: action.title, outcome: nil, problem: "RADIUS is not running", attempts: 0)
+        }
+        return await radius.sendCoA(action, session: session, reason: "manual (app)")
     }
 
     private func restartRPC(store: DirectoryStore, info: DomainInfo) async throws {
@@ -1202,4 +1631,13 @@ struct RetryWindow: Sendable {
         let minutes = Int(interval.components.seconds / 60)
         return minutes >= 1 ? "\(minutes) min" : "\(interval.components.seconds) s"
     }
+}
+
+
+/// The address the DHCP server hands out as DNS/NTP, shared with its reply path so a change in
+/// Settings applies without a restart.
+final class AdvertisedAddressBox: Sendable {
+    private let value = Mutex<String?>(nil)
+    func get() -> String? { value.withLock { $0 } }
+    func set(_ address: String?) { value.withLock { $0 = address } }
 }

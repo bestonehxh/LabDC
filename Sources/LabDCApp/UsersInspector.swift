@@ -56,7 +56,7 @@ private struct PersonInspector: View {
         let status = person.status(now: model.now)
         let protectedAdmin = person.isCritical && person.username.caseInsensitiveCompare("Administrator") == .orderedSame
         VStack(alignment: .leading, spacing: 0) {
-            InspectorHeader(title: person.displayName, subtitle: headerLine(model), dimmed: status == .disabled)
+            InspectorHeader(title: person.displayName, subtitle: headerLine, dimmed: status == .disabled)
             if protectedAdmin {
                 QuietNote("The built-in Administrator is protected: only its password can be changed here.")
             }
@@ -79,12 +79,20 @@ private struct PersonInspector: View {
                     .accessibilityLabel("Set password of \(person.username)")
             }
             FolderPicker(objectID: id, parentID: person.parentID, disabled: protectedAdmin)
-            InspectorRow(label: "Groups") {
-                Text(person.groupNames.isEmpty ? "None" : person.groupsText)
-                    .foregroundStyle(person.groupNames.isEmpty ? Theme.faint : Theme.ink)
-                    .fixedSize(horizontal: false, vertical: true)
-            } action: {
-                GroupMembership(person: person, disabled: protectedAdmin)
+            if person.groupNames.isEmpty {
+                // No "None" + "Change": one link that says what it does (owner, 2 Oct 2026).
+                if !protectedAdmin {
+                    InspectorRow(label: "Groups") {
+                        GroupMembership(person: person, title: "Add to a group")
+                    }
+                }
+            } else {
+                InspectorRow(label: "Groups") {
+                    Text(person.groupsText)
+                        .fixedSize(horizontal: false, vertical: true)
+                } action: {
+                    GroupMembership(person: person, disabled: protectedAdmin)
+                }
             }
             InspectorRow(label: "Account") {
                 StateText(text: status.rawValue, attention: status == .expired, dimmed: status == .disabled)
@@ -120,7 +128,7 @@ private struct PersonInspector: View {
                     Toggle(isOn: Binding(get: { person.mustChangePassword }, set: { v in
                         Task { await model.perform { try await $0.setMustChangePassword(id, v) } }
                     })) {
-                        Text("Must change password at next logon").font(Theme.body).foregroundStyle(Theme.ink)
+                        Text("Must change password at next sign-in").font(Theme.body).foregroundStyle(Theme.ink)
                     }
                     .toggleStyle(.quiet)
                     .disabled(protectedAdmin)
@@ -161,15 +169,13 @@ private struct PersonInspector: View {
         }
     }
 
-    /// `Staff / IT · last signed in 26 Sep 14:24`.
-    private func headerLine(_ model: UsersModel) -> String {
-        let folder = model.snapshot.folderPath(person.parentID)
-        let seen = person.lastLogon.map { "last signed in \(UsersFormat.date($0))" } ?? "never signed in"
-        return "\(folder) · \(seen)"
+    /// `Last signed in 26 Sep 14:24` / `Never signed in` (the Folder row below says where).
+    private var headerLine: String {
+        person.lastLogon.map { "Last signed in \(UsersFormat.date($0))" } ?? "Never signed in"
     }
 
     private var passwordText: String {
-        if person.mustChangePassword { return "Must be changed at next logon" }
+        if person.mustChangePassword { return "Must be changed at next sign-in" }
         return person.passwordLastSet.map { "Set \(UsersFormat.date($0))" } ?? "Set"
     }
 }
@@ -178,6 +184,7 @@ private struct PersonInspector: View {
 private struct GroupMembership: View {
     @Environment(AppModel.self) private var app
     let person: DirectoryPerson
+    var title = "Change"
     var disabled = false
     @State private var picking = false
     @State private var query = ""
@@ -186,7 +193,7 @@ private struct GroupMembership: View {
         let model = app.usersModel
         let id = person.id
         let current = Set(person.groupIDs)
-        Button("Change") { picking = true }
+        Button(title) { picking = true }
             .buttonStyle(.quietLink)
             .disabled(disabled)
             .help("Add to a group or remove from one")
@@ -255,8 +262,8 @@ private struct GroupInspector: View {
         let builtIn = group.scope == .builtinLocal
         let members = model.members(of: group)
         VStack(alignment: .leading, spacing: 0) {
-            InspectorHeader(title: group.name,
-                            subtitle: "\(group.scope.title) group · \(group.memberCount) member\(group.memberCount == 1 ? "" : "s")")
+            // No subtitle: Scope and Members below say it (owner, 2 Oct 2026).
+            InspectorHeader(title: group.name)
 
             CommitField("Name", value: group.name, first: true) { v in
                 await model.perform { try await $0.renameGroup(id, to: v) }
@@ -365,13 +372,23 @@ private struct ComputerInspector: View {
                             subtitle: computer.isDomainController ? "Domain controller" : computer.samAccountName,
                             dimmed: !computer.enabled)
 
-            InspectorRow(label: "DNS name", first: true) { valueText(computer.dnsName) }
-            InspectorRow(label: "OS") { valueText(computer.operatingSystem) }
+            // Empty read-only rows are left out, not shown as "None" (owner, 2 Oct 2026).
+            if let dns = computer.dnsName {
+                InspectorRow(label: "DNS name", first: true) { Text(dns).textSelection(.enabled) }
+            }
+            if let os = computer.operatingSystem {
+                InspectorRow(label: "OS", first: computer.dnsName == nil) { Text(os) }
+            }
             if let v = computer.operatingSystemVersion {
                 InspectorRow(label: "Version") { Text(v) }
             }
-            InspectorRow(label: "Last logon") { valueText(computer.lastLogon.map(UsersFormat.date), none: "Never") }
-            InspectorRow(label: "Joined") { Text(joinedText) }
+            InspectorRow(label: "Last sign-in", first: computer.dnsName == nil && computer.operatingSystem == nil) {
+                Text(computer.lastLogon.map(UsersFormat.date) ?? "Never")
+                    .foregroundStyle(computer.lastLogon == nil ? Theme.faint : Theme.ink)
+            }
+            if let joined = joinedText {
+                InspectorRow(label: "Joined") { Text(joined) }
+            }
             FolderPicker(objectID: id, parentID: computer.parentID)
             InspectorRow(label: "Account") {
                 StateText(text: computer.enabled ? "Enabled" : "Disabled", dimmed: !computer.enabled)
@@ -387,10 +404,8 @@ private struct ComputerInspector: View {
 
             DisclosureLink(title: "Advanced", hideTitle: "Hide advanced", expanded: $showAdvanced)
             if showAdvanced {
-                InspectorRow(label: "Service principal names") {
-                    if computer.spns.isEmpty {
-                        Text("None").foregroundStyle(Theme.faint)
-                    } else {
+                if !computer.spns.isEmpty {
+                    InspectorRow(label: "Service principal names") {
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(computer.spns, id: \.self) { spn in
                                 Text(spn).font(Theme.mono).textSelection(.enabled)
@@ -413,25 +428,26 @@ private struct ComputerInspector: View {
 
             if !computer.isDomainController {
                 VStack(alignment: .leading, spacing: 14) {
-                    Button("Reset machine account") { confirmReset = true }
+                    Button("Reset computer account") { confirmReset = true }
                         .buttonStyle(.quietLink)
                     Button("Remove from domain") { confirmLeave = true }
                         .buttonStyle(.quietDestructive)
                         .keyboardShortcut(.delete, modifiers: .command)
                     QuietNote("Resetting breaks the computer's link to the domain until it joins again.")
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(.top, 32)
             }
         }
         .confirmationDialog("Reset the account of \(computer.name)?", isPresented: $confirmReset) {
-            Button("Reset Account", role: .destructive) {
+            Button("Reset account", role: .destructive) {
                 Task { await model.perform { try await $0.resetMachineAccount(id) } }
             }
         } message: {
             Text("\(computer.name) can no longer sign in to the domain until it is joined again.")
         }
         .confirmationDialog("Remove \(computer.name) from the domain?", isPresented: $confirmLeave) {
-            Button("Remove from Domain", role: .destructive) {
+            Button("Remove from domain", role: .destructive) {
                 Task { await model.perform { try await $0.delete([id]) } }
             }
         } message: {
@@ -439,13 +455,15 @@ private struct ComputerInspector: View {
         }
     }
 
-    private func valueText(_ value: String?, none: String = "None") -> some View {
-        Text(value ?? none).foregroundStyle(value == nil ? Theme.faint : Theme.ink)
-    }
-
-    private var joinedText: String {
-        let when = computer.joined.map(UsersFormat.date) ?? "—"
-        return computer.joinedBy.map { "\(when) by \($0)" } ?? when
+    /// "26 Sep 14:24 by Administrator", "by Administrator", or nil when nothing is known.
+    private var joinedText: String? {
+        let when = computer.joined.map(UsersFormat.date)
+        switch (when, computer.joinedBy) {
+        case let (w?, by?): return "\(w) by \(by)"
+        case let (w?, nil): return w
+        case let (nil, by?): return "by \(by)"
+        case (nil, nil): return nil
+        }
     }
 }
 
@@ -489,8 +507,8 @@ private struct FolderSummary: View {
         let model = app.usersModel
         let folder = model.currentFolder
         VStack(alignment: .leading, spacing: 0) {
-            InspectorHeader(title: folder.kind == .domain ? folder.name : folder.path,
-                            subtitle: model.tab.count(model.rowCount))
+            // No count here: the folder chip carries it (owner, 2 Oct 2026).
+            InspectorHeader(title: folder.kind == .domain ? folder.name : folder.path)
             if let d = folder.description {
                 Text(d)
                     .font(Theme.detail)
@@ -498,17 +516,17 @@ private struct FolderSummary: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.bottom, 12)
             }
-            QuietNote(model.loaded ? "Select a \(model.tab.count(1)) on the left to see and change it here — details, password, groups, folder." : "Waiting for the directory…")
+            QuietNote(model.loaded ? "Select a \(model.tab.noun) on the left to see and change \(model.tab == .people ? "them" : "it") here." : "Waiting for the directory…")
         }
     }
 }
 
 // MARK: - Pieces
 
-/// The name (large, light) and a muted line under it.
+/// The name (large, light) and, when there is one, a muted line under it.
 private struct InspectorHeader: View {
     let title: String
-    let subtitle: String
+    var subtitle: String? = nil
     var dimmed = false
 
     var body: some View {
@@ -519,10 +537,12 @@ private struct InspectorHeader: View {
                 .foregroundStyle(dimmed ? Theme.faint : Theme.ink)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityAddTraits(.isHeader)
-            Text(subtitle)
-                .font(Theme.detail)
-                .foregroundStyle(Theme.muted)
-                .fixedSize(horizontal: false, vertical: true)
+            if let subtitle {
+                Text(subtitle)
+                    .font(Theme.detail)
+                    .foregroundStyle(Theme.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, 20)
@@ -634,6 +654,28 @@ struct CommitField: View {
     }
 
     var body: some View {
+        if value.isEmpty && !editing {
+            // Empty: one "Add email" link, not "None" + "Edit"; nothing at all when it cannot be
+            // edited (owner, 2 Oct 2026).
+            if !disabled {
+                InspectorRow(label: title, first: first) {
+                    Button("Add \(Self.lowercasedFirst(title))") { begin() }
+                        .buttonStyle(.quietLink)
+                        .accessibilityLabel("Add \(title)")
+                }
+            }
+        } else {
+            row
+        }
+    }
+
+    /// "Email" → "email"; "Sign-in name (UPN)" → "sign-in name (UPN)".
+    static func lowercasedFirst(_ s: String) -> String {
+        guard let first = s.first else { return s }
+        return String(first).lowercased() + s.dropFirst()
+    }
+
+    private var row: some View {
         InspectorRow(label: title, first: first) {
             if editing {
                 TextField(title, text: $text)
@@ -645,8 +687,7 @@ struct CommitField: View {
                     .onAppear { Task { focused = true } }
                     .accessibilityLabel(title)
             } else {
-                Text(value.isEmpty ? "None" : value)
-                    .foregroundStyle(value.isEmpty ? Theme.faint : Theme.ink)
+                Text(value)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -788,7 +829,7 @@ struct PasswordSheet: View {
                         .help("Generate a strong password")
                 }
                 PasswordHint(strength: strength)
-                Toggle("Must change password at next logon", isOn: $mustChange)
+                Toggle("Must change password at next sign-in", isOn: $mustChange)
                     .toggleStyle(.quiet)
                     .disabled(person?.isCritical == true && person?.username.caseInsensitiveCompare("Administrator") == .orderedSame)
                 if mustChange, person?.passwordNeverExpires == true {
@@ -800,7 +841,7 @@ struct PasswordSheet: View {
                 CopyButton(value: password, label: "Copy")
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button("Set Password") {
+                Button("Set password") {
                     busy = true
                     let pw = password, must = mustChange
                     Task {
@@ -821,7 +862,7 @@ struct PasswordSheet: View {
     }
 }
 
-/// "Must change at next logon" and "Password never expires" exclude each other, as in ADUC.
+/// "Must change at next sign-in" and "Password never expires" exclude each other, as in ADUC.
 enum PasswordOptions {
     static let note = "A password that never expires is never asked to change, so ticking one clears the other."
 }
@@ -888,7 +929,7 @@ private struct NewUserSheet: View {
                     }
                 }
                 .labelsHidden()
-                Toggle("Must change password at next logon", isOn: $mustChange)
+                Toggle("Must change password at next sign-in", isOn: $mustChange)
                     .toggleStyle(.quiet)
                     .onChange(of: mustChange) { _, on in if on { neverExpires = false } }
                 Toggle("Password never expires", isOn: $neverExpires)

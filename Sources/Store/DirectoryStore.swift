@@ -34,6 +34,9 @@ public actor DirectoryStore {
     /// UI-2: published after every object write (see `StoreChangeFeed`).
     public nonisolated let changes = StoreChangeFeed()
 
+    /// Phase 5: MACs whose device profile category/OS changed (`upsertDeviceProfile`).
+    public nonisolated let deviceProfileEvents = DeviceProfileEvents()
+
     static let logger = Logger(subsystem: "dev.labdc.app", category: "Store")
     static let schemaVersion: Int64 = 1
 
@@ -123,6 +126,10 @@ public actor DirectoryStore {
             PRAGMA user_version = \(schemaVersion);
             """)
         try createPKISchema(db)
+        try createDHCPSchema(db)
+        try createDNSOwnerSchema(db)
+        try createDeviceProfileSchema(db)
+        try createLSASecretSchema(db)
     }
 
     // MARK: - Transactions
@@ -716,14 +723,52 @@ public actor DirectoryStore {
             """, [.int(from), .text(attr), .text(attr), .int(to)]) != nil
     }
 
+    /// Primary groups any account may name: Domain Users, Domain Guests, Domain Computers.
+    static let unprivilegedPrimaryGroups: Set<UInt32> = [513, 514, 515]
+
+    /// The `primaryGroupID` that counts for `e` (group membership, the PAC, SAMR rights), or nil
+    /// when it has none. Security audit (1 Oct 2026): `primaryGroupID` confers membership on its
+    /// own, so a value naming a group the account is not an explicit member of (`member` links,
+    /// transitively) — e.g. 512 written through SAMR SetInformationUser — is ignored in favour of
+    /// the account type's default (513 / 515 / 516). Domain Users / Guests / Computers, the
+    /// default for the account type, and 521 for an RODC are always valid.
+    public func effectivePrimaryGroupRID(_ e: DirectoryEntry) throws -> UInt32? {
+        guard let raw = e.int("primaryGroupID") else { return nil }
+        let pg = UInt32(truncatingIfNeeded: raw)
+        return try isValidPrimaryGroup(pg, for: e) ? pg : defaultPrimaryGroup(of: e)
+    }
+
+    /// True when `rid` may be `e`'s primary group: Domain Users / Guests / Computers, the account
+    /// type's default, 521 for an RODC, or a group `e` is an explicit member of (MS-SAMR
+    /// §3.1.1.8.5: anything else is STATUS_MEMBER_NOT_IN_GROUP).
+    public func isValidPrimaryGroup(_ rid: UInt32, for e: DirectoryEntry) throws -> Bool {
+        let uac = UInt32(truncatingIfNeeded: e.int("userAccountControl") ?? 0)
+        if rid == defaultPrimaryGroup(of: e) || Self.unprivilegedPrimaryGroups.contains(rid) { return true }
+        if rid == 521, uac & UserAccountControl.partialSecretsAccount != 0 { return true }
+        return try isExplicitMember(e.id, ofDomainRID: rid)
+    }
+
+    private func defaultPrimaryGroup(of e: DirectoryEntry) -> UInt32 {
+        let uac = UInt32(truncatingIfNeeded: e.int("userAccountControl") ?? 0)
+        return Self.defaultPrimaryGroup(uac: uac, computer: DirectorySchema.classChain(e.objectClass).contains("computer"))
+    }
+
+    /// True when `id` reaches the domain group `rid` through `member` links (primary groups not
+    /// followed) — the membership AD requires before a group may become the primary group.
+    public func isExplicitMember(_ id: ObjectID, ofDomainRID rid: UInt32) throws -> Bool {
+        guard let domainSID = cachedInfo?.domainSID, let sid = try? domainSID.appending(rid: rid),
+              let g = try rows(where: "o.object_sid = ?", [.blob(sid.bytes)]).first, !g.deleted else { return false }
+        return try reachable(from: id, to: g.id, attr: "member", downwards: false)
+    }
+
     /// Every group `id` belongs to, transitively, including its primary group and the groups
     /// that group belongs to. Ordered by id.
     public func transitiveGroups(of id: ObjectID) throws -> [ObjectID] {
         var seen = Set<ObjectID>()
         var queue: [ObjectID] = try db.query("SELECT source_id FROM links WHERE target_id = ? AND attr = 'member'",
                                              [.int(id)]).compactMap { $0[0].int }
-        if let e = try read(id: id), let pg = e.int("primaryGroupID"), let domainSID = cachedInfo?.domainSID,
-           let sid = try? domainSID.appending(rid: UInt32(truncatingIfNeeded: pg)),
+        if let e = try read(id: id), let pg = try effectivePrimaryGroupRID(e), let domainSID = cachedInfo?.domainSID,
+           let sid = try? domainSID.appending(rid: pg),
            let g = try rows(where: "o.object_sid = ?", [.blob(sid.bytes)]).first {
             queue.append(g.id)
         }

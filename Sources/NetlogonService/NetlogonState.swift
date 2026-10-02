@@ -89,7 +89,6 @@ public final class NetlogonStateStore: @unchecked Sendable {
         channels[Self.key(channel.computerName, channel.secureChannelType)] = channel
         // Also index by name alone so the schannel bind (which knows only the computer name) resolves.
         channels[Self.nameKey(channel.computerName)] = channel
-        lastEstablished = channel
     }
 
     /// Advances `ClientStoredCredential` after a verified authenticator (MS-NRPC §3.1.4.5), for the
@@ -110,10 +109,4 @@ public final class NetlogonStateStore: @unchecked Sendable {
         if let type { return channels[Self.key(computer, type)] }
         return channels[Self.nameKey(computer)]
     }
-
-    /// The most recently established channel, or nil. Lab fallback for the schannel bind when the
-    /// `NL_AUTH_MESSAGE` computer name does not resolve exactly.
-    private var lastEstablished: NetlogonChannel?
-    func recordLast(_ c: NetlogonChannel) { lock.lock(); lastEstablished = c; lock.unlock() }
-    public func anyChannel() -> NetlogonChannel? { lock.lock(); defer { lock.unlock() }; return lastEstablished }
 }

@@ -83,10 +83,12 @@ public struct ConnectObservations: Sendable, Equatable {
     /// Challenges that can still be used (not revoked, not expired, one-time ones unused).
     public var usableChallenges: Int
     public var allowPlainLDAP: Bool
+    /// RADIUS clients (NAS) by name, for the Switch / AP checklist.
+    public var radiusClients: [String]
 
     public init(computers: [JoinedComputer] = [], issued: [IssuedCertificateRecord] = [], events: [ActivityEvent] = [],
                 enrollment: [LogLine] = [], trustedRootPublished: Bool = false, autoEnrollment: Bool? = nil,
-                usableChallenges: Int = 0, allowPlainLDAP: Bool = true) {
+                usableChallenges: Int = 0, allowPlainLDAP: Bool = true, radiusClients: [String] = []) {
         self.computers = computers
         self.issued = issued
         self.events = events
@@ -95,6 +97,7 @@ public struct ConnectObservations: Sendable, Equatable {
         self.autoEnrollment = autoEnrollment
         self.usableChallenges = usableChallenges
         self.allowPlainLDAP = allowPlainLDAP
+        self.radiusClients = radiusClients
     }
 
     /// Reads the store, the Default Domain Policy and the log. Every part is best effort.
@@ -122,6 +125,9 @@ public struct ConnectObservations: Sendable, Equatable {
                 IssuedCertificateRecord(serial: $0.serial, template: $0.templateName, subject: $0.subject, requester: $0.requesterName,
                                   issuedAt: $0.issuedAt, revoked: $0.revoked)
             }.sorted { $0.issuedAt > $1.issuedAt }
+        }
+        if let clients = try? await store.listNAS() {
+            o.radiusClients = clients.map(\.name)
         }
         if let rows = try? await store.pkiChallenges() {
             o.usableChallenges = rows.filter { !$0.revoked && $0.expiresAt > now && ($0.reusable || $0.usedAt == nil) }.count
@@ -268,8 +274,9 @@ public enum DeviceChecklist {
                 bound.detail = "No Mac bound (only needed for network accounts on a Mac)"
             }
             return [
+                // A status line; the save link is step 1's, not repeated here (owner, 2 Oct 2026).
                 ChecklistItem(id: "profile", title: "CA profile installed", state: .checkOnDevice,
-                              detail: "Can't be seen from here: install the profile and turn on full trust", action: .saveMobileConfig),
+                              detail: "Install the profile and turn on full trust (step 1)"),
                 bound,
                 lastSignIn(title: "Last sign-in", computers, addresses, o.events, noun: "Mac"),
             ]
@@ -278,7 +285,7 @@ public enum DeviceChecklist {
                 challengeReady(o),
                 deviceCertificate(o),
                 lastEnrollment(o),
-                ChecklistItem(id: "radius", title: "RADIUS", state: .later, detail: "Phase 4"),
+                radiusClient(o),
             ]
         case .other:
             return [
@@ -286,7 +293,7 @@ public enum DeviceChecklist {
                           none: "No LDAP bind yet"),
                 lastEvent(id: "kerberos", title: "Last Kerberos sign-in", o.events.first { $0.method == "Kerberos sign-in" },
                           none: "No Kerberos sign-in yet"),
-                ChecklistItem(id: "ca", title: "CA", state: .checkOnDevice, detail: "Trust it on the device (Save CA)", action: .saveCAPEM),
+                ChecklistItem(id: "ca", title: "CA", state: .checkOnDevice, detail: "Trust it on the device (step 3)"),
             ]
         }
     }
@@ -421,10 +428,10 @@ public enum DeviceChecklist {
     static func machineKerberos(_ computers: [JoinedComputer], _ events: [ActivityEvent]) -> ChecklistItem {
         let accounts = Set(computers.map { $0.account.uppercased() })
         guard let e = events.first(where: { $0.method == "Kerberos sign-in" && accounts.contains($0.user.uppercased()) }) else {
-            return ChecklistItem(id: "machine", title: "Machine Kerberos (SSSD)", state: .waiting,
+            return ChecklistItem(id: "machine", title: "Computer Kerberos (SSSD)", state: .waiting,
                                  detail: computers.isEmpty ? "After the join" : "Not seen yet (sudo systemctl restart sssd)")
         }
-        return ChecklistItem(id: "machine", title: "Machine Kerberos (SSSD)", state: e.result == .success ? .done : .problem,
+        return ChecklistItem(id: "machine", title: "Computer Kerberos (SSSD)", state: e.result == .success ? .done : .problem,
                              date: e.date, detail: e.result == .success ? e.user : "\(e.user): \(e.detail)")
     }
 
@@ -432,7 +439,7 @@ public enum DeviceChecklist {
         o.usableChallenges > 0
             ? ChecklistItem(id: "challenge", title: "Challenge ready", state: .done,
                             detail: "\(o.usableChallenges) usable challenge\(o.usableChallenges == 1 ? "" : "s")")
-            : ChecklistItem(id: "challenge", title: "Challenge ready", state: .waiting, detail: "Create one on Certificates ▸ Enrollment",
+            : ChecklistItem(id: "challenge", title: "Challenge ready", state: .waiting, detail: "No usable challenge yet",
                             action: .openEnrollment)
     }
 
@@ -441,6 +448,15 @@ public enum DeviceChecklist {
             return ChecklistItem(id: "cert", title: "Certificate enrolled", state: .waiting, detail: "No device certificate yet")
         }
         return ChecklistItem(id: "cert", title: "Certificate enrolled", state: .done, date: c.issuedAt, detail: "\(c.commonName) (\(c.template))")
+    }
+
+    /// Done once any RADIUS client exists (the DC cannot tell which one is this device).
+    static func radiusClient(_ o: ConnectObservations) -> ChecklistItem {
+        o.radiusClients.isEmpty
+            ? ChecklistItem(id: "radius", title: "RADIUS client added", state: .waiting,
+                            detail: "Add the switch or AP with a shared secret", action: .openRadiusClients)
+            : ChecklistItem(id: "radius", title: "RADIUS client added", state: .done,
+                            detail: o.radiusClients.joined(separator: ", "))
     }
 
     static func lastEnrollment(_ o: ConnectObservations) -> ChecklistItem {

@@ -1,4 +1,5 @@
 import DNSKit
+import MSPAC
 import Foundation
 import Store
 
@@ -19,6 +20,8 @@ public actor StoreZoneSource: DNSZoneSource {
     private let addressCacheSeconds: TimeInterval
     private var base: DNSDomainInfo?
     private var cachedAddresses: (at: Date, list: [DNSAddress])?
+    /// Phase 5: the DHCP scopes' reverse zones, re-read at most every `addressCacheSeconds`.
+    private var cachedReverse: (at: Date, list: [DNSName])?
 
     /// - Parameters:
     ///   - advertise: the one IPv4 to publish for the DC (overrides the interface list).
@@ -54,8 +57,20 @@ public actor StoreZoneSource: DNSZoneSource {
             }
         }
         info.addresses = currentAddresses()
+        info.reverseZones = await reverseZones()
         return info
     }
+
+    private func reverseZones() async -> [DNSName] {
+        let now = Date()
+        if let cached = cachedReverse, now.timeIntervalSince(cached.at) < addressCacheSeconds { return cached.list }
+        let list = ((try? await store.dhcpReverseZones()) ?? []).compactMap { try? DNSName(parsing: $0) }
+        cachedReverse = (now, list)
+        return list
+    }
+
+    /// Forget the cached reverse zones (a scope was added or removed in this process).
+    public func reverseZonesChanged() { cachedReverse = nil }
 
     public func records(zone: DNSName) async -> [DNSRecord] {
         let zoneText = zone.canonicalText
@@ -80,6 +95,21 @@ public actor StoreZoneSource: DNSZoneSource {
             removed += try await store.deleteDNSRecords(zone: row.zone, name: row.name, type: row.type, rdata: row.rdata)
         }
         if removed > 0 { onChange?("removed \(record) (zone \(zone.canonicalText))") }
+    }
+
+    public func hasStaticRecords(name: DNSName, zone: DNSName) async -> Bool {
+        // A read error counts as static: the name is then left alone rather than handed over.
+        (try? await store.hasStaticDNSRecords(zone: zone.canonicalText, name: Self.relativeName(name, zone: zone))) ?? true
+    }
+
+    public func dynamicOwner(name: DNSName, zone: DNSName) async -> DNSRecordOwner? {
+        guard let row = try? await store.dnsOwner(zone: zone.canonicalText, name: Self.relativeName(name, zone: zone)),
+              let holder = DNSRecordOwner.Holder(storageText: row.owner) else { return nil }
+        return DNSRecordOwner(holder: holder, updated: row.updated)
+    }
+
+    public func setDynamicOwner(_ owner: DNSRecordOwner.Holder?, name: DNSName, zone: DNSName) async throws {
+        try await store.setDNSOwner(zone: zone.canonicalText, name: Self.relativeName(name, zone: zone), owner: owner?.storageText)
     }
 
     // MARK: Helpers
@@ -150,5 +180,21 @@ public enum DNSRDataCoding {
         let message = try DNSMessage(bytes: bytes)
         guard let answer = message.answers.first else { throw CLIError.failure("undecodable RDATA") }
         return answer.rdata
+    }
+}
+
+/// DNSKit's `DNSUpdateDirectory` over a `DirectoryStore`: the signer's `dNSHostName`, and whether
+/// it is in Domain Admins / Enterprise Admins / DnsAdmins (nested groups included).
+public struct StoreDNSUpdateDirectory: DNSUpdateDirectory {
+    public let store: DirectoryStore
+
+    public init(store: DirectoryStore) { self.store = store }
+
+    public func dnsHostName(accountSID: SID) async -> String? {
+        (try? await store.dnsHostName(sid: accountSID)) ?? nil
+    }
+
+    public func isDNSAdministrator(accountSID: SID) async -> Bool {
+        (try? await store.isDNSAdministrator(sid: accountSID)) ?? false
     }
 }

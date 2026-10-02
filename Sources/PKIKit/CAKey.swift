@@ -20,6 +20,16 @@ public enum CAKeyType: String, Sendable, CaseIterable, Codable {
         case .rsa3072: "RSA-3072"
         }
     }
+
+    /// Key and signature, as the CA page shows them: `P-384 · ECDSA SHA-384`.
+    public var signatureDescription: String {
+        switch self {
+        case .p256: "P-256 · ECDSA SHA-256"
+        case .p384: "P-384 · ECDSA SHA-384"
+        case .rsa2048: "RSA-2048 · RSA SHA-256"
+        case .rsa3072: "RSA-3072 · RSA SHA-256"
+        }
+    }
 }
 
 /// A CA's private key: P-256 (ECDSA-SHA256 signatures), P-384 (ECDSA-SHA384) or RSA
@@ -162,5 +172,54 @@ public enum SubjectKeyKind: Sendable, Equatable, CustomStringConvertible {
         case .rsa(let bits): "RSA-\(bits)"
         case .ed25519: "Ed25519"
         }
+    }
+}
+
+/// The key of a server certificate LabDC issues to itself (the DC / LDAPS / EAP certificate and
+/// the 192-bit RADIUS one): P-256 or P-384. Since 1 Oct 2026 it follows the issuing CA — a P-384
+/// CA gets a P-384 server key, anything else (P-256 or RSA) the P-256 key it always had.
+enum ServerKey: Sendable {
+    case p256(P256.Signing.PrivateKey)
+    case p384(P384.Signing.PrivateKey)
+
+    /// A fresh key for a certificate signed by a CA of type `issuer`.
+    static func generate(issuedBy issuer: CAKeyType) -> ServerKey {
+        issuer == .p384 ? .p384(P384.Signing.PrivateKey()) : .p256(P256.Signing.PrivateKey())
+    }
+
+    /// Parses a PKCS#8 PEM P-256 or P-384 private key (whichever is on disk).
+    init(pem: String) throws {
+        if let key = try? P256.Signing.PrivateKey(pemRepresentation: pem) {
+            self = .p256(key)
+        } else {
+            self = .p384(try P384.Signing.PrivateKey(pemRepresentation: pem))
+        }
+    }
+
+    var pemRepresentation: String {
+        switch self {
+        case .p256(let k): k.pemRepresentation
+        case .p384(let k): k.pemRepresentation
+        }
+    }
+
+    /// PKCS#8 DER.
+    var derRepresentation: [UInt8] {
+        switch self {
+        case .p256(let k): Array(k.derRepresentation)
+        case .p384(let k): Array(k.derRepresentation)
+        }
+    }
+
+    var publicKey: Certificate.PublicKey {
+        switch self {
+        case .p256(let k): Certificate.PublicKey(k.publicKey)
+        case .p384(let k): Certificate.PublicKey(k.publicKey)
+        }
+    }
+
+    var isP384: Bool {
+        if case .p384 = self { return true }
+        return false
     }
 }

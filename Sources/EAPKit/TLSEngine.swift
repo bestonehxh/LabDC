@@ -18,10 +18,25 @@ import Foundation
 ///   AES-256-GCM-SHA384 suites only) gets that credential and BoringSSL's
 ///   `ssl_compliance_policy_wpa3_192_202304` (TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 /
 ///   TLS_AES_256_GCM_SHA384, P-384, SHA-384 signatures).
+///
+/// 1 Oct 2026 — RSA-only devices: a server context may also carry an RSA credential (the RSA
+/// compatibility root's RADIUS certificate). A ClientHello that cannot use an ECDSA certificate
+/// (`isRSAOnlyHello`: no ECDSA signature scheme, no ECDSA suite, no NIST curve, or a pre-TLS 1.2
+/// client) gets it, with the ECDHE-RSA suites old supplicants know (GCM and CBC; no RSA key transport) and
+/// TLS 1.0–1.2 allowed for that connection only. Everyone else keeps the ECDSA chain.
 public final class TLSContext: @unchecked Sendable {
     let ctx: OpaquePointer
     /// The P-384 credential served to 192-bit clients (nil: none configured).
     private(set) var suiteBCredential: OpaquePointer?
+    /// The RSA credential served to RSA-only clients (nil: none configured).
+    private(set) var rsaCredential: OpaquePointer?
+    /// The TLS 1.0–1.2 suites an RSA-only client may use (`rsaCredential` only, i.e. only while
+    /// "Allow RSA-only devices" is on): ECDHE-RSA with AES-GCM, ChaCha20 or AES-CBC. RSA key
+    /// transport (`AES128-SHA` & co.) is not offered (CVE audit 1 Oct 2026): it has no forward
+    /// secrecy — the RADIUS key decrypts every recorded session — and is the Bleichenbacher/ROBOT
+    /// oracle surface. A supplicant that knows nothing but RSA key transport fails the handshake.
+    static let rsaCompatibilityCiphers = "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305:"
+        + "ECDHE-RSA-AES256-SHA:ECDHE-RSA-AES128-SHA"
     let resumption: EAPResumptionCache?
 
     public enum Failure: Error, CustomStringConvertible {
@@ -51,6 +66,11 @@ public final class TLSContext: @unchecked Sendable {
     ///     resumption off explicitly (no tickets, SSL_SESS_CACHE_OFF).
     ///   - sessionContext: server: the session ID context — a session of one EAP method never
     ///     resumes under another.
+    ///   - rsa: server: the RSA credential for RSA-only clients (old devices); nil: none.
+    ///   - rsaOnlyClient: client (tests): behave like an RSA-only device — RSA suites and RSA
+    ///     signature schemes only (`cipherList` still overrides the suites).
+    ///   - minVersion: client: the lowest TLS version (legacy-device tests). The server keeps
+    ///     TLS 1.2 except on the RSA path.
     ///   - cipherList: the TLS 1.2 suites instead of the default list (test peers).
     ///   - deferClientVerification: server with `requireClientCertificate`: the handshake pauses
     ///     at the client certificate (`TLSEngine.certificatePending`) until the caller decides
@@ -59,17 +79,18 @@ public final class TLSContext: @unchecked Sendable {
     public init(isServer: Bool, chain: [[UInt8]], privateKeyDER: [UInt8]?, requireClientCertificate: Bool = false,
                 maxVersion: UInt16 = UInt16(TLS1_3_VERSION), suiteB: Credential? = nil, suiteBClient: Bool = false,
                 resumption: EAPResumptionCache? = nil, sessionContext: String = "EAP", deferClientVerification: Bool = false,
+                rsa: Credential? = nil, rsaOnlyClient: Bool = false, minVersion: UInt16 = UInt16(TLS1_2_VERSION),
                 cipherList: String? = nil) throws {
         guard let ctx = CNIOBoringSSL_SSL_CTX_new(CNIOBoringSSL_TLS_with_buffers_method()) else {
             throw Failure.boringSSL("cannot create a context")
         }
         self.ctx = ctx
         self.resumption = isServer ? resumption : nil
-        CNIOBoringSSL_SSL_CTX_set_min_proto_version(ctx, UInt16(TLS1_2_VERSION))
+        CNIOBoringSSL_SSL_CTX_set_min_proto_version(ctx, isServer ? UInt16(TLS1_2_VERSION) : minVersion)
         CNIOBoringSSL_SSL_CTX_set_max_proto_version(ctx, maxVersion)
         // TLS 1.2 suites: ECDHE + AEAD only; AES-256-GCM-SHA384 and P-384 for WPA3-Enterprise
         // 192-bit clients (TLS 1.3 always offers AES-256-GCM).
-        let ciphers = cipherList ?? "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:"
+        let ciphers = cipherList ?? (rsaOnlyClient ? Self.rsaCompatibilityCiphers : nil) ?? "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:"
             + "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"
         guard CNIOBoringSSL_SSL_CTX_set_strict_cipher_list(ctx, ciphers) == 1,
               CNIOBoringSSL_SSL_CTX_set1_groups_list(ctx, "X25519:P-256:P-384") == 1 else {
@@ -126,12 +147,37 @@ public final class TLSContext: @unchecked Sendable {
                     throw error
                 }
                 suiteBCredential = credential
+            }
+            if let rsa {
+                guard let credential = CNIOBoringSSL_SSL_CREDENTIAL_new_x509() else {
+                    if let suiteBCredential { CNIOBoringSSL_SSL_CREDENTIAL_free(suiteBCredential) }
+                    CNIOBoringSSL_SSL_CTX_free(ctx)
+                    throw Failure.boringSSL("cannot create the RSA credential")
+                }
+                do { try Self.setCredential(credential, chain: rsa.chain, keyDER: rsa.keyDER) } catch {
+                    CNIOBoringSSL_SSL_CREDENTIAL_free(credential)
+                    if let suiteBCredential { CNIOBoringSSL_SSL_CREDENTIAL_free(suiteBCredential) }
+                    CNIOBoringSSL_SSL_CTX_free(ctx)
+                    throw error
+                }
+                rsaCredential = credential
+            }
+            if suiteBCredential != nil || rsaCredential != nil {
                 CNIOBoringSSL_SSL_CTX_set_select_certificate_cb(ctx, selectCertificate)
             }
         } else {
             // A client (tests, the check harness) remembers the session it was given, for `-r`.
             CNIOBoringSSL_SSL_CTX_set_session_cache_mode(ctx, Int32(SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL))
             CNIOBoringSSL_SSL_CTX_sess_set_new_cb(ctx, clientNewSession)
+            if rsaOnlyClient {
+                // RSA-PSS and PKCS#1 only: what a device without ECDSA support announces.
+                let prefs: [UInt16] = [0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0201]
+                let ok = prefs.withUnsafeBufferPointer { CNIOBoringSSL_SSL_CTX_set_verify_algorithm_prefs(ctx, $0.baseAddress, $0.count) }
+                guard ok == 1 else {
+                    CNIOBoringSSL_SSL_CTX_free(ctx)
+                    throw Failure.boringSSL("RSA-only signature schemes refused: \(Self.errors())")
+                }
+            }
             if suiteBClient {
                 guard CNIOBoringSSL_SSL_CTX_set_compliance_policy(ctx, ssl_compliance_policy_wpa3_192_202304) == 1 else {
                     CNIOBoringSSL_SSL_CTX_free(ctx)
@@ -145,6 +191,7 @@ public final class TLSContext: @unchecked Sendable {
 
     deinit {
         if let suiteBCredential { CNIOBoringSSL_SSL_CREDENTIAL_free(suiteBCredential) }
+        if let rsaCredential { CNIOBoringSSL_SSL_CREDENTIAL_free(rsaCredential) }
         CNIOBoringSSL_SSL_CTX_free(ctx)
     }
 
@@ -221,6 +268,30 @@ public final class TLSContext: @unchecked Sendable {
         return !tls12.isEmpty && tls12.allSatisfy(suiteB.contains)
     }
 
+    /// Whether a ClientHello cannot use an ECDSA server certificate — an RSA-only device:
+    /// - a pre-TLS 1.2 client (legacy_version below 1.2 and no supported_versions, or only
+    ///   versions below 1.2), which the ECDSA path (TLS 1.2+) would refuse anyway;
+    /// - signature_algorithms without any ECDSA scheme;
+    /// - no TLS 1.3 suite and no ECDHE-ECDSA suite (only RSA key transport / ECDHE-RSA);
+    /// - no TLS 1.3 suite and supported_groups without a NIST curve (the ECDSA key's curve).
+    /// Windows 10/11, macOS/iOS and Android offer ECDSA and keep the ECDSA chain.
+    public static func isRSAOnlyHello(version: UInt16, supportedVersions: [UInt16]?, groups: [UInt16]?,
+                                      signatureAlgorithms: [UInt16]?, cipherSuites: [UInt16]) -> Bool {
+        let versions = (supportedVersions ?? []).filter { ($0 & 0x0f0f) != 0x0a0a }
+        if versions.isEmpty, version < 0x0303 { return true }
+        if !versions.isEmpty, versions.allSatisfy({ $0 < 0x0303 }) { return true }
+        if let sigalgs = signatureAlgorithms, !sigalgs.isEmpty {
+            let ecdsa: Set<UInt16> = [0x0403, 0x0503, 0x0603, 0x0203]
+            if !sigalgs.contains(where: ecdsa.contains) { return true }
+        }
+        if cipherSuites.contains(where: { ($0 >> 8) == 0x13 }) { return false }
+        let ecdsaSuites: Set<UInt16> = [0xc006, 0xc007, 0xc008, 0xc009, 0xc00a, 0xc023, 0xc024, 0xc02b, 0xc02c, 0xcca9,
+                                        0xc0ac, 0xc0ad, 0xc0ae, 0xc0af, 0xc072, 0xc073]
+        if !cipherSuites.contains(where: ecdsaSuites.contains) { return true }
+        if let groups, !groups.isEmpty, !groups.contains(where: { [0x0017, 0x0018, 0x0019].contains($0) }) { return true }
+        return false
+    }
+
     static func u16List(_ p: UnsafePointer<UInt8>?, _ len: Int, lengthPrefixed: Bool) -> [UInt16]? {
         guard let p else { return nil }
         let bytes = Array(UnsafeBufferPointer(start: p, count: len))
@@ -233,18 +304,41 @@ public final class TLSContext: @unchecked Sendable {
     }
 }
 
-/// The early callback: a 192-bit ClientHello gets the P-384 credential and the WPA3-192 policy.
+/// The early callback: a 192-bit ClientHello gets the P-384 credential and the WPA3-192 policy;
+/// an RSA-only one (when an RSA credential is configured) the RSA credential, its suites and
+/// TLS 1.0–1.2 for that connection. Anything else keeps the context's (ECDSA) chain.
 private let selectCertificate: @convention(c) (UnsafePointer<SSL_CLIENT_HELLO>?) -> ssl_select_cert_result_t = { hello in
-    guard let hello, let ssl = hello.pointee.ssl, let engine = TLSEngine.engine(for: ssl),
-          let credential = engine.context.suiteBCredential else { return ssl_select_cert_success }
+    guard let hello, let ssl = hello.pointee.ssl, let engine = TLSEngine.engine(for: ssl) else { return ssl_select_cert_success }
     func ext(_ type: UInt16) -> [UInt16]? {
         var data: UnsafePointer<UInt8>?
         var len = 0
         guard CNIOBoringSSL_SSL_early_callback_ctx_extension_get(hello, type, &data, &len) == 1 else { return nil }
         return TLSContext.u16List(data, len, lengthPrefixed: true)
     }
+    /// supported_versions (43): a one-byte length, then two-byte versions.
+    func supportedVersions() -> [UInt16]? {
+        var data: UnsafePointer<UInt8>?
+        var len = 0
+        guard CNIOBoringSSL_SSL_early_callback_ctx_extension_get(hello, 43, &data, &len) == 1, let data, len >= 1 else { return nil }
+        let bytes = Array(UnsafeBufferPointer(start: data, count: len))
+        let end = min(bytes.count, 1 + Int(bytes[0]))
+        return stride(from: 1, to: end - 1, by: 2).map { UInt16(bytes[$0]) << 8 | UInt16(bytes[$0 + 1]) }
+    }
     let suites = TLSContext.u16List(hello.pointee.cipher_suites, hello.pointee.cipher_suites_len, lengthPrefixed: false) ?? []
-    guard TLSContext.isSuiteBHello(groups: ext(10), signatureAlgorithms: ext(13), cipherSuites: suites) else {
+    if let rsa = engine.context.rsaCredential,
+       TLSContext.isRSAOnlyHello(version: hello.pointee.version, supportedVersions: supportedVersions(), groups: ext(10),
+                                 signatureAlgorithms: ext(13), cipherSuites: suites) {
+        CNIOBoringSSL_SSL_certs_clear(ssl)
+        guard CNIOBoringSSL_SSL_add1_credential(ssl, rsa) == 1,
+              CNIOBoringSSL_SSL_set_strict_cipher_list(ssl, TLSContext.rsaCompatibilityCiphers) == 1,
+              CNIOBoringSSL_SSL_set_min_proto_version(ssl, UInt16(TLS1_VERSION)) == 1 else {
+            return ssl_select_cert_error
+        }
+        engine.rsaCompatibility = true
+        return ssl_select_cert_success
+    }
+    guard let credential = engine.context.suiteBCredential,
+          TLSContext.isSuiteBHello(groups: ext(10), signatureAlgorithms: ext(13), cipherSuites: suites) else {
         return ssl_select_cert_success
     }
     CNIOBoringSSL_SSL_certs_clear(ssl)
@@ -360,6 +454,8 @@ public final class TLSEngine: @unchecked Sendable {
     var offeredHandle: [UInt8]?
     /// The server served the 192-bit credential and policy.
     public internal(set) var suiteB = false
+    /// The server served the RSA compatibility credential (an RSA-only client).
+    public internal(set) var rsaCompatibility = false
     /// Client side: the last session the server gave us (serialized), to offer next time.
     public internal(set) var savedSession: [UInt8]?
     /// Deferred verification: the handshake waits for `resolveCertificate`.

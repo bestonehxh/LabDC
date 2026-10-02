@@ -206,7 +206,7 @@ extension LDAPConnection {
                 // Any other authenticated user may create computer (machine) accounts up to
                 // ms-DS-MachineAccountQuota (Samba / MS-ADTS §6.4). The new object is stamped
                 // with mS-DS-CreatorSID = the creator's SID, which the creator then self-writes.
-                creatorSID = try await authorizeMachineAccountCreation(me, cls: cls, attributes: attributes)
+                creatorSID = try await authorizeMachineAccountCreation(me, cls: cls, rdn: rdn, attributes: attributes)
             }
         }
         if let creatorSID {

@@ -228,7 +228,7 @@ struct CertificatesSignView: View {
     /// ClearPass Trust List.
     private func saveCA(_ result: SignResult) {
         Task {
-            await model.perform("Export CA") { e in
+            await model.perform("Save CA") { e in
                 let data = try await e.exportRootCA(.pem, caName: result.caName)
                 try CertificateFiles.save(data, suggestedName: "\(result.caName)-ca.pem")
             }

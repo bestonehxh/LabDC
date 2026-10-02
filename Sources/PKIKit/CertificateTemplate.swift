@@ -57,6 +57,13 @@ public enum PKIOID {
     public static let emailProtection = "1.3.6.1.5.5.7.3.4"
     /// `szOID_NT_PRINCIPAL_NAME`, the UPN otherName.
     public static let userPrincipalName = "1.3.6.1.4.1.311.20.2.3"
+    /// `szOID_NTDS_CA_SECURITY_EXT` (KB5014754): the account's SID, for strong certificate mapping.
+    public static let ntdsCASecurityExtension = "1.3.6.1.4.1.311.25.2"
+    /// `szOID_NTDS_OBJECTSID`, the otherName inside it.
+    public static let ntdsObjectSID = "1.3.6.1.4.1.311.25.2.1"
+    /// Smart card logon and Any Purpose EKUs (both sign a user in, like clientAuth).
+    public static let smartcardLogon = "1.3.6.1.4.1.311.20.2.2"
+    public static let anyExtendedKeyUsage = "2.5.29.37.0"
     /// `szOID_CERTIFICATE_TEMPLATE` (template OID + major/minor version), how Windows
     /// auto-enrollment matches a certificate to its template.
     public static let certificateTemplateExtension = "1.3.6.1.4.1.311.21.7"
@@ -97,6 +104,10 @@ public struct CertificateTemplate: Sendable, Equatable {
     public var builtIn: Bool
     /// The CA that issues from this template (nil: the current CA).
     public var issuingCA: String?
+    /// The template's major version (`revision`, `szOID_CERTIFICATE_TEMPLATE` major): 100 until
+    /// a root migration bumps it, which makes Windows auto-enrollment re-enrol every holder
+    /// ("Reenroll All Certificate Holders"). Kept in the `domain` table (`CAService.templateRevisionsKey`).
+    public var majorRevision = CertificateTemplate.majorVersion
 
     /// Template extension versions (`szOID_CERTIFICATE_TEMPLATE` major/minor; PK-5 publishes
     /// `revision` = 100 and `msPKI-Template-Minor-Revision` = 0 to match).
@@ -129,6 +140,30 @@ public struct CertificateTemplate: Sendable, Equatable {
     /// A SubCA-style template (keyCertSign) issues `CA:TRUE, pathlen:0`.
     public var isCA: Bool { keyUsage.contains(.keyCertSign) }
 
+    /// The subject and SAN come from the requesting account (and its SID goes in the
+    /// certificate's `szOID_NTDS_CA_SECURITY_EXT`).
+    public var isAccountBound: Bool { sanPolicy == .dnsHostName || sanPolicy == .upn }
+
+    /// Certificates from this template sign someone in (clientAuth, smart card logon, any
+    /// purpose, or no EKU at all).
+    public var authenticatesClients: Bool {
+        !isCA && (ekus.isEmpty || ekus.contains { [PKIOID.clientAuth, PKIOID.smartcardLogon, PKIOID.anyExtendedKeyUsage].contains($0) })
+    }
+
+    /// ESC1: SANs from the CSR + client authentication + enrollable by someone who is not an
+    /// administrator lets that someone ask for a certificate naming anybody. The CA refuses UPN
+    /// SANs from non-administrators, but the template is still a footgun worth a warning.
+    /// `nil` when the template is fine (or only administrators may enrol).
+    public func esc1Warning() -> String? {
+        guard sanPolicy == .fromRequest, authenticatesClients, !manualApproval else { return nil }
+        let others = enrolAllowedGroupSIDs.filter { !Self.isAdministratorSID($0) }
+        guard !others.isEmpty else { return nil }
+        return "Template \(name) takes its names from the request, signs clients in and may be enrolled by "
+            + "non-administrators (\(others.joined(separator: ", "))). Anyone in those groups can ask for a "
+            + "certificate naming another account (ESC1); LabDC refuses UPNs from them, but restrict enrollment "
+            + "to administrators, require approval, or take the names from the account."
+    }
+
     public init(row: PKITemplateRow) {
         self.init(name: row.name, displayName: row.displayName, oid: row.oid, validityDays: row.validityDays,
                   renewalDays: row.renewalDays, keyUsage: TemplateKeyUsage(rawValue: row.keyUsage), ekus: row.ekus,
@@ -145,9 +180,19 @@ public struct CertificateTemplate: Sendable, Equatable {
                        enabled: enabled, builtIn: builtIn, issuingCA: issuingCA)
     }
 
+    /// Administrator (-500), Domain Admins (-512), Enterprise Admins (-519) of a domain, or
+    /// BUILTIN Administrators (S-1-5-32-544).
+    static func isAdministratorSID(_ sid: String) -> Bool {
+        let s = sid.uppercased()
+        if s == "S-1-5-32-544" { return true }
+        guard s.hasPrefix("S-1-5-21-") else { return false }
+        return s.hasSuffix("-500") || s.hasSuffix("-512") || s.hasSuffix("-519")
+    }
+
     // MARK: Built-ins
 
-    public static let builtInNames = ["Computer", "User", "WebServer", "Device", "SubCA", "Computer192", "User192"]
+    public static let builtInNames = ["Computer", "User", "WebServer", "Device", "SubCA", "Computer192", "User192",
+                                      "Computer-RSA", "User-RSA"]
 
     /// The five built-in templates of spec §3 for a domain. `oid` gives each template's OID.
     ///
@@ -195,6 +240,20 @@ public struct CertificateTemplate: Sendable, Equatable {
                                 ekus: [PKIOID.clientAuth], sanPolicy: .upn, enrolAllowedGroupSIDs: [sid(513)],
                                 autoEnroll: false, manualApproval: false, allowedKeyTypes: ["p384"], enabled: false, builtIn: true,
                                 issuingCA: LabPKI.suiteBCAName),
+            // RSA-only devices (1 Oct 2026): RSA-2048+ client certificates from the RSA
+            // compatibility root, for EAP-TLS on printers, phones and old supplicants. Enrolled
+            // over SCEP / EST (a challenge is the authorisation, the names come from the CSR) or
+            // signed by an administrator; switched on with "Allow RSA-only devices".
+            CertificateTemplate(name: "Computer-RSA", displayName: "Computer (RSA-only devices)", oid: oid("Computer-RSA"),
+                                validityDays: 365, renewalDays: 42, keyUsage: signAndEncrypt, ekus: [PKIOID.clientAuth],
+                                sanPolicy: .fromRequest, enrolAllowedGroupSIDs: [sid(512), sid(519)],
+                                autoEnroll: false, manualApproval: false, minKeyBits: 2048, allowedKeyTypes: ["rsa"], enabled: false,
+                                builtIn: true, issuingCA: LabPKI.rsaCompatCAName),
+            CertificateTemplate(name: "User-RSA", displayName: "User (RSA-only devices)", oid: oid("User-RSA"),
+                                validityDays: 365, renewalDays: 42, keyUsage: signAndEncrypt, ekus: [PKIOID.clientAuth],
+                                sanPolicy: .fromRequest, enrolAllowedGroupSIDs: [sid(512), sid(519)],
+                                autoEnroll: false, manualApproval: false, minKeyBits: 2048, allowedKeyTypes: ["rsa"], enabled: false,
+                                builtIn: true, issuingCA: LabPKI.rsaCompatCAName),
         ]
     }
 

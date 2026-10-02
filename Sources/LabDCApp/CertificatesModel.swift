@@ -16,11 +16,11 @@ enum CertificatesSection: String, CaseIterable, Identifiable, Hashable {
 
     var title: String {
         switch self {
-        case .ca: "CA"
+        case .ca: "Authority"
         case .issued: "Issued"
-        case .sign: "Sign CSR"
+        case .sign: "Sign a request"
         case .templates: "Templates"
-        case .trustedRoots: "Trusted Roots"
+        case .trustedRoots: "Trusted roots"
         case .enrollment: "Enrollment"
         case .converter: "Converter"
         }
@@ -234,6 +234,15 @@ struct IssuedRow: Identifiable, Equatable {
         }
     }
 
+    /// "Valid", "Expired", "Revoked": the table's column (the reason is in `statusText`).
+    var statusWord: String {
+        switch state {
+        case .valid: "Valid"
+        case .expired: "Expired"
+        case .revoked: "Revoked"
+        }
+    }
+
     var isRevoked: Bool { if case .revoked = state { true } else { false } }
 
     /// The subject's CN for file names (`CN=ws1.lab.sheep,O=Sheep` → `ws1.lab.sheep`), else the serial.
@@ -322,6 +331,9 @@ final class ChallengeRevealModel {
         var expires: Date
         var used: String
         var state: PKIChallengeRow.State
+
+        /// Under the state in the State column: when and by whom, nil while unused.
+        var usedText: String? { used == "Not yet" ? nil : used }
     }
 
     static func rows(_ challenges: [PKIChallengeRow], now: Date = Date()) -> [Row] {

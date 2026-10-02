@@ -36,6 +36,7 @@ public struct NetlogonSchannelProvider: RPCAuthProvider, RPCConnectionIdentity {
     private let rng: RandomBytes
     private let identityDirectory: DirectoryStore?
     private var identity: AuthenticatedIdentity?
+    private var computerName: String?
     private var level: RPCAuthLevel = .none
     private var sessionKey: [UInt8] = []
     private var aes = true
@@ -72,6 +73,8 @@ public struct NetlogonSchannelProvider: RPCAuthProvider, RPCConnectionIdentity {
     public var isEstablished: Bool { established }
     public var establishedIdentity: AuthenticatedIdentity? { established ? identity : nil }
     public var establishedSessionKey: [UInt8]? { nil }
+    /// The computer whose secure channel this binding uses (every request is signed with its key).
+    public var boundPrincipal: String? { established ? computerName : nil }
 
     public mutating func bind(authType: RPCAuthType, authData: [UInt8], authLevel: RPCAuthLevel) async throws -> [UInt8]? {
         guard authType == .schannel else {
@@ -80,15 +83,23 @@ public struct NetlogonSchannelProvider: RPCAuthProvider, RPCConnectionIdentity {
         guard authData.count >= 8, authData.prefix(4).allSatisfy({ $0 == 0 }) else {   // NL_AUTH_MESSAGE, type 0 (negotiate)
             throw RPCError.bindRejected(.reasonNotSpecified)
         }
-        // A named computer must have live secure-channel state; only a message without a NetBIOS
-        // host name falls back to the most recent channel (lab tolerance, as before).
-        let computer = Self.computerName(fromNLAuth: authData)
-        let channel: NetlogonChannel?
-        if let computer { channel = store.channel(computer: computer) } else { channel = store.anyChannel() }
-        guard let channel else { throw RPCError.bindRejected(.reasonNotSpecified) }
+        // CVE-2022-38023 class: the NL_AUTH_MESSAGE proves nothing by itself — possession of the
+        // session key is shown only by the per-PDU NL_AUTH_SHA2_SIGNATURE. A bind below packet
+        // integrity (connect/call/pkt) would let unsigned requests run as the secure channel, so it
+        // is refused (Windows' RequireSignOrSeal, Samba's `server schannel require seal`).
+        guard authLevel == .pktIntegrity || authLevel == .pktPrivacy else {
+            throw RPCError.bindRejected(.reasonNotSpecified)
+        }
+        // The message must name the computer, and that computer must have live secure-channel
+        // state (there is no "most recent channel" fallback).
+        guard let computer = Self.computerName(fromNLAuth: authData), !computer.isEmpty,
+              let channel = store.channel(computer: computer) else {
+            throw RPCError.bindRejected(.reasonNotSpecified)
+        }
         if let dir = identityDirectory {
             identity = await Self.identity(of: channel, in: dir)
         }
+        self.computerName = channel.computerName
         self.sessionKey = channel.sessionKey
         self.aes = channel.usesAES
         self.level = authLevel

@@ -90,6 +90,10 @@ enum Smoke {
         written += await ActivitySmoke.run(model: model, out: out)  // UI-5: ui-5-*.png
         // UI-3: every Certificates section, its sheets and the converter window (ui-3-*.png).
         let ui3 = await CertificatesSmoke.run(model: model, out: out)
+        // Phase 5: every DHCP tab with sample scopes, leases and devices (ui-6-dhcp-*.png).
+        let dhcp = await DHCPSmoke.run(model: model, out: out)
+        // Group Policy page with published and unpublished 802.1X profiles (ui-7-*.png).
+        let groupPolicy = await GroupPolicySmoke.run(model: model, out: out)
 
         // UI-1: every page last, so the dashboard shows the sample lab (computers, sign-ins,
         // certificates) the other parts created.
@@ -108,19 +112,19 @@ enum Smoke {
         await model.controller.stop()
         print("smoke: wrote \(written.count) screenshots to \(out.path): \(written.joined(separator: ", "))")
         return written.count - usersShots.count == 3 + SidebarItem.allCases.count + 1 + 3 + DeviceKind.allCases.count + 2
-            && usersShots.count == 5 && ui3
+            && usersShots.count == 5 && ui3 && dhcp && groupPolicy
     }
 
     /// Lays `view` out in an off-screen window and writes a PNG of it (`cacheDisplay`, so
     /// AppKit-backed controls — lists, forms, text fields — render, unlike `ImageRenderer`).
     @MainActor
-    static func render<V: View>(_ view: V, size: CGSize, to url: URL) async -> Bool {
+    static func render<V: View>(_ view: V, size: CGSize, to url: URL, appearance: NSAppearance? = nil) async -> Bool {
         let hosting = NSHostingView(rootView: view.frame(width: size.width, height: size.height))
         hosting.frame = CGRect(origin: .zero, size: size)
         let window = NSWindow(contentRect: CGRect(x: -20_000, y: -20_000, width: size.width, height: size.height),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        window.appearance = NSApp.effectiveAppearance
+        window.appearance = appearance ?? NSApp.effectiveAppearance
         window.backgroundColor = .windowBackgroundColor
         window.contentView = hosting
         window.orderFrontRegardless()

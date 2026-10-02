@@ -73,6 +73,13 @@ public struct CAInfo: Identifiable, Equatable, Sendable {
         return "Valid until \(PKIText.day(notAfter)) (\(days.formatted()) days)"
     }
 
+    /// Under a "Valid until" label: `26 Sep 2036 (3,652 days)`; near or past the end, `validityText`.
+    public func validUntilText(now: Date = Date()) -> String {
+        let days = daysLeft(now: now)
+        if notAfter <= now || days < 30 { return validityText(now: now) }
+        return "\(PKIText.day(notAfter)) (\(days.formatted()) days)"
+    }
+
     /// True when it expires within 90 days (the card turns orange).
     public func expiresSoon(now: Date = Date()) -> Bool { daysLeft(now: now) < 90 }
 }
@@ -148,7 +155,7 @@ public struct TrustedRootAddReport: Equatable, Sendable {
     public var added: [String] = []
     /// Roots that were already in the list.
     public var alreadyPresent: [String] = []
-    /// Certificates that are not self-signed (only roots belong in Trusted Root).
+    /// Certificates of the file that were not chosen.
     public var skipped: [String] = []
 
     public init(added: [String] = [], alreadyPresent: [String] = [], skipped: [String] = []) {
@@ -162,7 +169,7 @@ public struct TrustedRootAddReport: Equatable, Sendable {
         if !added.isEmpty { parts.append("Added \(added.joined(separator: ", ")).") }
         if !alreadyPresent.isEmpty { parts.append("Already in the list: \(alreadyPresent.joined(separator: ", ")).") }
         if !skipped.isEmpty {
-            parts.append("Skipped \(skipped.count) certificate\(skipped.count == 1 ? "" : "s") that \(skipped.count == 1 ? "is" : "are") not a root: \(skipped.joined(separator: "; ")).")
+            parts.append("Left out \(skipped.count) certificate\(skipped.count == 1 ? "" : "s") not chosen: \(skipped.joined(separator: "; ")).")
         }
         return parts.joined(separator: " ")
     }
@@ -173,7 +180,7 @@ public enum GPOVersionText {
     public static func line(version: UInt32?) -> String {
         guard let version else { return "Default Domain Policy not found — it is created when the server starts." }
         let v = GPOVersion(raw: version)
-        return "Default Domain Policy version \(v.machine) (computers), \(v.user) (users) — members refresh within 90 min or `gpupdate /force`"
+        return "Default Domain Policy version \(v.machine) (computers), \(v.user) (users) — members refresh within 90 min or at gpupdate /force"
     }
 }
 
@@ -243,8 +250,8 @@ public struct AutoEnrollmentStatus: Equatable, Sendable {
 
     /// The three-line "What Windows will do" explanation.
     public static let whatWindowsWillDo = [
-        "At the next policy refresh (90 min, or `gpupdate /force`) each joined PC reads the enrollment policy server from the Default Domain Policy.",
-        "It asks that server (CEP, Kerberos) which templates it may enrol for: computers get Computer, users get User at sign-in.",
+        "At the next policy refresh (90 min, or gpupdate /force) each joined PC reads the enrollment policy server from the Default Domain Policy.",
+        "It asks that server (CEP, Kerberos) which templates it may enroll for: computers get Computer, users get User at sign-in.",
         "It creates a key, sends the request to the CA (CES) and installs the certificate; it renews by itself 42 days before expiry.",
     ]
 }
@@ -454,4 +461,10 @@ public enum PKIText {
         let m = Int(seconds / 60)
         return "\(m) minute\(m == 1 ? "" : "s")"
     }
+}
+
+/// A root change in progress that keeps the old root trusted (`LabCASwitch`, transition mode).
+public struct RootMigrationState: Equatable, Sendable {
+    public let from: String
+    public let to: String
 }

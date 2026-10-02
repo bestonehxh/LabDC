@@ -184,6 +184,16 @@ extension LDAPConnection {
                 reply(LDAPResult(.saslBindInProgress), creds: out)
             case let .complete(output, identity, layer):
                 saslExchange = nil
+                if config.requireLDAPSigning, !isTLS, layer == nil {
+                    // "Require LDAP signing" (LDAPServerIntegrity = 2): no TLS and no SASL
+                    // integrity, so the session could be tampered with or relayed. AD answers
+                    // strongerAuthRequired with the same 00002028 comment.
+                    bound = nil
+                    server.logger.info("LDAP SASL \(mech, privacy: .public) bind by \(identity.downLevelName, privacy: .public) refused: no signing or sealing on a connection without TLS")
+                    reportBind(mech, identity.downLevelName, "strongerAuthRequired (LDAP signing required)")
+                    return reply(LDAPResult(.strongerAuthRequired, diagnosticMessage: "00002028: LdapErr: DSID-0C090259, comment: "
+                        + "The server requires binds to turn on integrity checking if SSL\\TLS are not already active on the connection, data 0, \(ADDiagnostic.version)"))
+                }
                 let entry = try await store.read(sid: identity.sid)
                 bound = await boundIdentity(entry: entry, identity: identity)
                 server.logger.info("LDAP SASL \(mech, privacy: .public) bind: \(identity.downLevelName, privacy: .public), layer \(layer?.qop.description ?? "none", privacy: .public)")
@@ -204,6 +214,12 @@ extension LDAPConnection {
             saslExchange = nil
             bound = nil
             server.logger.info("LDAP SASL \(mech, privacy: .public) bind failed: \(String(describing: error), privacy: .public)")
+            if case .channelBinding? = error as? AuthKitError {
+                // AD: 80090346 SEC_E_BAD_BINDINGS, LdapErr DSID-0C090635 (LdapEnforceChannelBinding).
+                reportBind(mech, "-", "invalidCredentials (80090346, channel binding)")
+                return reply(LDAPResult(.invalidCredentials,
+                                        diagnosticMessage: "80090346: LdapErr: DSID-0C090635, comment: AcceptSecurityContext error, data 80090346, \(ADDiagnostic.version)"))
+            }
             reportBind(mech, "-", "invalidCredentials (52e)")
             reply(LDAPResult(.invalidCredentials,
                              diagnosticMessage: "80090308: LdapErr: DSID-0C090569, comment: AcceptSecurityContext error, data 52e, \(ADDiagnostic.version)"))
@@ -211,11 +227,16 @@ extension LDAPConnection {
     }
 
     /// A fresh server side of `mech` (already checked against `saslMechanisms`).
+    /// On LDAPS / StartTLS the acceptors check the client's channel binding (EPA,
+    /// "LDAP channel binding").
     private func newSASLServer(_ mech: String) -> any SASLServer {
-        if mech == "GSSAPI" { return GSSAPISASLServer(acceptor: server.kerberosAcceptor) }
-        return GSSSPNEGOSASLServer(spnego: SPNEGOAcceptor(
-            kerberos: server.kerberosAcceptor,
-            ntlm: NTLMServer(source: server.secrets, allowAnonymous: false, clock: config.clock)))
+        let binding = server.channelBindingCheck(tls: isTLS)
+        var kerberos = server.kerberosAcceptor
+        kerberos.channelBinding = binding
+        if mech == "GSSAPI" { return GSSAPISASLServer(acceptor: kerberos) }
+        var ntlm = NTLMServer(source: server.secrets, allowAnonymous: false, clock: config.clock)
+        ntlm.channelBinding = binding
+        return GSSSPNEGOSASLServer(spnego: SPNEGOAcceptor(kerberos: kerberos, ntlm: ntlm))
     }
 
     // MARK: Extended operations

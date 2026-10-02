@@ -38,6 +38,10 @@ public final class PKIEditor {
     public private(set) var scepRA: (subject: String, notAfter: Date)?
     public private(set) var directorySync: DirectorySyncStatus?
     public private(set) var groups: [PKIDirectoryGroup] = []
+    /// Every root: issuing, trusted, retired, active certificates (CA page ▸ Roots).
+    public private(set) var roots: [CAService.RootStatus] = []
+    /// A root change that keeps the old root trusted (`from` → `to`), until it is retired.
+    public private(set) var migration: RootMigrationState?
     /// Bumped after every reload (views and tests wait on it).
     public private(set) var generation = 0
     /// The last reload problem (the page shows it; mutations throw instead).
@@ -139,6 +143,8 @@ public final class PKIEditor {
                 scepRA = nil
             }
             groups = try await Self.loadGroups(store: store, info: info)
+            roots = try await service.rootStatuses()
+            migration = try await service.migrationState().map { RootMigrationState(from: $0.from, to: $0.to) }
         } catch {
             problems.append("\(error)")
         }
@@ -242,6 +248,37 @@ public final class PKIEditor {
         await publishToDirectory()
         await reload()
         if let reissueDCCertificate { await reissueDCCertificate() }
+    }
+
+    /// "Change the lab CA key…" (`labdc ca migrate --key … [--now]`): a new root of `keyType`
+    /// issues from now on; the DC certificate is reissued and the server restarts to serve it.
+    /// Without `keepOldTrusted` the old root is retired in the same step (see `LabCASwitch`).
+    @discardableResult
+    public func changeLabCAKey(to keyType: CAKeyType, keepOldTrusted: Bool = false) async throws -> LabCASwitch.Report {
+        let log = self.log
+        let report = try await LabCASwitch.change(to: keyType, keepOldTrusted: keepOldTrusted, data: data, pki: pki, store: store,
+                                                  service: service) { log?.event("PKI", $0 + " (app)") }
+        await reload()
+        if let reissueDCCertificate { await reissueDCCertificate() }
+        return report
+    }
+
+    /// "Retire the old root…": no longer trusted (GPO, NTAuth, 802.1X profiles, EAP-TLS).
+    /// Returns how many certificates it issued are still unexpired.
+    @discardableResult
+    public func retireCA(name: String) async throws -> Int {
+        let log = self.log
+        let active = try await LabCASwitch.retire(name: name, data: data, pki: pki, store: store, service: service) {
+            log?.event("PKI", $0 + " (app)")
+        }
+        await reload()
+        return active.count
+    }
+
+    /// Certificates `caName` issued that are neither revoked nor expired (the Retire confirmation).
+    public func activeCertificates(caName: String) -> [IssuedCertificate] {
+        let now = clock()
+        return issued.filter { $0.caName == caName && !$0.revoked && $0.notAfter > now }
     }
 
     /// `ca crl`: a new CRL now.
@@ -352,6 +389,7 @@ public final class PKIEditor {
     public func saveTemplate(_ template: CertificateTemplate) async throws {
         try await service.saveTemplate(template)
         log?.event("PKI", "template \(template.name) saved (\(template.enabled ? "enabled" : "disabled"), \(template.validityDays) days) (app)")
+        if let warning = template.esc1Warning() { log?.warning("PKI", warning) }
         await publishToDirectory()
         await reload()
     }
@@ -372,6 +410,7 @@ public final class PKIEditor {
         t.builtIn = false
         try await service.saveTemplate(t)
         log?.event("PKI", "template \(name) created (custom, \(t.validityDays) days) (app)")
+        if let warning = t.esc1Warning() { log?.warning("PKI", warning) }
         await publishToDirectory()
         await reload()
     }
@@ -398,25 +437,24 @@ public final class PKIEditor {
 
     // MARK: Trusted roots (`gpo trusted-root add | add-ca | remove`)
 
-    /// Adds every self-signed certificate in a PEM / DER / P7B file (others are skipped).
+    /// Adds the chosen certificates of a PEM / DER / P7B file (others are left out). Like GPMC's
+    /// Trusted Root import any certificate goes (owner, 1 Oct 2026: ClearPass's own certificate
+    /// issued by another CA); `pick` nil: the self-signed ones, else the server's certificate.
     @discardableResult
-    public func addTrustedRoots(from bytes: [UInt8], fileName: String, friendlyName: String? = nil) async throws -> TrustedRootAddReport {
-        let bundle = try CertConvert.load(bytes, name: fileName)
-        guard !bundle.certificates.isEmpty else { throw CLIError.failure("\(fileName) holds no certificate") }
+    public func addTrustedRoots(from bytes: [UInt8], fileName: String, friendlyName: String? = nil,
+                                pick: Dot1XTrustCertificate.Pick? = nil) async throws -> TrustedRootAddReport {
+        let file = try Dot1XTrustCertificate.candidates(bytes, fileName: fileName)
+        let chosen = try Dot1XTrustCertificate.pick(pick, from: file.certificates, fileName: fileName)
         var report = TrustedRootAddReport()
-        let roots = bundle.certificates.filter(\.isSelfIssued)
-        for c in bundle.certificates where !c.isSelfIssued {
-            report.skipped.append("\(c.certificate.subject) (issued by \(c.certificate.issuer))")
+        for c in file.certificates where !chosen.contains(where: { $0.thumbprint == c.thumbprint }) {
+            report.skipped.append("\(c.subject) (\(c.role))")
         }
-        guard !roots.isEmpty else {
-            throw CLIError.failure("\(fileName) holds no self-signed (root) certificate; only root CAs belong in Trusted Root")
-        }
-        for c in roots {
-            let cn = ServerController.commonName(c.certificate.subject)
-            let name = roots.count == 1 ? friendlyName : friendlyName.map { "\($0) (\(cn ?? "root"))" }
-            let changed = try await addTrustedRoot(der: c.der, subject: c.certificate.subject.description, commonName: cn,
-                                                   friendlyName: name)
-            let label = cn ?? c.certificate.subject.description
+        for c in chosen {
+            let item = try CertificateItem(der: c.der)
+            let cn = ServerController.commonName(item.certificate.subject)
+            let name = chosen.count == 1 ? friendlyName : friendlyName.map { "\($0) (\(cn ?? "certificate"))" }
+            let changed = try await addTrustedRoot(der: c.der, subject: c.subject, commonName: cn, friendlyName: name)
+            let label = cn ?? c.subject
             if changed { report.added.append(label) } else { report.alreadyPresent.append(label) }
         }
         await reload()
@@ -446,6 +484,7 @@ public final class PKIEditor {
 
     public func removeTrustedRoot(thumbprint: String) async throws {
         let editor = GroupPolicyEditor(root: data.sysvolURL, store: store)
+        try await GroupPolicyDot1X.checkRootUnused(thumbprint, data: data, editor: editor)
         let change = try await editor.removeTrustedRoot(thumbprint: thumbprint)
         log?.event("GPO", "removed trusted root \(change.thumbprint) from Default Domain Policy"
                    + (change.edit.changed ? " (version \(change.edit.version.raw))" : " (was not in it)") + " (app)")

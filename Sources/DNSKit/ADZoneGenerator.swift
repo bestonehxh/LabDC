@@ -83,6 +83,9 @@ public enum ADZoneGenerator {
             out[former] = [soa(zone: former, info: info, serial: serial), DNSRecord(name: former, ttl: ttl, .ns(host))]
                 + addressRecords(former)
         }
+        for reverse in info.reverseZones where out[reverse] == nil {
+            out[reverse] = [soa(zone: reverse, info: info, serial: serial), DNSRecord(name: reverse, ttl: ttl, .ns(host))]
+        }
         return out
     }
 }

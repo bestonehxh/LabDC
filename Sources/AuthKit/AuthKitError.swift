@@ -24,6 +24,9 @@ public enum AuthKitError: Error, CustomStringConvertible, Sendable, Equatable {
     case sasl(String)
     /// The call is not valid in the current state (e.g. `step` after completion).
     case invalidState(String)
+    /// Extended Protection: the token's channel binding is missing or names another TLS channel
+    /// (SEC_E_BAD_BINDINGS).
+    case channelBinding(String)
 
     public var description: String {
         switch self {
@@ -38,6 +41,7 @@ public enum AuthKitError: Error, CustomStringConvertible, Sendable, Equatable {
         case .negotiation(let s): "SPNEGO: \(s)"
         case .sasl(let s): "SASL: \(s)"
         case .invalidState(let s): "invalid state: \(s)"
+        case .channelBinding(let s): "channel binding: \(s)"
         }
     }
 

@@ -76,8 +76,8 @@ public struct AuthenticationEvent: Sendable, Hashable, Identifiable {
 
         public var title: String {
             switch self {
-            case .openUser: "Open User"
-            case .connectDevice: "Connect a Device"
+            case .openUser: "Open person"
+            case .connectDevice: "Connect a device"
             case .openSettings: "Open Settings"
             }
         }
@@ -473,7 +473,7 @@ public struct AuthenticationEvent: Sendable, Hashable, Identifiable {
         let failed = outcome.hasPrefix("fault") || outcome.hasPrefix("Denied")
         var reason = ""
         if failed {
-            reason = outcome.hasPrefix("Denied") ? "Not allowed to enrol" + (template.map { " for template '\($0)'" } ?? "")
+            reason = outcome.hasPrefix("Denied") ? "Not allowed to enroll" + (template.map { " for template '\($0)'" } ?? "")
                 : "Request failed" + (parenthesized(outcome).map { " (\($0))" } ?? "")
         }
         let user = ActivityEvent.stripRealm(caller)

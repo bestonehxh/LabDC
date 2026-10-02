@@ -15,15 +15,24 @@ public struct RPCCallContext: Sendable {
     /// The negotiated RPC authentication level for this connection (MS-RPCE §2.2.1.1.8). Interfaces
     /// that mandate a protection level — DRSUAPI requires `pktPrivacy` — check it here.
     public let authLevel: RPCAuthLevel
+    /// The RPC auth service of the connection's established security context (`.none` when the
+    /// binding carries no RPC-level authentication, e.g. a plain SMB pipe).
+    public let authType: RPCAuthType
+    /// The principal the RPC security context is bound to, when the provider names one — for
+    /// Netlogon schannel the computer whose secure channel signed the request.
+    public let authPrincipal: String?
 
     public init(identity: AuthenticatedIdentity, sessionKey: [UInt8], clientAddress: String,
-                handles: RPCHandleTable, contextID: UInt16, authLevel: RPCAuthLevel = .none) {
+                handles: RPCHandleTable, contextID: UInt16, authLevel: RPCAuthLevel = .none,
+                authType: RPCAuthType = .none, authPrincipal: String? = nil) {
         self.identity = identity
         self.sessionKey = sessionKey
         self.clientAddress = clientAddress
         self.handles = handles
         self.contextID = contextID
         self.authLevel = authLevel
+        self.authType = authType
+        self.authPrincipal = authPrincipal
     }
 }
 

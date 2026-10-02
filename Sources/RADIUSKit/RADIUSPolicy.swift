@@ -16,6 +16,10 @@ public struct RADIUSPolicy: Codable, Sendable, Equatable, Identifiable {
     public var attributes: [ReturnedAttribute]
     /// The VLAN of the Accept-with-VLAN shorthand (30 Sep 2026); nil for the other actions.
     public var vlan: String?
+    /// MAC Authentication Bypass requests (no credentials, `auth_method = mab`) are evaluated
+    /// only by rules that allow them (off by default): a rule written for signed-in users never
+    /// lets a bare MAC in.
+    public var allowsMAB: Bool
 
     /// Accept-with-VLAN is Accept plus Tunnel-Type = VLAN, Tunnel-Medium-Type = 802 and
     /// Tunnel-Private-Group-ID = `vlan` (spec §3 "Accept-with-VLAN shorthand").
@@ -78,6 +82,14 @@ public struct RADIUSPolicy: Codable, Sendable, Equatable, Identifiable {
             case accountFlag = "account flag"       // userAccountControl facts (disabled, locked, …)
             case timeOfDay = "time of day"          // `08:00-18:00` (is = inside, is not = outside)
             case weekday = "weekday"                // Mon…Sun; `Mon-Fri` or a list
+            // Phase 5 device profiling (looked up by Calling-Station-Id) and MAB.
+            case authMethod = "auth_method"          // mab, pap, mschapv2, eap
+            case deviceCategory = "device_category"  // printer, ipPhone, … ; `unknown` when not profiled
+            case deviceOS = "device_os"
+            case dhcpVendorClass = "dhcp_vendor_class"
+            case dhcpHostname = "dhcp_hostname"
+            case registeredDevice = "registered_device"   // yes / no: on the registered-devices list
+            case deviceGroup = "device_group"              // the registered device's group
 
             /// What the value box suggests.
             public var placeholder: String {
@@ -94,6 +106,13 @@ public struct RADIUSPolicy: Codable, Sendable, Equatable, Identifiable {
                 case .weekday: "Mon-Fri"
                 case .ou: "Staff"
                 case .group: "Domain Users"
+                case .authMethod: "mab"
+                case .deviceCategory: "printer, ipPhone or unknown"
+                case .deviceOS: "Windows 11"
+                case .dhcpVendorClass: "MSFT 5.0"
+                case .dhcpHostname: "LAPTOP-7"
+                case .registeredDevice: "yes"
+                case .deviceGroup: "Printers"
                 default: "value"
                 }
             }
@@ -157,6 +176,14 @@ public struct RADIUSPolicy: Codable, Sendable, Equatable, Identifiable {
                 let names = [ou] + ou.components(separatedBy: " / ")
                 return op.testAny(names, value)
             case .machine: return op.test(request.isMachine ? "yes" : "no", value)
+            case .authMethod: single = request.authMethod
+            // No profile = `unknown`, so "device_category is unknown" catches devices DHCP has not seen.
+            case .deviceCategory: single = request.deviceCategory ?? "unknown"
+            case .deviceOS: single = request.deviceOS
+            case .dhcpVendorClass: single = request.dhcpVendorClass
+            case .dhcpHostname: single = request.dhcpHostname
+            case .registeredDevice: return op.test(request.registeredDevice ? "yes" : "no", value)
+            case .deviceGroup: single = request.deviceGroup
             case .timeOfDay:
                 if op == .is || op == .isNot, let inside = Self.within(time: request.timeOfDay, range: value) {
                     return op == .is ? inside : !inside
@@ -279,9 +306,27 @@ public struct RADIUSPolicy: Codable, Sendable, Equatable, Identifiable {
     }
 
     public init(id: UUID = UUID(), position: Int = 0, name: String, enabled: Bool = true,
-                rows: [Row] = [], action: Action = .accept, attributes: [ReturnedAttribute] = [], vlan: String? = nil) {
+                rows: [Row] = [], action: Action = .accept, attributes: [ReturnedAttribute] = [], vlan: String? = nil,
+                allowsMAB: Bool = false) {
         self.id = id; self.position = position; self.name = name; self.enabled = enabled
         self.rows = rows; self.action = action; self.attributes = attributes; self.vlan = vlan
+        self.allowsMAB = allowsMAB
+    }
+
+    enum CodingKeys: String, CodingKey { case id, position, name, enabled, rows, action, attributes, vlan, allowsMAB }
+
+    /// Older JSON has no `allowsMAB` (= false).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        position = try c.decode(Int.self, forKey: .position)
+        name = try c.decode(String.self, forKey: .name)
+        enabled = try c.decode(Bool.self, forKey: .enabled)
+        rows = try c.decode([Row].self, forKey: .rows)
+        action = try c.decode(Action.self, forKey: .action)
+        attributes = try c.decode([ReturnedAttribute].self, forKey: .attributes)
+        vlan = try c.decodeIfPresent(String.self, forKey: .vlan)
+        allowsMAB = try c.decodeIfPresent(Bool.self, forKey: .allowsMAB) ?? false
     }
 
     public func matches(_ request: RequestContext) -> Bool {
@@ -331,6 +376,24 @@ public struct DirectoryFacts: Sendable, Equatable {
     }
 }
 
+/// Device facts for one MAC (phase 5): the DHCP profile (category, OS, vendor class, hostname)
+/// and the registered-devices list. LabDCCore builds them; the evaluator only reads them.
+public struct DeviceFacts: Sendable, Equatable {
+    /// `printer`, `ipPhone`, … ; nil = no profile (matched as `unknown`).
+    public var category: String?
+    public var os: String?
+    public var vendorClass: String?
+    public var hostname: String?
+    public var registered: Bool
+    public var group: String?
+
+    public init(category: String? = nil, os: String? = nil, vendorClass: String? = nil, hostname: String? = nil,
+                registered: Bool = false, group: String? = nil) {
+        self.category = category; self.os = os; self.vendorClass = vendorClass; self.hostname = hostname
+        self.registered = registered; self.group = group
+    }
+}
+
 /// What the evaluator sees: the RADIUS attributes plus the directory facts for the account.
 public struct RequestContext: Sendable, Equatable {
     /// User-Name as the NAS sent it — for EAP the outer identity (`anonymous@lab.sheep`).
@@ -363,6 +426,16 @@ public struct RequestContext: Sendable, Equatable {
     /// Local time `HH:mm` and weekday `Mon`…`Sun` when the request arrived.
     public var timeOfDay: String
     public var weekday: String
+    /// How the request authenticated: `mab`, `pap`, `mschapv2`, `eap` (nil in a Test box that
+    /// does not say).
+    public var authMethod: String?
+    /// Device facts by Calling-Station-Id (see `DeviceFacts`); nil category = `unknown`.
+    public var deviceCategory: String?
+    public var deviceOS: String?
+    public var dhcpVendorClass: String?
+    public var dhcpHostname: String?
+    public var registeredDevice = false
+    public var deviceGroup: String?
 
     public init(userName: String? = nil, calledStationId: String? = nil, callingStationId: String? = nil,
                 nasIP: String? = nil, nasIdentifier: String? = nil, serviceType: String? = nil, eapMethod: String? = nil,
@@ -405,6 +478,16 @@ public struct RequestContext: Sendable, Equatable {
         accountFlags = facts.accountFlags
     }
 
+    /// Adds the device facts; a value already set (a Test box line) stays.
+    public mutating func merge(_ device: DeviceFacts) {
+        if deviceCategory == nil { deviceCategory = device.category }
+        if deviceOS == nil { deviceOS = device.os }
+        if dhcpVendorClass == nil { dhcpVendorClass = device.vendorClass }
+        if dhcpHostname == nil { dhcpHostname = device.hostname }
+        if device.registered { registeredDevice = true }
+        if deviceGroup == nil { deviceGroup = device.group }
+    }
+
     /// `Name = value`, one per line (the app's Test box, `labdc radius test`). Names are the
     /// RADIUS attribute names plus `Time` (HH:mm) and `Weekday`; blank lines and `#` comments are
     /// skipped. Returns the lines it did not understand.
@@ -432,6 +515,14 @@ public struct RequestContext: Sendable, Equatable {
             case "certificate-issuer", "certificate issuer": context.certificateIssuer = value
             case "time", "time of day": context.timeOfDay = value
             case "weekday", "day": context.weekday = value
+            case "auth_method", "auth-method", "auth method": context.authMethod = value.lowercased()
+            case "device_category", "device-category", "device category": context.deviceCategory = value
+            case "device_os", "device-os", "device os": context.deviceOS = value
+            case "dhcp_vendor_class", "dhcp-vendor-class", "vendor class": context.dhcpVendorClass = value
+            case "dhcp_hostname", "dhcp-hostname", "hostname": context.dhcpHostname = value
+            case "registered_device", "registered-device", "registered device":
+                context.registeredDevice = ["yes", "true", "1"].contains(value.lowercased())
+            case "device_group", "device-group", "device group": context.deviceGroup = value
             default: unknown.append(line)
             }
         }
@@ -461,19 +552,24 @@ public enum RADIUSDefaultAction: String, Codable, Sendable, CaseIterable {
 }
 
 public enum RADIUSEvaluator {
-    /// The first enabled rule that matches, in position order.
+    /// The first enabled rule that matches, in position order. A MAB request (`auth_method =
+    /// mab`) only sees the rules that allow MAB.
     public static func match(policies: [RADIUSPolicy], _ request: RequestContext) -> RADIUSPolicy? {
-        policies
-            .filter { $0.enabled }
+        let mab = request.authMethod == "mab"
+        return policies
+            .filter { $0.enabled && (!mab || $0.allowsMAB) }
             .sorted { $0.position < $1.position }
             .first { $0.matches(request) }
     }
 
     /// First match wins; no match = `defaultAction` (an Accept by default returns nothing).
+    /// A MAB request with no matching MAB rule is always rejected: "Accept when nothing matches"
+    /// is about signed-in users and never lets a bare MAC onto the network.
     public static func decide(policies: [RADIUSPolicy], defaultAction: RADIUSDefaultAction,
                               _ request: RequestContext) -> RADIUSDecision {
         guard let rule = match(policies: policies, request) else {
-            return RADIUSDecision(accept: defaultAction == .accept, rule: nil, attributes: [])
+            let mab = request.authMethod == "mab"
+            return RADIUSDecision(accept: !mab && defaultAction == .accept, rule: nil, attributes: [])
         }
         return RADIUSDecision(accept: rule.action.accepts, rule: rule.name, attributes: rule.replyAttributes)
     }

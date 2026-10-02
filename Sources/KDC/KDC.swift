@@ -34,12 +34,16 @@ public struct ExchangeRecord: Sendable, CustomStringConvertible {
     public var replySize: Int = 0
     /// kpasswd: the result code sent back (in a KRB-PRIV, or in a KRB-ERROR's e-data).
     public var kpasswdResult: KPasswdResult?
+    /// Delegation-related flags of the issued ticket (`ok-as-delegate`, `forwarded`), logged
+    /// so a Windows "must be trusted for delegation" failure can be traced from the log.
+    public var ticketFlags: [String] = []
 
     public init(from: String) { self.from = from }
 
     public var succeeded: Bool { errorCode == nil }
 
-    /// `AS alice@LAB.SHEEP from 127.0.0.1 etype=18 -> OK ticket krbtgt/LAB.SHEEP 10h` or
+    /// `AS alice@LAB.SHEEP from 127.0.0.1 etype=18 -> OK ticket krbtgt/LAB.SHEEP 10h`,
+    /// `TGS alice@LAB.SHEEP from 127.0.0.1 etype=18 -> OK ticket HTTP/dc1.lab.sheep 10h flags=ok-as-delegate` or
     /// `AS alice@LAB.SHEEP from 127.0.0.1 -> KDC_ERR_PREAUTH_REQUIRED`.
     public var description: String {
         var s = "\(kind.rawValue) \(client ?? "-") from \(from)"
@@ -51,10 +55,14 @@ public struct ExchangeRecord: Sendable, CustomStringConvertible {
         }
         if let errorCode {
             s += " -> \(KerberosErrorCode.name(errorCode))"
+            // Which service was unknown is the whole point of that error (1 Oct 2026).
+            if errorCode == 7, let server { s += " (\(server))" }
         } else {
             if let etype { s += " etype=\(etype)" }
             s += " -> OK ticket \(server ?? "-")"
             if let lifetime { s += " \(Self.formatLifetime(lifetime))" }
+            // After the lifetime: the log parsers read the service as the third outcome word.
+            if !ticketFlags.isEmpty { s += " flags=\(ticketFlags.joined(separator: ","))" }
         }
         return s
     }
@@ -71,7 +79,8 @@ public struct ExchangeRecord: Sendable, CustomStringConvertible {
 ///
 /// Windows-facing behaviour (WP-J): `canonicalize`, NT-ENTERPRISE and `DOMAIN\user` client
 /// names, PA-PAC-OPTIONS and PA-SUPPORTED-ENCTYPES in `encrypted-pa-data`, ETYPE-INFO2 in
-/// PREAUTH_FAILED, a PA-ENC-TIMESTAMP replay cache, renew/validate, U2U refused with BADOPTION,
+/// PREAUTH_FAILED, a PA-ENC-TIMESTAMP replay cache, renew/validate, U2U and proxy refused with
+/// BADOPTION, unconstrained delegation (OK-AS-DELEGATE, forwarded TGTs),
 /// PAC_FULL_CHECKSUM in service tickets, account state (CLIENT_REVOKED, KEY_EXPIRED) and
 /// logon bookkeeping.
 public actor KDC {
@@ -337,7 +346,9 @@ public actor KDC {
 
         let changePassword = server.isChangePasswordService
         var flags = TicketFlags()
-        flags.forwardable = options.forwardable && !changePassword
+        // NOT_DELEGATED ("sensitive and cannot be delegated"): never FORWARDABLE, so the TGT
+        // can be neither forwarded nor used for delegable service tickets (MS-KILE §3.3.5.7).
+        flags.forwardable = options.forwardable && !changePassword && !client.notDelegated
         flags.proxiable = options.proxiable && !changePassword
         flags.initial = true
         flags.preAuthent = true
@@ -590,10 +601,12 @@ public actor KDC {
             throw KDCError.krb(KerberosErrorCode.kdcErrPadataTypeNosupp, "TGS-REQ without PA-TGS-REQ")
         }
 
-        // Options: user-to-user, proxy and forwarded requests are not supported.
+        // Options: user-to-user and proxy requests are not supported; `forwarded` only for a
+        // TGT (checked below, once the service is known).
         let options = body.kdcOptions
         let unsupported = [(options.encTktInSkey, "enc-tkt-in-skey (user-to-user)"), (options.proxy, "proxy"),
-                           (options.forwarded, "forwarded"), (options.renew && options.validate, "renew+validate")]
+                           (options.forwarded && (options.renew || options.validate), "forwarded+renew/validate"),
+                           (options.renew && options.validate, "renew+validate")]
             .filter(\.0).map(\.1)
         guard unsupported.isEmpty else {
             throw KDCError.krb(KerberosErrorCode.kdcErrBadoption, "unsupported kdc-options \(unsupported)")
@@ -671,8 +684,10 @@ public actor KDC {
         }
 
         // The client must still be allowed to log on.
+        var clientNotDelegated = false
         if let client = try await lookupClient(tgt.cname, realm: tgt.crealm) {
             try checkAccountState(client, now: now)
+            clientNotDelegated = client.notDelegated
         }
 
         // 2. The service (for renew/validate: the ticket's own server).
@@ -696,6 +711,21 @@ public actor KDC {
         }
         guard service.enabled else {
             throw KDCError.krb(KerberosErrorCode.kdcErrServiceRevoked, "service \(service.displayName) is disabled")
+        }
+        // FORWARDED (RFC 4120 §2.6, §3.3.3): a copy of a forwardable TGT, for unconstrained
+        // delegation (a client sends it in the KRB-CRED of a GSS_C_DELEG_FLAG checksum).
+        // Forwarded service tickets are not issued, as Windows clients only forward TGTs.
+        if options.forwarded {
+            guard service.kind == .krbtgt else {
+                throw KDCError.krb(KerberosErrorCode.kdcErrBadoption, "forwarded: \(service.displayName) is not krbtgt")
+            }
+            guard tgt.flags.forwardable else {
+                throw KDCError.krb(KerberosErrorCode.kdcErrBadoption, "forwarded: the TGT is not forwardable")
+            }
+            // A TGT issued before the account became NOT_DELEGATED may still be forwardable.
+            guard !clientNotDelegated else {
+                throw KDCError.krb(KerberosErrorCode.kdcErrBadoption, "forwarded: \(tgt.cname) cannot be delegated")
+            }
         }
         let serviceKey: KerberosKey
         let newSessionType: EncryptionType
@@ -734,10 +764,17 @@ public actor KDC {
             }
         } else {
             let changePassword = service.isChangePasswordService
-            flags.forwardable = options.forwardable && tgt.flags.forwardable && !changePassword
+            flags.forwardable = options.forwardable && tgt.flags.forwardable && !changePassword && !clientNotDelegated
             flags.proxiable = options.proxiable && tgt.flags.proxiable && !changePassword
             flags.renewable = options.renewable && tgt.flags.renewable && !changePassword
             flags.preAuthent = tgt.flags.preAuthent
+            // RFC 4120 §2.6: FORWARDED is set in a forwarded TGT and in every ticket issued
+            // from one, so a service can tell the client's credentials were delegated.
+            flags.forwarded = options.forwarded || tgt.flags.forwarded
+            // MS-KILE §3.3.5.7: OK-AS-DELEGATE when the service account is TRUSTED_FOR_DELEGATION.
+            // Windows only delegates (forwards its TGT) to such services, and its CES client
+            // fails with SEC_E_DELEGATION_REQUIRED without it.
+            flags.okAsDelegate = service.kind != .krbtgt && service.trustedForDelegation
             endtime = min(tgt.endtime, now.adding(seconds: changePassword ? KDCPolicy.changePasswordTicketLifetime
                                                                            : KDCPolicy.maxTicketLifetime))
             if body.till.secondsSince1970 > 0, body.till < endtime { endtime = body.till }
@@ -767,10 +804,13 @@ public actor KDC {
             }
         }
 
+        // A forwarded TGT carries the addresses the client asked for (it is used from another
+        // host), none when it asked for none (RFC 4120 §2.6, §3.3.3).
+        let caddr = options.forwarded ? body.addresses : tgt.caddr
         var encTicket = EncTicketPart(
             flags: flags, key: EncryptionKey(keytype: sessionKey.type.rawValue, keyvalue: sessionKey.bytes),
             crealm: tgt.crealm, cname: tgt.cname, transited: tgt.transited, authtime: tgt.authtime,
-            starttime: starttime, endtime: endtime, renewTill: renewTill, caddr: tgt.caddr)
+            starttime: starttime, endtime: endtime, renewTill: renewTill, caddr: caddr)
         // Renew/validate echo the ticket's realm, unless it is an alias (the outer realm of a
         // ticket is not encrypted; ours never carry one).
         let ticketRealm = renewOrValidate && !isRealmAlias(tkt.realm) ? tkt.realm : realm
@@ -797,7 +837,7 @@ public actor KDC {
         let encPart = EncKDCRepPart(
             key: encTicket.key, lastReq: [LastReqEntry(lrType: LastReqType.none, lrValue: now)],
             nonce: body.nonce, flags: flags, authtime: tgt.authtime, starttime: starttime, endtime: endtime,
-            renewTill: renewTill, srealm: ticketRealm, sname: sname, encryptedPAData: encPAData)
+            renewTill: renewTill, srealm: ticketRealm, sname: sname, caddr: caddr, encryptedPAData: encPAData)
         let cipher = try KerberosCrypto.encrypt(EncTGSRepPart(encPart).encode(), key: replyKey, usage: usage, rng: rng)
         let rep = TGSRep(crealm: tgt.crealm, cname: tgt.cname, ticket: ticket,
                          encPart: EncryptedData(etype: replyKey.type.rawValue, cipher: cipher))
@@ -805,6 +845,7 @@ public actor KDC {
         record.server = sname.description + (options.renew ? " (renew)" : options.validate ? " (validate)" : "")
         record.etype = serviceKey.type.rawValue
         record.lifetime = endtime.secondsSince1970 - now.secondsSince1970
+        record.ticketFlags = [(flags.okAsDelegate, "ok-as-delegate"), (flags.forwarded, "forwarded")].filter(\.0).map(\.1)
         return rep.encode()
     }
 }

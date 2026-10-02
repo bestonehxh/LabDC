@@ -12,6 +12,9 @@ public struct RADIUSPacket: Sendable, Equatable {
         case accessRequest = 1, accessAccept = 2, accessReject = 3
         case accountingRequest = 4, accountingResponse = 5
         case accessChallenge = 11
+        /// RFC 5176 Dynamic Authorization: the DC is the client, the NAS the server.
+        case disconnectRequest = 40, disconnectACK = 41, disconnectNAK = 42
+        case coaRequest = 43, coaACK = 44, coaNAK = 45
         /// "Access-Reject" etc.
         public var title: String {
             switch self {
@@ -21,20 +24,36 @@ public struct RADIUSPacket: Sendable, Equatable {
             case .accountingRequest: "Accounting-Request"
             case .accountingResponse: "Accounting-Response"
             case .accessChallenge: "Access-Challenge"
+            case .disconnectRequest: "Disconnect-Request"
+            case .disconnectACK: "Disconnect-ACK"
+            case .disconnectNAK: "Disconnect-NAK"
+            case .coaRequest: "CoA-Request"
+            case .coaACK: "CoA-ACK"
+            case .coaNAK: "CoA-NAK"
             }
+        }
+
+        /// Requests whose Request Authenticator is MD5 over a zeroed field + the secret
+        /// (Accounting-Request, RFC 2866 §3; CoA/Disconnect-Request, RFC 5176 §2.3) and whose
+        /// Message-Authenticator is computed over that zeroed field.
+        public var hasComputedRequestAuthenticator: Bool {
+            self == .accountingRequest || self == .disconnectRequest || self == .coaRequest
         }
     }
 
     /// The attributes the policy engine and auth care about (type numbers per RFC 2865/2866/2868/2869).
     public enum AttrType: UInt8, Sendable {
         case userName = 1, userPassword = 2, chapPassword = 3, nasIPAddress = 4, nasPort = 5, serviceType = 6
-        case framedProtocol = 7, filterId = 11, framedMTU = 12, replyMessage = 18, state = 24, class_ = 25
+        case framedProtocol = 7, framedIPAddress = 8, filterId = 11, framedMTU = 12, replyMessage = 18, state = 24, class_ = 25
         case vendorSpecific = 26, sessionTimeout = 27, idleTimeout = 28, terminationAction = 29
         case calledStationId = 30, callingStationId = 31, nasIdentifier = 32
-        case proxyState = 33, acctStatusType = 40, acctSessionId = 44, nasPortType = 61
+        case proxyState = 33, acctStatusType = 40, acctDelayTime = 41, acctInputOctets = 42, acctOutputOctets = 43
+        case acctSessionId = 44, acctSessionTime = 46, acctInputPackets = 47, acctOutputPackets = 48
+        case acctTerminateCause = 49, acctInputGigawords = 52, acctOutputGigawords = 53, eventTimestamp = 55
+        case chapChallenge = 60, nasPortType = 61
         case tunnelType = 64, tunnelMediumType = 65
         case eapMessage = 79, messageAuthenticator = 80, tunnelPrivateGroupID = 81
-        case nasIPv6Address = 95
+        case nasPortId = 87, nasIPv6Address = 95, errorCause = 101
     }
 
     public var code: Code
@@ -187,7 +206,7 @@ public struct RADIUSPacket: Sendable, Equatable {
         let over: [UInt8]?
         switch code {
         case .accessRequest: over = nil
-        case .accountingRequest: over = [UInt8](repeating: 0, count: 16)
+        case .accountingRequest, .disconnectRequest, .coaRequest: over = [UInt8](repeating: 0, count: 16)
         default: over = requestAuthenticator
         }
         guard let expected = Self.messageAuthenticator(over: bytes, authenticator: over, secret: secret) else { return false }
@@ -203,26 +222,28 @@ public struct RADIUSPacket: Sendable, Equatable {
         return Array(Insecure.MD5.hash(data: b + secret))
     }
 
-    /// Checks an Accounting-Request's Request Authenticator (constant time).
+    /// Checks an Accounting-Request's (or CoA/Disconnect-Request's, RFC 5176 §2.3) Request
+    /// Authenticator (constant time).
     public func verifyAccountingRequestAuthenticator(secret: [UInt8]) -> Bool {
-        guard code == .accountingRequest, let bytes = raw ?? (try? encode()) else { return false }
+        guard code.hasComputedRequestAuthenticator, let bytes = raw ?? (try? encode()) else { return false }
         return ConstantTime.equal(authenticator, Self.accountingRequestAuthenticator(over: bytes, secret: secret))
     }
 
     // MARK: Signing
 
     /// Finishes a reply to the request whose authenticator is `requestAuthenticator`: an optional
-    /// `Message-Authenticator` over the request's authenticator (RFC 3579 §3.2), then the
+    /// `Message-Authenticator` — the first attribute — over the request's authenticator (RFC 3579 §3.2), then the
     /// Response Authenticator MD5(Code+ID+Length+RequestAuth+Attributes+Secret) (RFC 2865 §3).
     public mutating func signResponse(requestAuthenticator: [UInt8], secret: [UInt8], messageAuthenticator: Bool) throws {
         remove(.messageAuthenticator)
         authenticator = requestAuthenticator
         if messageAuthenticator {
-            attributes.append(Attribute(.messageAuthenticator, [UInt8](repeating: 0, count: 16)))
+            // First attribute (Blast-RADIUS, CVE-2024-3596 / RFC 9765 era guidance): an MD5
+            // chosen-prefix collision then has no attacker-controlled bytes before it.
+            attributes.insert(Attribute(.messageAuthenticator, [UInt8](repeating: 0, count: 16)), at: 0)
             let bytes = try encode()
-            if let mac = Self.messageAuthenticator(over: bytes, authenticator: nil, secret: secret),
-               let i = attributes.lastIndex(where: { $0.type == AttrType.messageAuthenticator.rawValue }) {
-                attributes[i].value = mac
+            if let mac = Self.messageAuthenticator(over: bytes, authenticator: nil, secret: secret) {
+                attributes[0].value = mac
             }
         }
         authenticator = Array(Insecure.MD5.hash(data: try encode() + secret))
@@ -238,19 +259,22 @@ public struct RADIUSPacket: Sendable, Equatable {
 
     /// Signs a request as a NAS would (tests, `radius-check`): Access-Request keeps its random
     /// authenticator and gets a Message-Authenticator over it; Accounting-Request gets one over
-    /// zeros (when `messageAuthenticator`), then its RFC 2866 Request Authenticator.
+    /// zeros (when `messageAuthenticator`), then its RFC 2866 Request Authenticator. CoA- and
+    /// Disconnect-Requests (RFC 5176 §2.3/§3.1) are signed the way Accounting-Requests are.
     public mutating func signRequest(secret: [UInt8], messageAuthenticator: Bool = true) throws {
         remove(.messageAuthenticator)
-        if code == .accountingRequest { authenticator = [UInt8](repeating: 0, count: 16) }
+        let computed = code.hasComputedRequestAuthenticator
+        if computed { authenticator = [UInt8](repeating: 0, count: 16) }
         if messageAuthenticator {
-            attributes.append(Attribute(.messageAuthenticator, [UInt8](repeating: 0, count: 16)))
+            // First attribute (Blast-RADIUS, CVE-2024-3596 / RFC 9765 era guidance): an MD5
+            // chosen-prefix collision then has no attacker-controlled bytes before it.
+            attributes.insert(Attribute(.messageAuthenticator, [UInt8](repeating: 0, count: 16)), at: 0)
             let bytes = try encode()
-            if let mac = Self.messageAuthenticator(over: bytes, authenticator: nil, secret: secret),
-               let i = attributes.lastIndex(where: { $0.type == AttrType.messageAuthenticator.rawValue }) {
-                attributes[i].value = mac
+            if let mac = Self.messageAuthenticator(over: bytes, authenticator: nil, secret: secret) {
+                attributes[0].value = mac
             }
         }
-        if code == .accountingRequest {
+        if computed {
             authenticator = Self.accountingRequestAuthenticator(over: try encode(), secret: secret)
         }
         raw = nil

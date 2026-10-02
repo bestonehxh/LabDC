@@ -17,7 +17,8 @@ import os
 /// ```
 /// Every entry may also carry `kvno` (default 1), `etypes` (default `[18, 17, 23]`), `enabled`
 /// (default true), `passwordSet` (ISO 8601), `upn` (users; default `name@dnsDomain`) and
-/// `keys` (`[{"etype": 18, "hex": "…"}]`, used instead of `password`).
+/// `keys` (`[{"etype": 18, "hex": "…"}]`, used instead of `password`), `trustedForDelegation`
+/// and `notDelegated` (default false; AD's UAC 0x80000 and 0x100000).
 public struct PrincipalsFile: Codable, Sendable {
     public struct KeyEntry: Codable, Sendable {
         public var etype: Int32
@@ -37,6 +38,8 @@ public struct PrincipalsFile: Codable, Sendable {
         public var etypes: [Int32]?
         public var enabled: Bool?
         public var passwordSet: String?
+        public var trustedForDelegation: Bool?
+        public var notDelegated: Bool?
     }
 
     public var realm: String
@@ -250,7 +253,8 @@ public actor JSONPrincipalStore: PrincipalStore {
             passwordSet = d
         }
         return Principal(name: name, realm: info.realm, keys: keys, kvno: entry.kvno ?? 1, kind: kind,
-                         passwordSet: passwordSet, enabled: entry.enabled ?? true, salt: salt)
+                         passwordSet: passwordSet, enabled: entry.enabled ?? true, salt: salt,
+                         trustedForDelegation: entry.trustedForDelegation ?? false, notDelegated: entry.notDelegated ?? false)
     }
 
     /// Fills in random keys for krbtgt entries that have neither keys nor a password.

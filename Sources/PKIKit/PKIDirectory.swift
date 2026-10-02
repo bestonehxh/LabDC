@@ -116,9 +116,14 @@ public enum PKIDirectory {
         public var templateArc: String
         /// Latest CRL (DER) per CA name.
         public var crls: [String: [UInt8]]
+        /// CAs that are not trusted (a retired root, the RSA compatibility root while switched
+        /// off): AIA and CDP stay (existing certificates still chain and check revocation), but
+        /// they leave `Certification Authorities` and NTAuth.
+        public var untrusted: Set<String>
 
         public init(authorities: [CertificateAuthority], current: CertificateAuthority?, templates: [CertificateTemplate],
-                    templateArc: String, crls: [String: [UInt8]]) {
+                    templateArc: String, crls: [String: [UInt8]], untrusted: Set<String> = []) {
+            self.untrusted = untrusted
             self.authorities = authorities
             self.current = current
             self.templates = templates
@@ -136,13 +141,20 @@ public enum PKIDirectory {
         // CAs: Certification Authorities, AIA, CDP, NTAuth.
         let names = try uniqueObjectNames(snapshot.authorities)
         var ntAuth: [[UInt8]] = []
+        var untrustedDERs: [[UInt8]] = []
         for ca in snapshot.authorities.sorted(by: { $0.name < $1.name }) {
             let der = try ca.der()
-            ntAuth.append(der)
-            let (dn, changed) = try await CertificationAuthorityDirectory.publish(
-                CACertificateInfo(der: der, commonName: commonName(ca.certificate), subject: ca.certificate.subject.description),
-                store: store)
-            if changed { w.report.modified.append(dn) }
+            if snapshot.untrusted.contains(ca.name) {
+                untrustedDERs.append(der)
+                let removed = try await CertificationAuthorityDirectory.unpublish(thumbprint: CertificateBlob.thumbprint(der), store: store)
+                w.report.modified.append(contentsOf: removed)
+            } else {
+                ntAuth.append(der)
+                let (dn, changed) = try await CertificationAuthorityDirectory.publish(
+                    CACertificateInfo(der: der, commonName: commonName(ca.certificate), subject: ca.certificate.subject.description),
+                    store: store)
+                if changed { w.report.modified.append(dn) }
+            }
             try await w.ensureCertificationAuthority(parent: aiaDN(configurationDN: info.configurationDN),
                                                      name: names[ca.name] ?? ca.name, certificates: [der],
                                                      subject: ca.certificate.subject.description)
@@ -151,7 +163,8 @@ public enum PKIDirectory {
             }
         }
         try await w.ensureCertificationAuthority(parent: publicKeyServicesDN(configurationDN: info.configurationDN),
-                                                 name: "NTAuthCertificates", certificates: ntAuth, subject: nil)
+                                                 name: "NTAuthCertificates", certificates: ntAuth, subject: nil,
+                                                 removing: untrustedDERs)
 
         // Templates and their enterprise OID objects.
         try await publishTemplates(&w, info: info, templates: snapshot.templates, arc: snapshot.templateArc)
@@ -310,10 +323,12 @@ public enum PKIDirectory {
         /// `certificates` in `cACertificate`: values already there (renewed or foreign CAs) are
         /// kept, missing ones appended. authorityRevocationList / certificateRevocationList are
         /// mustContain; they get one NUL byte on creation, as `certutil -dspublish` writes them.
+        /// Adds `certificates` (values added by hand stay) and drops `removing` (an untrusted LabDC CA).
         mutating func ensureCertificationAuthority(parent: DN, name: String, certificates: [[UInt8]],
-                                                   subject: String?) async throws {
+                                                   subject: String?, removing: [[UInt8]] = []) async throws {
             let existing = try await store.read(dn: parent.child(RDN("CN", name)), attrs: ["cACertificate"])
             var values = existing?.values("cACertificate") ?? []
+            values.removeAll { removing.contains($0) }
             for der in certificates where !values.contains(der) { values.append(der) }
             var initial: [String: [[UInt8]]] = ["authorityRevocationList": [[0]], "certificateRevocationList": [[0]]]
             if let subject { initial["cACertificateDN"] = [Array(subject.utf8)] }
@@ -344,8 +359,10 @@ extension CAService {
         for ca in authorities {
             if let row = try await store.pkiCRL(caName: ca.name) { crls[ca.name] = row.der }
         }
+        let trusted = Set(try await trustedAuthorities().map(\.name))
         let snapshot = PKIDirectory.Snapshot(authorities: authorities, current: current, templates: try await templates(),
-                                             templateArc: try await templateArc(), crls: crls)
+                                             templateArc: try await templateArc(), crls: crls,
+                                             untrusted: Set(authorities.map(\.name)).subtracting(trusted))
         return try await PKIDirectory.publish(snapshot, store: store)
     }
 

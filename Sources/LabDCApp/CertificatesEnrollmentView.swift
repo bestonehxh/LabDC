@@ -11,6 +11,7 @@ struct CertificatesEnrollmentView: View {
     @Bindable var challenges: ChallengeRevealModel
     @State private var newChallenge = false
     @State private var switching = false
+    @State private var confirmRevoke: ChallengeRevealModel.Row?
 
     var body: some View {
         ScrollView {
@@ -72,7 +73,7 @@ struct CertificatesEnrollmentView: View {
             if let port = ep.httpsPort {
                 VStack(alignment: .leading, spacing: 0) {
                     InfoRow(label: "HTTPS port", value: "\(port) (Kerberos / Negotiate)")
-                    InfoRow(label: "Policy (CEP)", value: ep.cepURL, copyable: true)
+                    // The policy server (CEP) URL is in Auto-enrollment above (owner, 2 Oct 2026).
                     if let ca = editor.currentCA {
                         InfoRow(label: "Enrollment (CES)", value: ep.cesURL(caName: ca.name), copyable: true)
                     }
@@ -119,7 +120,7 @@ struct CertificatesEnrollmentView: View {
         let rows = ChallengeRevealModel.rows(editor.challenges)
         return Card(title: "Challenges") {
             HStack(alignment: .firstTextBaseline, spacing: 24) {
-                Text("A challenge lets one device (or any device, if reusable) enrol through SCEP or EST. It is shown once.")
+                Text("A challenge lets one device (or any device, if reusable) enroll through SCEP or EST. It is shown once.")
                     .font(Theme.detail).foregroundStyle(Theme.muted)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 12)
@@ -133,14 +134,19 @@ struct CertificatesEnrollmentView: View {
                 TableColumn("Template") { r in Text(r.template).font(Theme.body) }.width(min: 60, ideal: 80)
                 TableColumn("Kind") { r in Text(r.reusable).font(Theme.detail).foregroundStyle(Theme.muted) }.width(min: 60, ideal: 80)
                 TableColumn("Expires") { r in Text(PKIText.stamp(r.expires)).font(Theme.detail).foregroundStyle(Theme.muted) }.width(min: 100, ideal: 130)
-                TableColumn("Used") { r in Text(r.used).font(Theme.detail).foregroundStyle(Theme.muted) }.width(min: 80, ideal: 150)
+                // One State column: the state, and when it was used under it (owner, 2 Oct 2026).
                 TableColumn("State") { r in
-                    CertStatusText(text: r.state.rawValue.capitalized, attention: r.state == .revoked,
-                                   dimmed: r.state == .expired || r.state == .used)
+                    VStack(alignment: .leading, spacing: 1) {
+                        CertStatusText(text: r.state.rawValue.capitalized, attention: r.state == .revoked,
+                                       dimmed: r.state == .expired || r.state == .used)
+                        if let used = r.usedText {
+                            Text(used).font(Theme.caption).foregroundStyle(Theme.muted)
+                        }
+                    }
                 }
-                .width(min: 60, ideal: 70)
+                .width(min: 100, ideal: 180)
             }
-            .tableStyle(.inset)
+            .tableStyle(.inset(alternatesRowBackgrounds: false))
             .scrollContentBackground(.hidden)
             .frame(minHeight: 150, idealHeight: 190)
             .overlay {
@@ -150,14 +156,22 @@ struct CertificatesEnrollmentView: View {
             }
             HStack {
                 let selected = rows.first { challenges.selection.contains($0.id) }
-                Button("Revoke") {
-                    guard let selected else { return }
-                    Task { await model.perform("Revoke challenge") { try await $0.revokeChallenge(id: selected.id) } }
-                }
+                Button("Revoke…") { confirmRevoke = selected }
                 .buttonStyle(.quietDestructive)
                 .disabled(selected == nil || selected?.state != .active)
                 Spacer()
             }
+        }
+        // Revoking cannot be undone: ask first (owner, 2 Oct 2026).
+        .alert("Revoke the challenge \(confirmRevoke?.id ?? "")?",
+               isPresented: Binding(get: { confirmRevoke != nil }, set: { if !$0 { confirmRevoke = nil } }),
+               presenting: confirmRevoke) { row in
+            Button("Revoke", role: .destructive) {
+                Task { await model.perform("Revoke challenge") { try await $0.revokeChallenge(id: row.id) } }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { row in
+            Text("\(row.device) can no longer enroll with it. This cannot be undone; create a new challenge if it is needed again.")
         }
     }
 }

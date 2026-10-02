@@ -28,6 +28,28 @@ public enum PortProbe {
         return nil
     }
 
+    /// Whether every family binds (no `lsof`: cheap enough to poll while a port is released).
+    public static func isFree(port: UInt16, protos: [Proto]) -> Bool {
+        guard port != 0 else { return true }
+        for proto in protos {
+            for family in [AF_INET, AF_INET6] {
+                if let e = bindError(port: port, proto: proto, family: family) {
+                    if e == EADDRNOTAVAIL || e == EAFNOSUPPORT, family == AF_INET6 { continue }
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    /// `udp port 547 is in use (holder: X)` → `X` (nil for other messages).
+    public static func holderName(in message: String) -> String? {
+        guard let start = message.range(of: "(holder: ") else { return nil }
+        var rest = message[start.upperBound...]
+        if rest.hasSuffix(")") { rest = rest.dropLast() }
+        return String(rest)
+    }
+
     static func bindError(port: UInt16, proto: Proto, family: Int32) -> Int32? {
         let fd = socket(family, proto == .udp ? SOCK_DGRAM : SOCK_STREAM, 0)
         guard fd >= 0 else { return errno }
@@ -72,6 +94,39 @@ public enum PortProbe {
             let f = line.split(separator: " ", omittingEmptySubsequences: true)
             return f.count >= 9 ? "\(f[0]) pid \(f[1]) \(f[7]) \(f[8])" : String(line)
         }
-        return rows.isEmpty ? "not visible to this user; try `sudo lsof -nP -i :\(port)`" : Array(Set(rows)).sorted().joined(separator: "; ")
+        if rows.isEmpty, let known = knownSystemHolder(port) { return known }
+        return rows.isEmpty ? "not visible to this user; try sudo lsof -nP -i :\(port)" : Array(Set(rows)).sorted().joined(separator: "; ")
+    }
+
+    /// Root-owned holders lsof cannot show this user, named from the running process list
+    /// (owner, 1 Oct 2026: UTM's Shared network started Internet Sharing, which holds udp 67, and
+    /// udp 547 too; it kept running after UTM quit).
+    static func knownSystemHolder(_ port: UInt16, running: (String) -> Bool = PortProbe.isRunning) -> String? {
+        switch port {
+        case 67:
+            if running("InternetSharing") || running("bootpd") {
+                return "macOS Internet Sharing (bootpd) — a VM on a Shared network (UTM, Parallels, VMware) or Settings ▸ General ▸ Sharing ▸ Internet Sharing turns it on; "
+                    + "it may keep running after the VM quits. Switch the VM to Bridged, or turn Internet Sharing off in System Settings ▸ General ▸ Sharing (or log out) to release it"
+            }
+        case 547:
+            if running("InternetSharing") {
+                return "macOS Internet Sharing (InternetSharing, DHCPv6) — a VM on a Shared network (UTM, Parallels, VMware) or Settings ▸ General ▸ Sharing ▸ Internet Sharing turns it on; "
+                    + "it may keep running after the VM quits. Turn Internet Sharing off in System Settings ▸ General ▸ Sharing (or log out) to release it"
+            }
+        default: break
+        }
+        return nil
+    }
+
+    /// `pgrep -x name` (root processes included).
+    static func isRunning(_ name: String) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        p.arguments = ["-x", name]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
     }
 }

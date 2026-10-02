@@ -46,7 +46,7 @@ public enum DeviceKind: String, CaseIterable, Identifiable, Sendable, Codable {
         case .imaster: "Every controller node joins; users and computers sync over LDAP."
         case .linux: "realmd + SSSD: join with realm join, sign in as a domain user."
         case .apple: "One profile trusts the CA; a Mac can also bind to the domain."
-        case .switchAP: "Certificates by SCEP or EST with a challenge. RADIUS comes in phase 4."
+        case .switchAP: "Certificates by SCEP or EST with a challenge; 802.1X through this DC's RADIUS."
         case .other: "The generic LDAP, Kerberos and CA values."
         }
     }
@@ -83,16 +83,19 @@ public struct ConnectValues: Equatable, Sendable {
     public var httpPort: Int
     public var estPort: Int
     public var httpsPort: Int
+    /// RADIUS authentication and accounting (1812 / 1813 unless moved).
+    public var radiusPort: Int
+    public var radiusAccountingPort: Int
     public var caName: String
     /// Upper-case colon hex, nil until the CA is known.
     public var caSHA256: String?
     public var caSHA1: String?
-    /// "Allow plain LDAP" (Settings ▸ Directory): simple binds on 389 work only when on.
+    /// "Allow plain LDAP" (Settings ▸ System): simple binds on 389 work only when on.
     public var allowPlainLDAP: Bool
 
     public init(address: String, dnsDomain: String, realm: String, netbios: String, dcFQDN: String, baseDN: String,
                 ldapPort: Int = 389, ldapsPort: Int = 636, kerberosPort: Int = 88, httpPort: Int = 80, estPort: Int = 8443,
-                httpsPort: Int = 443, caName: String = LabPKI.labCAName, caDER: [UInt8]? = nil, allowPlainLDAP: Bool = true) {
+                httpsPort: Int = 443, radiusPort: Int = 1812, radiusAccountingPort: Int = 1813, caName: String = LabPKI.labCAName, caDER: [UInt8]? = nil, allowPlainLDAP: Bool = true) {
         self.address = address
         self.dnsDomain = dnsDomain
         self.realm = realm
@@ -106,6 +109,8 @@ public struct ConnectValues: Equatable, Sendable {
         self.httpPort = httpPort
         self.estPort = estPort
         self.httpsPort = httpsPort
+        self.radiusPort = radiusPort
+        self.radiusAccountingPort = radiusAccountingPort
         self.caName = caName
         if let caDER {
             caSHA256 = Self.fingerprint(Array(SHA256.hash(data: caDER)))
@@ -127,6 +132,7 @@ public struct ConnectValues: Equatable, Sendable {
                              baseDN: baseDN ?? domain.split(separator: ".").map { "DC=\($0)" }.joined(separator: ","),
                              ldapPort: ports[.ldap] ?? 389, ldapsPort: ports[.ldaps] ?? 636, kerberosPort: ports[.kdc] ?? 88,
                              httpPort: ports[.http] ?? 80, estPort: ports[.est] ?? 8443, httpsPort: ports[.https] ?? 443,
+                             radiusPort: ports[.radius] ?? 1812, radiusAccountingPort: ports[.radacct] ?? 1813,
                              caName: caName ?? LabPKI.labCAName, caDER: caDER, allowPlainLDAP: allowPlainLDAP)
     }
 
@@ -190,7 +196,7 @@ public struct GuideField: Equatable, Sendable {
 public enum GuideAction: String, Equatable, Sendable {
     case saveCAPEM, saveCACER, saveMobileConfig
     case publishCA
-    case openSignCSR, openEnrollment, openTrustedRoots, openUsers, openDirectorySettings
+    case openSignCSR, openEnrollment, openTrustedRoots, openUsers, openDirectorySettings, openRadiusClients
 
     public var title: String {
         switch self {
@@ -198,11 +204,12 @@ public enum GuideAction: String, Equatable, Sendable {
         case .saveCACER: "Save CA (.cer)…"
         case .saveMobileConfig: "Save Profile (.mobileconfig)…"
         case .publishCA: "Publish CA"
-        case .openSignCSR: "Certificates ▸ Sign CSR"
+        case .openSignCSR: "Certificates ▸ Sign a request"
         case .openEnrollment: "Certificates ▸ Enrollment"
         case .openTrustedRoots: "Certificates ▸ Trusted roots"
-        case .openUsers: "Open Users"
-        case .openDirectorySettings: "Settings ▸ Directory"
+        case .openUsers: "Open Directory"
+        case .openDirectorySettings: "Settings ▸ System"
+        case .openRadiusClients: "RADIUS ▸ Clients"
         }
     }
 }
@@ -225,7 +232,7 @@ public struct GuideStep: Identifiable, Equatable, Sendable {
     /// Where on the device (`Administration ▸ Server Manager ▸ …`).
     public var location: String?
     public var items: [GuideItem]
-    /// A step that only arrives later (RADIUS in phase 4): shown dimmed.
+    /// A step that only arrives later: shown dimmed.
     public var isLater = false
 
     public var id: Int { number }
@@ -296,7 +303,7 @@ public enum DeviceGuide {
     private static func wifiStep(_ v: ConnectValues) -> GuideStep {
         step("Wi-Fi with 802.1X", nil, [
             .text("Keep \"Verify the server's identity by validating the certificate\" on."),
-            .text("The RADIUS server's certificate must be issued by this CA (Certificates ▸ Sign CSR), or its own CA added under Certificates ▸ Trusted roots so joined PCs trust it."),
+            .text("The RADIUS server's certificate must be issued by this CA, or its own CA must be a trusted root so joined PCs trust it."),
             .actions([.openSignCSR, .openTrustedRoots]),
         ])
     }
@@ -318,8 +325,8 @@ public enum DeviceGuide {
                 .note("\"Welcome to the \(v.dnsDomain) domain\" means it worked."),
             ]),
             step("Restart and sign in", nil, [
-                .text("Restart when asked. On the sign-in screen choose Other user and sign in as \(v.netbios)\\<user> with a person from Users."),
-                .field(GuideField("Sign in as", "\(v.netbios)\\alice", note: "example; any user from Users")),
+                .text("Restart when asked. On the sign-in screen choose Other user and sign in as \(v.netbios)\\<user> with a person from Directory."),
+                .field(GuideField("Sign in as", "\(v.netbios)\\alice", note: "example; any person")),
                 .actions([.openUsers]),
             ]),
             step("Apply the domain policy", "Command Prompt (Run as administrator)", [
@@ -328,7 +335,7 @@ public enum DeviceGuide {
             ]),
             step("Check", "Command Prompt (Run as administrator)", [
                 .command("nltest /sc_verify:\(v.dnsDomain)", expect: "Trusted DC Connection Status Status = 0 0x0 NERR_Success"),
-                .command("certutil -store -grouppolicy Root", expect: "lists the lab CA once it is published (Publish CA)"),
+                .command("certutil -store -grouppolicy Root", expect: "lists the lab CA once it is published"),
                 .command("certutil -pulse", expect: "asks for the computer certificate now when auto-enrollment is on; certlm.msc ▸ Personal shows it"),
                 .field(GuideField("Enrollment policy server", v.cepURL, note: "the Default Domain Policy hands this to the PC when auto-enrollment is on")),
                 .actions([.publishCA, .openEnrollment]),
@@ -352,7 +359,7 @@ public enum DeviceGuide {
             .field(GuideField("Filter", ConnectValues.clearPassFilter, note: "Attributes tab ▸ Authentication filter")),
         ]
         if !v.allowPlainLDAP {
-            ldap.append(.warning("Allow plain LDAP is off in Settings ▸ Directory, so a Bind DN on port \(v.ldapPort) is refused. Use LDAP over SSL (port \(v.ldapsPort)) or turn it on."))
+            ldap.append(.warning("Allow plain LDAP is off, so a Bind DN on port \(v.ldapPort) is refused. Use LDAP over SSL (port \(v.ldapsPort)) or turn it on."))
             ldap.append(.actions([.openDirectorySettings]))
         }
         return [
@@ -372,10 +379,10 @@ public enum DeviceGuide {
             step("LDAP source", "Configuration ▸ Authentication ▸ Sources ▸ Add ▸ Type: Active Directory", ldap),
             step("RADIUS server certificate", "Administration ▸ Certificates ▸ Certificate Store ▸ Server Certificate ▸ Create Certificate Signing Request (usage RADIUS/EAP Server)", [
                 .text("1. Create the CSR in ClearPass and download it."),
-                .text("2. Sign it here on Certificates ▸ Sign CSR (template WebServer)."),
+                .text("2. Sign it here with the template WebServer."),
                 .text("3. Back in ClearPass: Import Certificate with the same usage."),
                 .actions([.openSignCSR]),
-                .text("Or keep ClearPass's own certificate and add its CA to the PCs under Certificates ▸ Trusted roots."),
+                .text("Or keep ClearPass's own certificate and add its CA to the PCs as a trusted root."),
                 .text("Trust List: Administration ▸ Certificates ▸ Trust List ▸ Add this CA with usage EAP and AD/LDAP Servers."),
                 .actions([.saveCAPEM, .openTrustedRoots]),
             ]),
@@ -404,7 +411,7 @@ public enum DeviceGuide {
             .text("Sync mode: by OU (root OU = Base DN or a folder), by group with folders, or by nested groups — all three work."),
         ]
         if !v.allowPlainLDAP {
-            sync.append(.warning("Allow plain LDAP is off in Settings ▸ Directory, so the Administrator DN on port \(v.ldapPort) with TLS off is refused. Turn TLS on (port \(v.ldapsPort)) or turn plain LDAP on."))
+            sync.append(.warning("Allow plain LDAP is off, so the Administrator DN on port \(v.ldapPort) with TLS off is refused. Turn TLS on (port \(v.ldapsPort)) or turn plain LDAP on."))
             sync.append(.actions([.openDirectorySettings, .saveCAPEM]))
         } else {
             sync.append(.actions([.saveCAPEM]))
@@ -436,7 +443,7 @@ public enum DeviceGuide {
                 .warning("Don't change this account's password afterwards: MS-CHAPv2 pass-through stops until you Add to Domain again."),
                 .field(GuideField("Detection account (optional)", v.adminAccount, note: "a user whose sign-in iMaster tries through the join")),
             ]),
-            step("User synchronisation (LDAP)", "AD/LDAP server settings", sync),
+            step("User synchronization (LDAP)", "AD/LDAP server settings", sync),
             step("Machine authentication (extended user)", "Extended user settings", [
                 .field(GuideField("Object", "computer")),
                 .field(GuideField("Extended username", "cn")),
@@ -445,9 +452,9 @@ public enum DeviceGuide {
                 .note("Windows PCs that joined appear under ROOT\\computers after the next sync."),
             ]),
             step("RADIUS / EAP server certificate", "System ▸ Certificate Management (802.1X / Portal server certificate)", [
-                .text("PEAP clients must trust the certificate iMaster presents. Create a CSR on iMaster, sign it here on Certificates ▸ Sign CSR (template WebServer), then import it with this CA as the chain."),
+                .text("PEAP clients must trust the certificate iMaster presents. Create a CSR on iMaster, sign it here with the template WebServer, then import it with this CA as the chain."),
                 .text("The Certificate Converter's iMaster preset writes srv.crt, srv.key and srv-chain.crt in the form iMaster imports."),
-                .note("MS-CHAPv2 pass-through needs Settings ▸ Directory ▸ NAC password checks to allow MS-CHAPv2 (the default); \"Only NTLMv2\" stops PEAP sign-ins."),
+                .note("MS-CHAPv2 pass-through needs Settings ▸ System ▸ NAC password checks to allow MS-CHAPv2 (the default); \"Only NTLMv2\" stops PEAP sign-ins."),
                 .actions([.openSignCSR, .saveCAPEM]),
             ]),
             step("Check", nil, [
@@ -537,7 +544,7 @@ public enum DeviceGuide {
                 .actions([.saveCAPEM, .saveCACER]),
             ]),
             step("A challenge for the device", nil, [
-                .text("Create one on Certificates ▸ Enrollment: one-time and bound to the switch's name, or reusable for ClearPass Onboard. It is shown only once."),
+                .text("One-time and bound to the switch's name, or reusable for ClearPass Onboard. It is shown only once."),
                 .actions([.openEnrollment]),
             ]),
             step("Enrollment URLs", nil, [
@@ -593,8 +600,14 @@ public enum DeviceGuide {
                     """),
                 .text("Replace sw1 with the device's name and <challenge> with the challenge."),
             ]),
-            step("RADIUS — phase 4", nil, later: true, [
-                .text("LabDC's own RADIUS server arrives in phase 4. Until then point 802.1X on the switch or AP at ClearPass or iMaster."),
+            // LabDC has its own RADIUS server (phase 4 shipped); the old "later" step is gone (owner, 2 Oct 2026).
+            step("Point 802.1X at this DC", "the device's AAA / RADIUS server settings", [
+                .text("Add the switch or AP as a RADIUS client with its address and a shared secret, then point the device's RADIUS server at this DC."),
+                .field(GuideField("RADIUS server", v.address)),
+                .field(GuideField("Authentication port", String(v.radiusPort))),
+                .field(GuideField("Accounting port", String(v.radiusAccountingPort))),
+                .field(GuideField("Shared secret", nil, hint: "the secret you gave the client")),
+                .actions([.openRadiusClients]),
             ]),
         ]
     }

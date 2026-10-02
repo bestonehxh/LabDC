@@ -55,7 +55,13 @@ public final class RPCServerConnection: @unchecked Sendable {
         while true {
             if accumulator.count >= 16 {
                 let fragLen = Int(UInt16(accumulator[8]) | (UInt16(accumulator[9]) << 8))
-                if fragLen >= 16, accumulator.count >= fragLen {
+                // A frag_length below the 16-byte common header can never be consumed: the stream
+                // would buffer every later byte forever (memory DoS). Drop the connection instead.
+                guard fragLen >= 16 else {
+                    accumulator.removeAll()
+                    throw RPCError.malformedPDU("frag_length \(fragLen) is shorter than the PDU header")
+                }
+                if accumulator.count >= fragLen {
                     let pdu = Array(accumulator[0..<fragLen])
                     accumulator.removeFirst(fragLen)
                     return pdu
@@ -265,7 +271,9 @@ public final class RPCServerConnection: @unchecked Sendable {
         }
         let ctx = RPCCallContext(identity: effIdentity, sessionKey: effSessionKey,
                                  clientAddress: transport.remoteAddress, handles: handles, contextID: contextID,
-                                 authLevel: provider.authLevel)
+                                 authLevel: provider.authLevel,
+                                 authType: provider.isEstablished ? provider.authType : .none,
+                                 authPrincipal: provider.isEstablished ? provider.boundPrincipal : nil)
         let reader = NDRReader(stub)
         let responseStub: [UInt8]
         do {
@@ -295,6 +303,13 @@ public final class RPCServerConnection: @unchecked Sendable {
     /// (Netlogon schannel) by the provider's capabilities.
     private func openIncoming(parsed p: PDUCodec.Parsed, raw: [UInt8], currentStub: [UInt8],
                               provider: any RPCAuthProvider) throws -> [UInt8] {
+        // Netlogon schannel proves key possession only through per-PDU signatures, so a schannel
+        // context below packet integrity never runs a request (CVE-2022-38023 class; the provider
+        // already refuses such a bind — this is the belt to that).
+        if provider.authType == .schannel, provider.isEstablished,
+           provider.authLevel != .pktIntegrity, provider.authLevel != .pktPrivacy {
+            throw RPCError.auth("schannel below packet integrity")
+        }
         if provider.authLevel == .pktIntegrity || provider.authLevel == .pktPrivacy,
            let whole = provider as? RPCWholePDUAuthenticator, p.verifier != nil {
             let stubOffset = 16 + 8 + (p.header.flags.contains(.objectUUID) ? 16 : 0)

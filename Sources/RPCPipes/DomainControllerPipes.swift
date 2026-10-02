@@ -1,4 +1,5 @@
 import Foundation
+import BackupKeyService
 import DRSService
 import LSAService
 import NetlogonService
@@ -48,6 +49,8 @@ public struct DomainControllerServices: Sendable {
     public let dssetup: DSSetupService
     public let netlogon: NetlogonService
     public let drs: DRSService
+    /// MS-BKRP (DPAPI master-key backup), on `\pipe\protected_storage` and the TCP endpoint.
+    public let backupKey: BackupKeyService
     public let netlogonState: NetlogonStateStore
     /// The Store the services read (WP-AJ: the TCP schannel provider resolves the computer
     /// account's identity from it).
@@ -59,14 +62,22 @@ public struct DomainControllerServices: Sendable {
                 shareProvider: (any ShareProvider)? = nil,
                 allowAnonymousLSA: Bool = false,
                 netlogonConfig: NetlogonServiceConfig = NetlogonServiceConfig(),
-                drsOnEvent: (@Sendable (String) -> Void)? = nil) {
-        self.samr = SAMRService(directory: store)
+                drsOnEvent: (@Sendable (String) -> Void)? = nil,
+                backupKeyOnEvent: (@Sendable (String) -> Void)? = nil) {
+        let netlogon = NetlogonService(store: store, state: netlogonState, dcInfo: dcInfo, config: netlogonConfig)
+        self.netlogon = netlogon
+        // SAMR's password change shares Netlogon's bad-password tracker and thresholds, so guesses
+        // over either path count towards one lockout per account.
+        self.samr = SAMRService(directory: store, badPasswords: netlogon.badPasswords,
+                                lockoutThreshold: netlogonConfig.lockoutThreshold,
+                                lockoutWindow: netlogonConfig.lockoutWindow,
+                                lockoutDuration: netlogonConfig.lockoutDuration)
         self.lsa = LSARPCService(store: store, allowAnonymous: allowAnonymousLSA)
         self.srvsvc = SrvsvcService(store: store, shares: shareProvider)
         self.wkssvc = WkssvcService(store: store)
         self.dssetup = DSSetupService(store: store)
-        self.netlogon = NetlogonService(store: store, state: netlogonState, dcInfo: dcInfo, config: netlogonConfig)
         self.drs = DRSService(store: store, onEvent: drsOnEvent)
+        self.backupKey = BackupKeyService(store: store, onEvent: backupKeyOnEvent)
         self.netlogonState = netlogonState
         self.store = store
     }
@@ -79,10 +90,17 @@ public struct DomainControllerServices: Sendable {
         NetlogonSchannelProvider(store: netlogonState, identityDirectory: store)
     }
 
-    /// The five DC named pipes: `\samr`, `\lsarpc`, `\srvsvc`, `\wkssvc`, `\netlogon`.
-    public func pipeServices() -> [any NamedPipeService] {
+    /// The DC named pipes: `\samr`, `\lsarpc`, `\srvsvc`, `\wkssvc`, `\netlogon` and
+    /// `\protected_storage`.
+    ///
+    /// `rpcAuth` backs the RPC-level authentication on `\protected_storage`: MS-BKRP §3.1.4.1
+    /// requires packet privacy, which on a pipe means an NTLMSSP / SPNEGO / Kerberos bind verifier
+    /// (DPAPI binds with SPNEGO at PKT_PRIVACY) — the SMB session's own signing does not count.
+    /// Without it the pipe still opens, but every BackupKey call is refused.
+    public func pipeServices(rpcAuth: RPCServerAuthConfig? = nil) -> [any NamedPipeService] {
         let samr = self.samr, lsa = self.lsa, srvsvc = self.srvsvc, wkssvc = self.wkssvc
         let dssetup = self.dssetup, netlogon = self.netlogon, netlogonState = self.netlogonState
+        let backupKey = self.backupKey
         return [
             // WP-Z: a Samba/winbind member *requires* schannel (auth type 68) on \samr and \lsarpc
             // (winbindd_cm.c `cm_connect_sam`/`cm_connect_lsa`: require_schannel for its own domain).
@@ -100,14 +118,21 @@ public struct DomainControllerServices: Sendable {
             RPCPipeService(pipeName: "netlogon") { _ in
                 RPCPipeSetup(interfaces: [netlogon], authProvider: NetlogonSchannelProvider(store: netlogonState))
             },
+            // MS-BKRP §2.1: `\pipe\protected_storage` is the BackupKey pipe (the only one Samba's
+            // backupkey.idl lists; Windows' other lsass pipe aliases are not offered for it).
+            RPCPipeService(pipeName: "protected_storage") { _ in
+                RPCPipeSetup(interfaces: [backupKey],
+                             authProvider: rpcAuth.map { RPCServerAuthNegotiator(config: $0) } ?? NoAuthProvider())
+            },
         ]
     }
 
-    /// The interfaces published on the shared dynamic `ncacn_ip_tcp` port: LSARPC (+ dssetup), SAMR
-    /// and NETLOGON — the interfaces Windows reaches over TCP after a join and at logon. Identity
+    /// The interfaces published on the shared dynamic `ncacn_ip_tcp` port: LSARPC (+ dssetup), SAMR,
+    /// NETLOGON, DRSUAPI and BackupKey — the interfaces Windows reaches over TCP after a join and at
+    /// logon. Identity
     /// comes from the RPC auth provider on that connection (no SMB session): NTLM/SPNEGO/Kerberos,
     /// or Netlogon schannel via `makeTCPSchannelProvider()` (WP-AJ).
-    public var tcpInterfaces: [any RPCInterface] { [lsa, dssetup, samr, netlogon, drs] }
+    public var tcpInterfaces: [any RPCInterface] { [lsa, dssetup, samr, netlogon, drs, backupKey] }
 
     /// Endpoint-mapper registrations for the TCP interfaces: each advertised on
     /// `ncacn_ip_tcp:<advertise>[tcpPort]` and its named pipe (`ncacn_np:\\host[\pipe\…]`).
@@ -125,13 +150,15 @@ public struct DomainControllerServices: Sendable {
             // DRSUAPI is TCP-only on Windows: advertise just the ncacn_ip_tcp endpoint.
             EPMRegistration(interface: drs.abstractSyntax, annotation: "LabDC Directory Replication",
                             endpoints: [.tcp(ipv4: advertiseIPv4, port: tcpPort)]),
+            reg(backupKey, pipe: "\\pipe\\protected_storage", "LabDC BackupKey"),
         ]
     }
 }
 
-/// Builds the five DC named pipes over one Store: `\samr`, `\lsarpc`, `\srvsvc`, `\wkssvc`, and
-/// `\netlogon` (the last with a `NetlogonSchannelProvider` available for the type-68 schannel bind
-/// Windows makes after `NetrServerAuthenticate3`). A thin wrapper over `DomainControllerServices` for
+/// Builds the DC named pipes over one Store: `\samr`, `\lsarpc`, `\srvsvc`, `\wkssvc`, `\netlogon`
+/// (with a `NetlogonSchannelProvider` available for the type-68 schannel bind Windows makes after
+/// `NetrServerAuthenticate3`) and `\protected_storage` (without RPC auth here, so BackupKey calls
+/// on it are refused — `pipeServices(rpcAuth:)` enables them). A thin wrapper over `DomainControllerServices` for
 /// existing callers; new code that also wants the TCP endpoint should build `DomainControllerServices`
 /// once and use both `pipeServices()` and `tcpInterfaces`.
 public enum DomainControllerPipes {

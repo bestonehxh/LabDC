@@ -19,19 +19,18 @@ struct ConnectView: View {
         let values = connect.values(model.controller)
         QuietPage(title: connect.device.connectTitle, subtitle: connect.device.subtitle) {
             CopyAllButton(text: connect.copyAllText(values))
-            Menu {
+            // "Save…", a quiet link like the others: the steps carry their own Save links, this is
+            // the one place for every format (owner, 2 Oct 2026).
+            Menu("Save…") {
                 Button("Save CA (.pem)…") { perform(.saveCAPEM, values) }
                 Button("Save CA (.cer)…") { perform(.saveCACER, values) }
                 Button("Save Profile (.mobileconfig)…") { perform(.saveMobileConfig, values) }
-            } label: {
-                Text("Save CA")
-                    .font(.system(size: 13))
-                    .foregroundStyle(Theme.ink)
             }
-            .menuStyle(.borderlessButton)
+            .menuStyle(.button)
+            .buttonStyle(.quietLink)
             .menuIndicator(.hidden)
             .fixedSize()
-            .accessibilityLabel("Save CA")
+            .accessibilityLabel("Save")
             .accessibilityHint("Saves the CA certificate or the Apple configuration profile")
         } content: {
             VStack(alignment: .leading, spacing: 0) {
@@ -82,11 +81,15 @@ struct ConnectView: View {
                 }
             }
         case .openSignCSR, .openEnrollment, .openTrustedRoots:
+            model.certificates.section = action == .openSignCSR ? .sign : action == .openEnrollment ? .enrollment : .trustedRoots
             model.selection = .certificates
         case .openUsers:
             model.selection = .users
         case .openDirectorySettings:
+            model.requestedSettingsTab = .directory
             openSettings()
+        case .openRadiusClients:
+            model.selection = .radius
         }
     }
 }
@@ -381,15 +384,20 @@ struct ChecklistCard: View {
                         .font(.system(size: 17))
                         .foregroundStyle(Theme.ink)
                 }
-                .menuStyle(.borderlessButton)
+                // Plain, so the name lines up with the label above (no menu inset).
+                .menuStyle(.button)
+                .buttonStyle(.plain)
                 .menuIndicator(.hidden)
                 .fixedSize()
                 .accessibilityLabel("This device")
                 .accessibilityValue(currentName)
                 .accessibilityHint("Which joined computer is this device")
-                Text(connect.pinnedAccount == nil ? "Chosen automatically" : "Chosen by you")
-                    .font(Theme.caption)
-                    .foregroundStyle(Theme.faint)
+                // "Automatic" says it already; no "Chosen automatically" under it.
+                if currentName != "Automatic" {
+                    Text(connect.pinnedAccount == nil ? "Chosen automatically" : "Chosen by you")
+                        .font(Theme.caption)
+                        .foregroundStyle(Theme.faint)
+                }
             }
         } else if connect.device.joins {
             Text("Not joined yet")

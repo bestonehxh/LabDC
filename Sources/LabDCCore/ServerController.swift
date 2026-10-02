@@ -152,17 +152,19 @@ public final class ServerController {
         }
         runtime = rt
         if let why = await rt.radiusStartFailure { failures[.radius] = why }
+        await syncDHCPFailures(rt)
         store = await rt.store
         pki = await rt.pki
         if let info = try? await store?.domainInfo() { status.apply(info) }
         serveLog.banner(await rt.banner())
         let addresses = ServeAddresses.current()
         if options.advertise == nil, addresses.count > 1 {
-            serveLog.warning("serve", ServeRuntime.multipleAddressWarning(addresses))
+            serveLog.warning("serve", ServeRuntime.multipleAddressWarning(addresses, app: true))
         }
         serveLog.event("serve", "ready (LabDC app)")
         status.startedAt = Date()
         status.addresses = addresses.sorted()
+        status.addressesReported = true
         status.advertisePinned = options.advertise != nil
         status.advertisedIPv4 = await rt.advertisedIPv4
         status.interfaces = NetworkInterfaces.current()
@@ -341,6 +343,7 @@ public final class ServerController {
 
     private func settleStopped() {
         status.startedAt = nil
+        status.dhcpStopped = false
         status.phase = restartWindow ? .restarting : data.hasStore ? .stopped : .notSetUp
         if let lastOptions { status.applyListeners(options: lastOptions, bound: nil, failures: [:]) }
     }
@@ -453,8 +456,8 @@ public final class ServerController {
         serveLog.event("serve", "restart all services (app)")
         let all = Set(ServeService.allCases)
         status.restarting = all
+        defer { status.restarting = [] }
         await restart()
-        status.restarting = []
         let outcome = RestartOutcome(date: Date(), error: status.phase == .running ? nil : status.lastError ?? "not running")
         for s in all { status.lastRestart[s] = outcome }
     }
@@ -469,8 +472,12 @@ public final class ServerController {
             return status.lastRestart[service] ?? RestartOutcome(date: Date())
         }
         status.restarting.insert(service)
-        defer { status.restarting.remove(service) }
-        let outcome: RestartOutcome
+        // Whatever happens (a throw, a busy port), the row leaves "Restarting…" with an outcome.
+        var outcome = RestartOutcome(date: Date(), error: "the restart did not finish")
+        defer {
+            status.restarting.remove(service)
+            status.lastRestart[service] = outcome
+        }
         if let rt = runtime {
             do {
                 try await rt.restartInPlace(service.listeners, name: service.title)
@@ -487,20 +494,63 @@ public final class ServerController {
                 failures[failed] = message
                 outcome = RestartOutcome(date: Date(), error: message)
             }
+            if service == .dhcp {
+                // v4 and v6 are separate listeners: one may run while the other's port is busy.
+                await syncDHCPFailures(rt)
+                if outcome.succeeded, let why = failures[.dhcpv6] ?? failures[.dhcp] {
+                    outcome = RestartOutcome(date: Date(), error: why)
+                }
+            }
             await refreshListeners()
         } else {
             serveLog.event("serve", "restart \(service.title): the server is not running; starting every service")
             await start()
             outcome = RestartOutcome(date: Date(), error: status.phase == .running ? nil : status.lastError ?? "not running")
         }
-        status.lastRestart[service] = outcome
         return outcome
+    }
+
+    /// Phase 5: a DHCP scope, reservation or setting changed — the runtime reloads (the first
+    /// scope starts DHCP), the Services row and its summary follow.
+    func dhcpChanged() async {
+        guard let rt = runtime else { return }
+        await rt.dhcpConfigChanged()
+        await syncDHCPFailures(rt)
+        await refreshListeners()
+    }
+
+    /// DHCPv4 and DHCPv6 are independent listeners, each with its own problem.
+    private func syncDHCPFailures(_ rt: ServeRuntime) async {
+        failures[.dhcp] = await rt.dhcpStartFailure
+        failures[.dhcpv6] = await rt.dhcpv6StartFailure
+    }
+
+    /// The runtime's background retry bound a DHCP port that was busy.
+    private func dhcpChangedByRuntime() async {
+        guard let rt = runtime, !status.isBusy, !status.restarting.contains(.dhcp) else { return }
+        await syncDHCPFailures(rt)
+        await refreshListeners()
+    }
+
+    /// Services ▸ Stop (owner, 1 Oct 2026): stops one service; the others keep running. Restart
+    /// (shown as Start on a stopped row) brings it back; quitting and reopening starts everything.
+    public func stopService(_ service: ServeService) async {
+        guard let rt = runtime, !status.isBusy, !status.restarting.contains(service) else { return }
+        await rt.stopInPlace(service.listeners, name: service.title)
+        for l in service.listeners { failures[l] = nil }
+        if let e = status.lastError, service.listeners.contains(where: { ServeListener.named(inError: e) == $0 }) {
+            status.lastError = nil
+        }
+        status.lastRestart[service] = nil
+        await refreshListeners()
     }
 
     private func refreshListeners() async {
         guard let rt = runtime else { return }
         let options = await rt.options
         let bound = await rt.bound
+        status.dhcpSummary = await rt.dhcp?.status().summary
+        status.dhcpStopped = await rt.dhcpStoppedByOwner
         lastOptions = options
         status.applyListeners(options: options, bound: bound, failures: failures)
         let failed = !failures.isEmpty
@@ -562,6 +612,26 @@ public final class ServerController {
             await rt.setDNSForwarding(forwarding)
             await refreshListeners()
         }
+    }
+
+    /// Settings: networks (CIDRs, comma or space separated) besides this Mac's own and the DHCP
+    /// scopes that may resolve names outside the domain through this DNS. Saved, applied live.
+    public func setDNSAllowedClients(_ text: String) async throws {
+        let networks = try DNSNetwork.parseList(text)
+        let list = networks.map(\.description)
+        guard list != settings.dnsAllowedClients else { return }
+        settings.dnsAllowedClients = list
+        try saveSettings()
+        await runtime?.setDNSAllowedClients(networks)
+    }
+
+    /// Settings ▸ DNS "Dynamic updates": secure and nonsecure / secure only / off. Saved, applied
+    /// live (DNS keeps running).
+    public func setDNSDynamicUpdates(_ mode: DNSDynamicUpdateMode) async throws {
+        guard mode != settings.dnsDynamicUpdates else { return }
+        settings.dnsDynamicUpdates = mode
+        try saveSettings()
+        await runtime?.setDNSUpdateMode(mode)
     }
 
     /// Where DNS sends names outside the domain right now (Services); nil while DNS is not running.
@@ -633,6 +703,19 @@ public final class ServerController {
     }
 
     /// What happens when no rule matches (Reject by default).
+    /// RADIUS ▸ 802.1X ▸ "Require PEAP crypto binding" (default off).
+    public func radiusRequirePEAPCryptoBinding() async -> Bool {
+        guard let store else { return false }
+        return (try? await store.radiusRequirePEAPCryptoBinding()) ?? false
+    }
+
+    public func setRadiusRequirePEAPCryptoBinding(_ on: Bool) async throws {
+        guard let store else { throw CLIError.failure("the server is not running") }
+        try await store.setRadiusRequirePEAPCryptoBinding(on)
+        await runtime?.radiusConfigChanged()
+        serveLog.event("RADIUS", "require PEAP crypto binding: \(on ? "on" : "off") (app)")
+    }
+
     public func radiusDefaultAction() async -> RADIUSDefaultAction {
         guard let store else { return .reject }
         return (try? await store.radiusDefaultAction()) ?? .reject
@@ -645,61 +728,167 @@ public final class ServerController {
         serveLog.event("RADIUS", "default action when no rule matches: \(action.title) (app)")
     }
 
-    /// RADIUS ▸ 802.1X: publishes the wireless and/or wired policy into the Default Domain Policy
-    /// ([MS-GPWL]); joined Windows machines apply it at `gpupdate /force`. The server-name check
-    /// defaults to this DC's FQDN (what the RADIUS server certificate is issued for).
-    ///
-    /// EAP-TLS profiles offer only client certificates of the matching CA (the lab CA's P-256
-    /// ones; for WPA3-Enterprise 192-bit the P-384 802.1X CA's). Publishing a 192-bit profile also
-    /// puts that root into the policy's trusted roots and switches on auto-enrollment of the
-    /// Computer192 / User192 templates. Wired 802.1X has no 192-bit mode: it keeps the lab CA.
-    public func set80211Profile(_ policy: Dot1XPolicy, wireless: Bool = true, wired: Bool = true) async throws {
-        guard let store, let editor = gpoEditor() else { throw CLIError.failure("the server is not running") }
-        var policy = policy
-        if policy.serverNames.isEmpty, let dc = try? await store.domainInfo().dcDNSName { policy.serverNames = [dc] }
-        var wiredPolicy = policy
-        wiredPolicy.security = .wpa2
-        if policy.method == .tls { wiredPolicy.clientIssuerThumbprint = policy.caThumbprint }
-        if policy.method == .tls { policy.clientIssuerThumbprint = policy.caThumbprint }
-        if wireless, policy.security == .wpa3Suite192 {
-            guard let pki else { throw CLIError.failure("the server is not running") }
-            // The P-384 802.1X CA is created on first use (and published to NTAuth); the RADIUS
-            // server picks up its P-384 certificate on the next exchange.
-            let service = try await CAService.open(pki: pki, store: store)
-            if try await service.ensureSuiteBAuthority() {
-                serveLog.event("PKI", "802.1X 192-bit CA (P-384) created for the 192-bit profile (app)")
-            }
-            let ca = try await pki.authority(named: LabPKI.suiteBCAName)
-            let der = try ca.der()
-            let thumbprint = CertificateBlob.thumbprint(der)
-            policy.caThumbprint = thumbprint
-            policy.clientIssuerThumbprint = thumbprint
-            let cn = Self.commonName(ca.certificate.subject)
-            _ = try await editor.addTrustedRoot(CACertificateInfo(der: der, commonName: cn, subject: ca.certificate.subject.description),
-                                                friendlyName: cn)
-            for name in ["Computer192", "User192"] {
-                guard var t = try? await service.template(named: name), !t.autoEnroll || !t.enabled else { continue }
-                t.autoEnroll = true; t.enabled = true
-                try await service.saveTemplate(t)
-                serveLog.event("PKI", "template \(name) auto-enrollment on (802.1X 192-bit profile) (app)")
-            }
-        }
-        if wireless { try await editor.set80211Policy(policy) }
-        if wired { try await editor.set8023Policy(wiredPolicy) }
-        let kinds = [wireless ? "wireless \(policy.ssid)" : nil, wired ? "wired" : nil].compactMap { $0 }.joined(separator: " + ")
-        serveLog.event("GPO", "802.1X profile published: \(kinds), \(policy.method.title), \(policy.security.title), "
-                       + "server \(policy.serverNames.joined(separator: ", ")) (app)")
+    // MARK: RADIUS sessions, CoA, registered devices (phase 4c / 5)
+
+    /// RADIUS ▸ Sessions: newest first; `activeOnly` = no Stop yet.
+    public func radiusSessions(activeOnly: Bool) async -> [DirectoryStore.RadiusSession] {
+        guard let store else { return [] }
+        return (try? await store.radiusSessions(activeOnly: activeOnly)) ?? []
     }
 
-    public func remove80211Profiles() async throws {
+    /// Reauthenticate / Disconnect a session through its NAS (RFC 5176); the Activity line is
+    /// written by the RADIUS server.
+    public func radiusCoA(_ action: CoAAction, session: DirectoryStore.RadiusSession) async -> CoAResult {
+        guard let runtime else {
+            return CoAResult(request: action.title, outcome: nil, problem: "the server is not running", attempts: 0)
+        }
+        return await runtime.radiusCoA(action, session: session)
+    }
+
+    public func registeredDevices() async -> [DirectoryStore.RegisteredDevice] {
+        guard let store else { return [] }
+        return (try? await store.registeredDevices()) ?? []
+    }
+
+    public func saveRegisteredDevice(_ device: DirectoryStore.RegisteredDevice) async throws {
+        guard let store else { throw CLIError.failure("the server is not running") }
+        try await store.saveRegisteredDevice(device)
+        serveLog.event("RADIUS", "registered device \(device.mac)\(device.group.map { " (\($0))" } ?? "") saved (app)")
+    }
+
+    public func deleteRegisteredDevice(mac: String) async throws {
+        guard let store else { throw CLIError.failure("the server is not running") }
+        try await store.deleteRegisteredDevice(mac: mac)
+        serveLog.event("RADIUS", "registered device \(mac) removed (app)")
+    }
+
+    /// Group Policy page: the draft, what is published, the GPO version, the trust and the other
+    /// things the Default Domain Policy carries (trusted roots, password policy). nil when the
+    /// server is not running.
+    public func groupPolicySnapshot() async -> GroupPolicySnapshot? {
+        guard let store, let editor = gpoEditor() else { return nil }
+        do {
+            let published = try await editor.publishedDot1XProfiles().set
+            let draft = GroupPolicyDot1X.savedDraft(data) ?? published
+            let state = try? await editor.state(.defaultDomainPolicy)
+            var trust: GroupPolicyDot1X.Trust?
+            if let pki { trust = try? await GroupPolicyDot1X.trust(store: store, pki: pki) }
+            let roots = ((try? await editor.trustedRoots()) ?? []).map { root -> String in
+                let cert = try? Certificate(derEncoded: root.der)
+                return root.friendlyName ?? cert.flatMap { Self.commonName($0.subject) } ?? root.thumbprint
+            }
+            var certificates = ((try? await editor.trustedRoots()) ?? []).compactMap {
+                try? Dot1XTrustCertificate(der: $0.der, friendlyName: $0.friendlyName)
+            }
+            // The LabDC CA is trusted by every member through AD (Certification Authorities), and
+            // Publish adds it when another server's certificate was issued by it: list it so such
+            // a profile still opens and saves, and it can be chosen directly.
+            if let pki, let ca = try? await pki.currentAuthority(), let der = try? ca.der(),
+               let c = try? Dot1XTrustCertificate(der: der),
+               !certificates.contains(where: { $0.thumbprint == c.thumbprint }) {
+                certificates.append(c)
+            }
+            return GroupPolicySnapshot(draft: draft, published: published,
+                                       version: state.map { Int(GPOVersion.newest($0.containerVersion, $0.fileVersion).machine) } ?? 0,
+                                       trust: trust, trustedRoots: roots, passwordPolicy: try? await store.passwordPolicy(),
+                                       certificates: certificates)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Group Policy page: keeps the edited profiles (`<data>/group-policy-8021x.json`); nothing
+    /// reaches Windows until `publishDot1X`.
+    public func saveDot1XDraft(_ set: Dot1XProfileSet) throws {
+        try set.validate()
+        try GroupPolicyDot1X.saveDraft(set, data)
+    }
+
+    /// Group Policy ▸ Discard (owner, 2 Oct 2026): forgets the unpublished edits — the draft
+    /// file goes, so the page shows what is published again (pending certificates included).
+    public func discardDot1XDraft() throws {
+        let url = GroupPolicyDot1X.draftURL(data)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do { try FileManager.default.removeItem(at: url) } catch {
+            throw CLIError.failure("cannot remove \(url.path): \(error.localizedDescription)")
+        }
+        serveLog.event("GPO", "802.1X unpublished changes discarded (app)")
+    }
+
+    /// Group Policy ▸ Publish changes: the draft into the Default Domain Policy (one version bump).
+    @discardableResult
+    public func publishDot1X() async throws -> GroupPolicyDot1X.PublishReport {
+        guard let store, let pki, let editor = gpoEditor() else { throw CLIError.failure("the server is not running") }
+        let set = try await GroupPolicyDot1X.draft(data, editor: editor)
+        let report = try await GroupPolicyDot1X.publish(set, store: store, pki: pki, editor: editor)
+        var saved = report.set
+        saved.pendingRoots = []  // trusted roots now
+        if saved != set { try GroupPolicyDot1X.saveDraft(saved, data) }
+        for e in report.events { serveLog.event("PKI", "\(e) (app)") }
+        serveLog.event("GPO", "802.1X profiles published: \(report.summary) (app)")
+        return report
+    }
+
+    /// Group Policy ▸ Remove all from Group Policy: the wireless and wired policy objects leave
+    /// the Default Domain Policy (the version is bumped so PCs drop them). The list stays as a
+    /// draft that can be published again.
+    public func removeDot1XFromGroupPolicy() async throws {
         guard let editor = gpoEditor() else { throw CLIError.failure("the server is not running") }
+        let published = try await editor.publishedDot1XProfiles().set
+        if GroupPolicyDot1X.savedDraft(data) == nil { try GroupPolicyDot1X.saveDraft(published, data) }
         try await editor.remove80211Policies()
-        serveLog.event("GPO", "802.1X profiles removed (app)")
+        serveLog.event("GPO", "802.1X profiles removed from the Default Domain Policy (app)")
+    }
+
+    /// RADIUS ▸ "Allow RSA-only devices" (default off).
+    public func rsaOnlyDevicesAllowed() async -> Bool {
+        guard let pki, let store else { return false }
+        return await CAService(pki: pki, store: store).rsaCompatibilityEnabled()
+    }
+
+    /// RADIUS ▸ "Allow RSA-only devices": on creates the RSA compatibility root (RSA-3072,
+    /// SHA-256) on first use with its RSA RADIUS certificate, enables the Computer-RSA / User-RSA
+    /// templates (SCEP/EST) and puts the root into the Default Domain Policy's trusted roots and
+    /// NTAuth; the RADIUS server then serves the RSA chain to clients that cannot use ECDSA and
+    /// accepts client certificates from that root. Off reverses all of it (the root and its key
+    /// stay). The 802.1X profiles keep pointing at the main root: Windows never needs RSA.
+    public func setRSAOnlyDevicesAllowed(_ on: Bool) async throws {
+        guard let pki, let store, let editor = gpoEditor() else { throw CLIError.failure("the server is not running") }
+        let service = try await CAService.open(pki: pki, store: store)
+        let created = try await service.setRSACompatibility(on)
+        if created { serveLog.event("PKI", "RSA compatibility CA (RSA-3072) created (app)") }
+        guard let ca = try? await pki.authority(named: LabPKI.rsaCompatCAName) else {
+            serveLog.event("RADIUS", "RSA-only devices not allowed (app)")
+            return
+        }
+        let der = try ca.der()
+        if on {
+            let dc = try await store.domainInfo().dcDNSName
+            if try await pki.ensureRSAServerCertificate(hostname: dc) == .issued {
+                serveLog.event("PKI", "RSA RADIUS certificate issued for \(dc) (app)")
+            }
+            let cn = Self.commonName(ca.certificate.subject)
+            let change = try await editor.addTrustedRoot(CACertificateInfo(der: der, commonName: cn, subject: ca.certificate.subject.description),
+                                                         friendlyName: cn)
+            serveLog.event("GPO", "trusted root \(change.thumbprint) \(ca.certificate.subject) in Default Domain Policy (app)")
+        } else {
+            do {
+                let change = try await editor.removeTrustedRoot(thumbprint: CertificateBlob.thumbprint(der))
+                serveLog.event("GPO", "trusted root \(change.thumbprint) removed from Default Domain Policy (app)")
+            } catch GroupPolicyError.unknownThumbprint {}
+        }
+        serveLog.event("RADIUS", "RSA-only devices \(on ? "allowed: RSA chain for clients without ECDSA, Computer-RSA / User-RSA templates on" : "not allowed") (app)")
+    }
+
+    /// The RSA compatibility root's certificate (DER) for old devices to install, nil before it exists.
+    public func rsaCompatibilityRoot() async -> (der: [UInt8], thumbprint: String)? {
+        guard let pki, let ca = try? await pki.authority(named: LabPKI.rsaCompatCAName), let der = try? ca.der() else { return nil }
+        return (der, CertificateBlob.thumbprint(der))
     }
 
     /// The 802.1X 192-bit (P-384) root's SHA-1 thumbprint (WPA3-Enterprise 192-bit profiles).
     public func suiteBThumbprint() async -> String? {
-        guard let pki, let ca = try? await pki.authority(named: LabPKI.suiteBCAName), let der = try? ca.der() else { return nil }
+        guard let pki, let ca = (try? await pki.suiteBAuthority()) ?? nil, let der = try? ca.der() else { return nil }
         return CertificateBlob.thumbprint(der)
     }
 
@@ -728,29 +917,47 @@ public final class ServerController {
     public func testRadius(attributes text: String) async -> RadiusTestResult {
         guard let store else { return RadiusTestResult(ok: false, text: "The server is not running.") }
         let (parsed, unknown) = RequestContext.parse(text)
-        return await Self.radiusTest(store: store, request: parsed, unknown: unknown)
+        let profiles = await runtime?.deviceProfiles ?? NoDeviceProfiles()
+        return await Self.radiusTest(store: store, request: parsed, unknown: unknown, profiles: profiles)
     }
 
     /// Shared by the Test box and `labdc radius test`.
-    public nonisolated static func radiusTest(store: DirectoryStore, request parsed: RequestContext, unknown: [String]) async -> RadiusTestResult {
+    public nonisolated static func radiusTest(store: DirectoryStore, request parsed: RequestContext, unknown: [String],
+                                              profiles: DeviceProfileSource = NoDeviceProfiles()) async -> RadiusTestResult {
         var request = parsed
         let config = await RadiusConfig.load(store)
         var notes: [String] = []
         var facts: DirectoryFacts?
-        if let user = request.userName, !user.isEmpty {
+        let mab = request.authMethod == "mab"
+        // Device facts by Calling-Station-Id (MAB: the MAC in User-Name); lines given stay.
+        let mac = request.callingStationId.flatMap(RADIUSMAC.normalize)
+            ?? (mab ? request.userName.flatMap(RADIUSMAC.normalize) : nil)
+        if let mac { request.merge(await RadiusDeviceFacts.lookup(mac: mac, store: store, profiles: profiles)) }
+        if mab {
+            notes.append("MAB: no directory account is looked up; only rules that allow MAB are tried.")
+        } else if let user = request.userName, !user.isEmpty {
             facts = try? await store.radiusFacts(name: user)
-            if facts == nil { notes.append("No account named \(user): a live request is rejected before the policies run.") }
+            if facts == nil {
+                notes.append("No account named \(user): a live request is rejected before the policies run."
+                             + (RADIUSMAC.normalize(user) != nil ? " For MAC Authentication Bypass add auth_method = mab." : ""))
+            }
         } else {
             notes.append("No User-Name: only the RADIUS attributes are tested.")
         }
         let decision = RadiusServer.decide(request: &request, facts: facts, config: config)
-        var lines = ["\(decision.accept ? "Accept" : "Reject") — \(decision.rule.map { "rule \($0)" } ?? "no rule matched, default action")"]
+        let none = mab ? "no MAB rule matched" : "no rule matched, default action"
+        var lines = ["\(decision.accept ? "Accept" : "Reject") — \(decision.rule.map { "rule \($0)" } ?? none)"]
         lines += decision.attributes.map { "    " + RADIUSEvaluator.describe($0) }
         if let facts {
             lines.append("Facts: groups \(facts.groups.isEmpty ? "none" : facts.groups.joined(separator: ", "))"
                          + "; OU \(facts.ou ?? "none"); \(facts.isMachine ? "machine" : "user") account"
                          + (facts.accountFlags.isEmpty ? "" : "; \(facts.accountFlags.joined(separator: ", "))"))
         }
+        lines.append("Device: \(request.deviceCategory ?? "unknown")"
+                     + (request.deviceOS.map { ", \($0)" } ?? "")
+                     + (request.dhcpVendorClass.map { ", vendor class \($0)" } ?? "")
+                     + (request.dhcpHostname.map { ", hostname \($0)" } ?? "")
+                     + (request.registeredDevice ? ", registered" + (request.deviceGroup.map { " (\($0))" } ?? "") : ""))
         lines.append("Request: \(request.timeOfDay) \(request.weekday)"
                      + (request.nasIP.map { ", NAS-IP-Address \($0)" } ?? "")
                      + (request.calledStationId.map { ", Called-Station-Id \($0)" } ?? ""))
@@ -797,7 +1004,7 @@ public final class ServerController {
             case .nxDomain:
                 return DNSForwardingTestResult(ok: false, text: "\(upstreams) answered that \(name) does not exist. Those servers may only know internal names; add a public DNS server such as 8.8.8.8.")
             case .servFail, .refused:
-                return DNSForwardingTestResult(ok: false, text: "No answer for \(name) from \(upstreams). Check that this Mac can reach them, or enter other servers in Settings ▸ Directory.")
+                return DNSForwardingTestResult(ok: false, text: "No answer for \(name) from \(upstreams). Check that this Mac can reach them, or enter other servers in Settings ▸ System.")
             default:
                 return DNSForwardingTestResult(ok: false, text: "\(name): \(reply.rcode), no address in the answer.")
             }
@@ -974,9 +1181,12 @@ public final class ServerController {
         switch event {
         case let .addressesChanged(advertised, addresses, pinned):
             status.addresses = addresses
+            status.addressesReported = true
             status.advertisePinned = pinned
             status.advertisedIPv4 = advertised
             status.interfaces = NetworkInterfaces.current()
+        case .dhcpChanged:
+            Task { await dhcpChangedByRuntime() }
         }
     }
 

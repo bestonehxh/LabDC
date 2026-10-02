@@ -218,10 +218,12 @@ extension NetlogonService {
         // winbind binds schannel at PRIVACY and calls SamLogonEx level 6, so sealing here made
         // `ntlm_auth --request-nt-key` return the wrong NT_KEY (double-encrypted).
         var sessionKey = Array(sessionBaseKey.prefix(16))
-        if validationLevel == 2 || validationLevel == 3,
-           let channel = state.channel(computer: computer), channel.usesAES {
-            sessionKey = NetlogonCrypto.aesCFB8(key: channel.sessionKey, iv: [UInt8](repeating: 0, count: 16),
-                                                sessionKey, encrypt: true)
+        if Self.encryptsUserSessionKey(validationLevel), let channel = state.channel(computer: computer) {
+            // AES channel: AES-CFB8 with a zero IV; the RC4 strong-key channel: RC4 with the session
+            // key (Samba `netlogon_creds_arcfour_crypt`) — never the key in the clear.
+            sessionKey = channel.usesAES
+                ? NetlogonCrypto.aesCFB8(key: channel.sessionKey, iv: [UInt8](repeating: 0, count: 16), sessionKey, encrypt: true)
+                : RC4.apply(key: channel.sessionKey, sessionKey)
         }
 
         var v = SamValidationInfo(effectiveName: sam,
@@ -241,6 +243,34 @@ extension NetlogonService {
         return SamLogonOutcome(info: v, status: NLStatus.success, reason: nil, account: sam, kind: kind)
     }
 
+    /// Validation levels whose `UserSessionKey` is encrypted with the schannel session key
+    /// (SamInfo 2, SamInfo2 3). Any other level (SamInfo4 6) carries it in the clear.
+    static func encryptsUserSessionKey(_ validationLevel: UInt16) -> Bool {
+        validationLevel == 2 || validationLevel == 3
+    }
+
+    /// Why a SamLogon call may not run on this binding, or nil when it may (MS-NRPC §3.5.4.5.1).
+    /// - `requireOwnChannel` (SamLogonEx, which has no authenticator): the computer must have a
+    ///   secure channel and, over a real transport, the call must arrive on *that* computer's
+    ///   schannel binding at integrity or privacy.
+    /// - A validation level that returns the UserSessionKey in the clear needs privacy (sealing)
+    ///   over a real transport — integrity would put the key on the wire.
+    /// The in-memory test transport is exempt from the transport checks, as before.
+    func samLogonRefusal(computer: String, validationLevel: UInt16, requireOwnChannel: Bool) -> String? {
+        if requireOwnChannel, state.channel(computer: computer) == nil { return "no secure channel" }
+        guard let call = NetlogonCallInfo.current, call.isNetworkTransport else { return nil }
+        if requireOwnChannel {
+            guard call.isSecureRPC else { return "not over secure RPC (schannel)" }
+            guard call.isSecureRPC(for: computer) else {
+                return "schannel is bound to \(call.schannelComputer ?? "-"), not \(computer)"
+            }
+        }
+        if !Self.encryptsUserSessionKey(validationLevel), call.authLevel != .pktPrivacy {
+            return "validation level \(validationLevel) needs a sealed (privacy) binding"
+        }
+        return nil
+    }
+
     /// `NetrLogonSamLogonEx` (opnum 39): no authenticator (schannel-protected); ExtraFlags trailer.
     func samLogonEx(_ r: NDRReader) async throws -> NDRWriter {
         _ = try NLNDR.readTopLevelString(r)                  // LogonServer
@@ -253,9 +283,10 @@ extension NetlogonService {
         // SamLogonEx carries no authenticator: MS-NRPC requires it over secure RPC (schannel) from a
         // computer that has a secure channel. Otherwise anyone reaching the DC could use it as a
         // password oracle and harvest session keys.
-        let call = NetlogonCallInfo.current
-        if state.channel(computer: computer) == nil || (call?.isNetworkTransport == true && call?.isSecureRPC != true) {
-            let reason = state.channel(computer: computer) == nil ? "no secure channel" : "not over secure RPC (schannel)"
+        // The binding must be the named computer's own schannel (an NTLM-signed user binding, or
+        // another computer's channel, may not borrow it), and validation levels that return the
+        // UserSessionKey in the clear need privacy (sealing).
+        if let reason = samLogonRefusal(computer: computer, validationLevel: validationLevel, requireOwnChannel: true) {
             logSamLogon(level: logonLevel, validationLevel: validationLevel, network: network, computer: computer,
                         outcome: SamLogonOutcome(status: NLStatus.accessDenied, reason: reason))
             SamValidationInfo.writeEmpty(w, level: validationLevel, hasReturnAuth: false, status: NLStatus.accessDenied)
@@ -300,6 +331,17 @@ extension NetlogonService {
         func writeReturnAuth() {
             NLNDR.writeReferent(w)                           // PNETLOGON_AUTHENTICATOR
             writeAuthenticator(w, credential: returnCred, timestamp: 0)
+        }
+        // The authenticator proves the channel; a level that returns the key in the clear still
+        // needs a sealed binding (the dispatcher already required schannel sign/seal).
+        if step?.ok == true,
+           let reason = samLogonRefusal(computer: computer, validationLevel: validationLevel, requireOwnChannel: false) {
+            logSamLogon(level: logonLevel, validationLevel: validationLevel, network: network, computer: computer,
+                        outcome: SamLogonOutcome(status: NLStatus.accessDenied, reason: reason))
+            writeReturnAuth()
+            SamValidationInfo.writeEmptyBody(w, level: validationLevel, authoritative: true,
+                                             withFlags: withFlags, status: NLStatus.accessDenied)
+            return w
         }
         if step == nil || step?.ok == false {
             logSamLogon(level: logonLevel, validationLevel: validationLevel, network: network, computer: computer,

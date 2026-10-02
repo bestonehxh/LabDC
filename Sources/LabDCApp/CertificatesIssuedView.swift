@@ -244,8 +244,10 @@ private struct IssuedTable<RowMenu: View>: View {
                 if show.requester { Text(r.requester).frame(width: 120, alignment: .leading) }
                 if show.issued { Text(PKIText.day(r.issued)).monospacedDigit().frame(width: 92, alignment: .trailing) }
                 Text(PKIText.day(r.expires)).monospacedDigit().frame(width: 92, alignment: .trailing)
-                CertStatusText(text: r.statusText, attention: r.isRevoked, dimmed: dim)
+                // One word in the column ("Revoked (Supers…" was cut); the reason in the tooltip.
+                CertStatusText(text: r.statusWord, attention: r.isRevoked, dimmed: dim)
                     .frame(width: 110, alignment: .leading)
+                    .help(r.statusText)
             }
             .font(Theme.body)
             .foregroundStyle(dim ? Theme.faint : Theme.muted)

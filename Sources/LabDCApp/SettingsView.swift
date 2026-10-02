@@ -1,4 +1,6 @@
 import AppKit
+import AuthKit
+import DNSKit
 import NetlogonService
 import LabDCCore
 import Store
@@ -37,10 +39,18 @@ struct SettingsView: View {
         .frame(width: 620, height: 560)
         .background(Theme.background)
         .navigationTitle("Settings")
+        .onAppear { takeRequestedTab() }
+        .onChange(of: model.requestedSettingsTab) { _, _ in takeRequestedTab() }
         .overlay(alignment: .bottom) {
             SavedPill(generation: model.controller.savedGeneration)
                 .padding(.bottom, 12)
         }
+    }
+
+    private func takeRequestedTab() {
+        guard let requested = model.requestedSettingsTab else { return }
+        tab = requested
+        model.requestedSettingsTab = nil
     }
 }
 
@@ -176,7 +186,7 @@ struct GeneralSettings: View {
         // the controller or move its folder.
         let settling = status.isBusy
         SettingsPage {
-            QuietSection("Overview") {
+            QuietSection("Greeting") {
                 SettingsRow(title: "Greeting picture",
                             detail: "The picture beside the greeting on the Overview. It plays when LabDC opens and when the greeting changes.",
                             first: true) {
@@ -287,7 +297,7 @@ struct GeneralSettings: View {
                 }
             }
 
-            QuietSection("Profiles") {
+            QuietSection("Data profiles") {
                 if !model.profilesApply {
                     QuietNote("This window was opened with --data \(model.controller.data.url.path), so profiles do not apply: the app uses that folder only.", attention: false)
                         .textSelection(.enabled)
@@ -516,6 +526,19 @@ struct DirectorySettings: View {
                 QuietRow {
                     DNSForwardingSetting()
                 }
+                QuietRow {
+                    DNSAllowedClientsSetting()
+                }
+                SettingsRow(title: "Dynamic updates",
+                            detail: dynamicUpdatesDetail(settings.dnsDynamicUpdates)) {
+                    Picker("Dynamic updates", selection: dynamicUpdatesBinding) {
+                        ForEach(DNSDynamicUpdateMode.allCases, id: \.self) { Text($0.settingsLabel).tag($0) }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
+                    .accessibilityLabel("DNS dynamic updates")
+                }
             }
 
             QuietSection("LDAP") {
@@ -529,6 +552,49 @@ struct DirectorySettings: View {
                     .toggleStyle(.quiet)
                     .accessibilityLabel("Allow plain LDAP")
                     .accessibilityHint("Simple binds with a password on port 389 without encryption")
+                }
+                QuietRow {
+                    Toggle(isOn: binding(\.requireLDAPSigning)) {
+                        SettingsLabel(title: "Require LDAP signing",
+                                      detail: settings.requireLDAPSigning
+                                          ? "Kerberos and NTLM binds on port 389 must sign or encrypt, as Windows, Samba and macOS do. Like a Windows DC's \"Require signing\"."
+                                          : "Kerberos and NTLM binds on port 389 may skip signing, so the session can be tampered with or relayed.")
+                    }
+                    .toggleStyle(.quiet)
+                    .accessibilityLabel("Require LDAP signing")
+                }
+                SettingsRow(title: "LDAP channel binding",
+                            detail: "Ties Kerberos and NTLM binds on LDAPS and StartTLS to the TLS connection, so a relayed login fails. \"When supported\" checks every client that sends a binding.") {
+                    Picker("LDAP channel binding", selection: binding(\.ldapChannelBinding)) {
+                        ForEach(ChannelBindingPolicy.allCases, id: \.self) { Text($0.settingsLabel).tag($0) }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
+                    .accessibilityLabel("LDAP channel binding")
+                }
+            }
+
+            QuietSection("Certificate enrollment over HTTPS") {
+                QuietRow(first: true) {
+                    Toggle(isOn: binding(\.cesAllowNTLM)) {
+                        SettingsLabel(title: "Allow NTLM",
+                                      detail: settings.cesAllowNTLM
+                                          ? "Windows may enroll with NTLM when Kerberos is unavailable; NTLM must be bound to the TLS connection, so a relayed login is refused."
+                                          : "Only Kerberos signs in to the enrollment web services.")
+                    }
+                    .toggleStyle(.quiet)
+                    .accessibilityLabel("Allow NTLM for certificate enrollment")
+                }
+                SettingsRow(title: "Kerberos channel binding",
+                            detail: "Whether Kerberos logins to the enrollment web services must be tied to the TLS connection.") {
+                    Picker("Kerberos channel binding", selection: binding(\.cesChannelBinding)) {
+                        ForEach(ChannelBindingPolicy.allCases, id: \.self) { Text($0.settingsLabel).tag($0) }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .fixedSize()
+                    .accessibilityLabel("Kerberos channel binding for certificate enrollment")
                 }
             }
 
@@ -580,6 +646,31 @@ struct DirectorySettings: View {
         }
     }
 
+    /// DNS "Dynamic updates" applies live (DNS keeps running), unlike the settings that restart.
+    private var dynamicUpdatesBinding: Binding<DNSDynamicUpdateMode> {
+        Binding(get: { model.controller.settings.dnsDynamicUpdates }, set: { value in
+            Task {
+                do {
+                    try await model.controller.setDNSDynamicUpdates(value)
+                    error = nil
+                } catch {
+                    self.error = "Not saved: \(error)"
+                }
+            }
+        })
+    }
+
+    private func dynamicUpdatesDetail(_ mode: DNSDynamicUpdateMode) -> String {
+        switch mode {
+        case .secureAndNonsecure:
+            "Joined PCs update their own names signed with Kerberos (GSS-TSIG) from any address; other devices may register their own address."
+        case .secureOnly:
+            "Only joined PCs and DNS admins, signed with Kerberos (GSS-TSIG). Unsigned updates are refused; Windows then retries signed."
+        case .off:
+            "Nobody may change DNS names with dynamic updates. The DHCP server still registers its leases."
+        }
+    }
+
     private func binding<T: Equatable>(_ key: WritableKeyPath<ServerSettings, T>) -> Binding<T> {
         Binding(get: { model.controller.settings[keyPath: key] }, set: { value in
             Task {
@@ -591,6 +682,46 @@ struct DirectorySettings: View {
                 }
             }
         })
+    }
+}
+
+/// "Other names for": the networks besides this Mac's own and the DHCP scopes whose devices may
+/// resolve names outside the domain here (CVE audit 1 Oct 2026: no open resolver).
+struct DNSAllowedClientsSetting: View {
+    @Environment(AppModel.self) private var model
+    @State private var text = ""
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SettingsLabel(title: "Other names for",
+                          detail: "Names outside the domain are looked up only for devices on this Mac's networks and the DHCP scopes. Add other networks (routed subnets, VPNs) here.")
+            HStack(alignment: .firstTextBaseline, spacing: 16) {
+                TextField("Networks", text: $text, prompt: Text("10.8.0.0/16, fd00::/64"))
+                    .textFieldStyle(.quiet)
+                    .labelsHidden()
+                    .onSubmit { save() }
+                    .accessibilityLabel("Networks allowed to resolve other names")
+                Button("Save") { save() }
+                    .buttonStyle(.quietLink)
+            }
+            if let error {
+                QuietNote(error, attention: true)
+            }
+        }
+        .onAppear { text = model.controller.settings.dnsAllowedClients.joined(separator: ", ") }
+    }
+
+    private func save() {
+        Task {
+            do {
+                try await model.controller.setDNSAllowedClients(text)
+                error = nil
+                text = model.controller.settings.dnsAllowedClients.joined(separator: ", ")
+            } catch {
+                self.error = "Not saved: \(error)"
+            }
+        }
     }
 }
 
@@ -866,7 +997,7 @@ struct BackupSettings: View {
                 }
                 QuietRow {
                     HStack(spacing: 24) {
-                        Button("Show in Finder") { model.openDataFolder() }
+                        Button("Open data folder") { model.openDataFolder() }
                             .buttonStyle(.quietLink)
                         Button("Open log folder") { model.openLogFolder() }
                             .buttonStyle(.quietLink)

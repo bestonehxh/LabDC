@@ -152,7 +152,7 @@ public actor CAService {
     public let pki: LabPKI
     public let store: DirectoryStore
     let clock: @Sendable () -> Date
-    private let logger = Logger(subsystem: "dev.labdc.app", category: "pki")
+    let logger = Logger(subsystem: "dev.labdc.app", category: "pki")
     /// `domain` table key holding the HTTP port the CRL and CA certificate are served on (audit
     /// 27 Sep 2026: the CDP/AIA URLs ignored `--ports http=N`, so members could not fetch the CRL).
     /// Kept in the store so `ca sign` and the app's Sign use the port the running serve bound.
@@ -216,12 +216,19 @@ public actor CAService {
     }
 
     public func templates() async throws -> [CertificateTemplate] {
-        try await store.pkiTemplates().map(CertificateTemplate.init(row:))
+        let revisions = try await templateRevisions()
+        return try await store.pkiTemplates().map { row in
+            var t = CertificateTemplate(row: row)
+            if let r = revisions[t.name] { t.majorRevision = r }
+            return t
+        }
     }
 
     public func template(named name: String) async throws -> CertificateTemplate {
         guard let row = try await store.pkiTemplate(named: name) else { throw IssuanceError.unknownTemplate(name) }
-        return CertificateTemplate(row: row)
+        var t = CertificateTemplate(row: row)
+        if let r = try await templateRevisions()[t.name] { t.majorRevision = r }
+        return t
     }
 
     /// Inserts or replaces a template (UI edits, custom templates) and republishes the PKI
@@ -230,6 +237,7 @@ public actor CAService {
     public func saveTemplate(_ template: CertificateTemplate) async throws {
         // An enabled 192-bit template needs its issuer: the P-384 802.1X CA is made on first use.
         if template.enabled, template.issuingCA == LabPKI.suiteBCAName { try await ensureSuiteBAuthority() }
+        if template.enabled, template.issuingCA == LabPKI.rsaCompatCAName { try await ensureRSACompatAuthority() }
         try await store.savePKITemplate(template.row)
         try await publishToDirectory()
     }
@@ -237,10 +245,12 @@ public actor CAService {
     /// WPA3-Enterprise 192-bit: the P-384 802.1X root is created only when it is first needed —
     /// a 192-bit 802.1X profile is published or a template it issues is enabled — with its CRL,
     /// and published to the Configuration NC (NTAuth, AIA, Certification Authorities) at once.
-    /// Returns true when it was created now (an existing one is kept as is).
+    /// Returns true when it was created now (an existing one is kept as is). A P-384 current CA
+    /// serves 192-bit itself (`LabPKI.mainCAServesSuiteB`): nothing is created then.
     @discardableResult
     public func ensureSuiteBAuthority() async throws -> Bool {
         if try await pki.hasSuiteBCA() { return false }
+        if try await pki.mainCAServesSuiteB() { return false }
         let info = try await store.domainInfo()
         try await pki.ensureSuiteBCA(commonName: "LabDC 802.1X 192-bit CA (\(info.realm))")
         _ = try await generateCRL(caName: LabPKI.suiteBCAName)
@@ -318,7 +328,8 @@ public actor CAService {
         // Extensions
         let extensions = try await leafExtensions(template: template, ca: ca, subjectKey: csr.publicKey,
                                                   keyKind: plan.keyKind, subjectEmpty: plan.subject.isEmpty,
-                                                  sans: plan.subjectAltNames)
+                                                  sans: plan.subjectAltNames,
+                                                  accountSID: template.isAccountBound ? requester.sid : nil)
 
         // Sign, with a serial not used before
         var certificate: Certificate?
@@ -388,7 +399,7 @@ public actor CAService {
             days = d
         }
         let ca: CertificateAuthority
-        if let name = overrides.caName ?? template.issuingCA { ca = try await pki.authority(named: name) } else { ca = try await pki.currentAuthority() }
+        if let name = overrides.caName ?? template.issuingCA { ca = try await pki.issuingAuthority(named: name) } else { ca = try await pki.currentAuthority() }
         let now = clock()
         guard ca.certificate.notValidAfter > now else { throw IssuanceError.caExpired(ca.name) }
         let notBefore = now.addingTimeInterval(-Self.backdate)
@@ -433,6 +444,7 @@ public actor CAService {
                 throw IssuanceError.requesterHasNoDNSHostName(entry.samAccountName ?? requester.name)
             }
             if host.hasSuffix(".") { host.removeLast() }
+            try await refuseDomainControllerName(host, for: entry)
             for name in requested {
                 guard case .dnsName(let asked) = name, Self.normalizedHost(asked) == host else {
                     throw IssuanceError.subjectAltNameNotAllowed(requested: Self.describe(name), allowed: "DNS:\(host)")
@@ -462,6 +474,14 @@ public actor CAService {
         case .fromRequest:
             let sans = overrides.subjectAltNames ?? requested
             for name in sans { try Self.validate(name) }
+            if !requester.isAdmin {
+                // ESC1: a CSR-supplied UPN (or a SID URL, KB5014754) would sign the requester in
+                // as somebody else. Only an administrator may put an identity in the SAN.
+                for name in sans where Self.upn(of: name) != nil || Self.isSIDURL(name) {
+                    throw IssuanceError.subjectAltNameNotAllowed(requested: Self.describe(name),
+                                                                 allowed: "DNS names and addresses (an identity SAN needs an administrator)")
+                }
+            }
             if sans.isEmpty && template.ekus.contains(PKIOID.serverAuth) {
                 throw IssuanceError.missingSubjectAltName(template: template.name)
             }
@@ -484,6 +504,36 @@ public actor CAService {
         }
     }
 
+    /// Certifried (CVE-2022-26923): a `dnsHostName` certificate for an account that is not a
+    /// domain controller may not name a DC (this DC's or any DC account's `dNSHostName`, or a DC's
+    /// computer name as the first label) or the domain itself, like `checkDeviceNames` for devices.
+    func refuseDomainControllerName(_ host: String, for entry: DirectoryEntry) async throws {
+        let uac = UInt32(truncatingIfNeeded: entry.int("userAccountControl") ?? 0)
+        if uac & (UserAccountControl.serverTrustAccount | UserAccountControl.partialSecretsAccount) != 0 { return }
+        let info = try await store.domainInfo()
+        var hosts: Set<String> = [Self.normalizedHost(info.dcDNSName), Self.normalizedHost(info.dnsDomain)]
+        var labels: Set<String> = [info.dcName.lowercased()]
+        let dcs = try await store.search(base: info.domainDN, scope: .subtree,
+                                         filter: .or([.eq("primaryGroupID", "516"), .eq("primaryGroupID", "521")]),
+                                         attrs: ["sAMAccountName", "dNSHostName"])
+        for dc in dcs where dc.id != entry.id {
+            if let h = dc.string("dNSHostName") { hosts.insert(Self.normalizedHost(h)) }
+            if let sam = dc.samAccountName?.lowercased() { labels.insert(sam.hasSuffix("$") ? String(sam.dropLast()) : sam) }
+        }
+        let host = Self.normalizedHost(host)
+        let label = host.split(separator: ".").first.map(String.init) ?? host
+        if hosts.contains(host) || labels.contains(label) {
+            throw IssuanceError.subjectAltNameNotAllowed(requested: "DNS:\(host)",
+                                                         allowed: "a name that is not a domain controller's or the domain's")
+        }
+    }
+
+    /// The KB5014754 SAN URL `tag:microsoft.com,2022-09-14:sid:<SID>` (strong mapping by SAN).
+    static func isSIDURL(_ name: GeneralName) -> Bool {
+        guard case .uniformResourceIdentifier(let uri) = name else { return false }
+        return uri.lowercased().hasPrefix("tag:microsoft.com,2022-09-14:sid:")
+    }
+
     private func account(of requester: RequesterIdentity, template: CertificateTemplate) async throws -> DirectoryEntry {
         guard let sidText = requester.sid else { throw IssuanceError.requesterHasNoSID(template: template.name) }
         guard let sid = try? SID(string: sidText), let entry = try await store.read(sid: sid) else {
@@ -494,7 +544,7 @@ public actor CAService {
 
     private func leafExtensions(template: CertificateTemplate, ca: CertificateAuthority,
                                 subjectKey: Certificate.PublicKey, keyKind: SubjectKeyKind, subjectEmpty: Bool,
-                                sans: [GeneralName]) async throws -> Certificate.Extensions {
+                                sans: [GeneralName], accountSID: String? = nil) async throws -> Certificate.Extensions {
         var usage = template.keyUsage
         // keyEncipherment means RSA key transport; an EC key cannot do it.
         if keyKind.isEC { usage.remove(.keyEncipherment) }
@@ -532,11 +582,18 @@ public actor CAService {
                                                  critical: false, value: aiaValue[...]))
             // szOID_CERTIFICATE_TEMPLATE { templateID, majorVersion, minorVersion }
             let templateExt = DERWriter.sequence([DERWriter.oid(template.oid),
-                                                  DERWriter.integer(Int64(CertificateTemplate.majorVersion)),
+                                                  DERWriter.integer(Int64(template.majorRevision)),
                                                   DERWriter.integer(Int64(CertificateTemplate.minorVersion))])
             try ext.append(Certificate.Extension(
                 oid: try ASN1ObjectIdentifier(dotRepresentation: PKIOID.certificateTemplateExtension),
                 critical: false, value: templateExt[...]))
+            // KB5014754: account-bound certificates carry the account's SID (strong mapping).
+            if let accountSID {
+                let value = NTDSSecurityExtension.value(sid: accountSID)
+                try ext.append(Certificate.Extension(
+                    oid: try ASN1ObjectIdentifier(dotRepresentation: PKIOID.ntdsCASecurityExtension),
+                    critical: false, value: value[...]))
+            }
             return ext
         } catch {
             throw PKIKitError.encoding("certificate extensions: \(error)")

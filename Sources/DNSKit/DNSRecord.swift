@@ -16,6 +16,8 @@ public struct DNSRecordType: RawRepresentable, Hashable, Sendable, CustomStringC
     public static let aaaa = DNSRecordType(rawValue: 28)
     public static let srv = DNSRecordType(rawValue: 33)
     public static let opt = DNSRecordType(rawValue: 41)
+    /// RFC 4701: written by the DHCP server next to the A/AAAA it registers for a lease.
+    public static let dhcid = DNSRecordType(rawValue: 49)
     public static let tkey = DNSRecordType(rawValue: 249)
     public static let tsig = DNSRecordType(rawValue: 250)
     public static let ixfr = DNSRecordType(rawValue: 251)
@@ -40,6 +42,7 @@ public struct DNSRecordType: RawRepresentable, Hashable, Sendable, CustomStringC
         case 28: "AAAA"
         case 33: "SRV"
         case 41: "OPT"
+        case 49: "DHCID"
         case 249: "TKEY"
         case 250: "TSIG"
         case 251: "IXFR"

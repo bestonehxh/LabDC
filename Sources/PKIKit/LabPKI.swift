@@ -1,3 +1,4 @@
+import _CryptoExtras
 import CryptoKit
 import Foundation
 import os
@@ -11,7 +12,11 @@ import X509
 /// CAs, one directory each: `cas/<name>/ca.pem` + `ca-key.pem` (P-256 or RSA-2048/3072), and
 /// `current-ca.json` naming the CA that issues (absent: the lab CA). `ensureCA` and
 /// `ensureServerCertificate` are idempotent: they reuse what is on disk while it still matches
-/// and regenerate it otherwise. The DC certificate is always P-256 and is signed by the current CA.
+/// and regenerate it otherwise. The DC certificate is signed by the current CA.
+///
+/// Key types (owner, 1 Oct 2026): a NEW lab CA is P-384 / ECDSA-SHA384 and the DC certificate
+/// issued by a P-384 CA has a P-384 key. An existing lab CA keeps its type (P-256 domains stay
+/// P-256 — never re-keyed by an upgrade), and whatever key type is on disk (P-256 or P-384) loads.
 public actor LabPKI {
     /// Result of an `ensure…` call.
     public enum Outcome: Sendable, Equatable {
@@ -52,6 +57,12 @@ public actor LabPKI {
     /// The RADIUS server certificate under that root (P-384, serverAuth, the DC's FQDN).
     public static let suiteBServerCertificateFileName = "radius-suiteb.pem"
     public static let suiteBServerKeyFileName = "radius-suiteb-key.pem"
+    /// Old devices that only do RSA (1 Oct 2026, opt-in): a separate RSA-3072 / SHA-256 root for
+    /// 802.1X, created when "Allow RSA-only devices" is switched on; existing CAs are untouched.
+    public static let rsaCompatCAName = "rsa-compat"
+    /// Its RADIUS server certificate (RSA-2048, serverAuth, the DC's FQDN).
+    public static let rsaServerCertificateFileName = "radius-rsa.pem"
+    public static let rsaServerKeyFileName = "radius-rsa-key.pem"
 
     static let caLifetimeYears = 10
     static let serverLifetimeDays = 825
@@ -62,7 +73,7 @@ public actor LabPKI {
 
     private struct Pair {
         var certificate: Certificate
-        var key: P256.Signing.PrivateKey
+        var key: ServerKey
     }
 
     public nonisolated let directory: URL
@@ -74,6 +85,9 @@ public actor LabPKI {
     public private(set) var currentCAName: String = LabPKI.labCAName
     private var server: Pair?
     private var suiteBServer: (certificate: Certificate, key: P384.Signing.PrivateKey)?
+    private var rsaServer: (certificate: Certificate, key: _RSA.Signing.PrivateKey)?
+    /// The key type of a lab CA created where none exists (a new domain): P-384 since 1 Oct 2026.
+    public static let defaultLabCAKeyType: CAKeyType = .p384
     private let logger = Logger(subsystem: "dev.labdc.app", category: "pki")
 
     private init(directory: URL) {
@@ -102,8 +116,12 @@ public actor LabPKI {
     /// `alsoAccepting`: former names of the same CA (the app was SheepAuth until 1 Oct 2026, and
     /// its lab CA is `CN=SheepAuth Lab CA (<realm>)`). A current CA under one of them is kept as
     /// it is: joined PCs trust that key, so a rename never re-keys (owner, 1 Oct 2026).
+    ///
+    /// `keyType`: the key of a lab CA created where there is none (default P-384). A lab CA that
+    /// is replaced (renamed, expiring) keeps the type it had, so a P-256 domain stays P-256.
     @discardableResult
-    public func ensureCA(name: String, alsoAccepting formerNames: [String] = []) throws -> Outcome {
+    public func ensureCA(name: String, alsoAccepting formerNames: [String] = [],
+                         keyType: CAKeyType = LabPKI.defaultLabCAKeyType) throws -> Outcome {
         let subject = try DistinguishedName { CommonName(name) }
         let accepted = try [subject] + formerNames.map { n in try DistinguishedName { CommonName(n) } }
         let now = Date()
@@ -112,7 +130,7 @@ public actor LabPKI {
             return .unchanged
         }
 
-        let key = CASigningKey.p256(P256.Signing.PrivateKey())
+        let key = try CASigningKey.generate(lab?.keyType ?? keyType)
         let certificate = try Self.makeCACertificate(subject: subject, key: key, years: Self.caLifetimeYears,
                                                      maxPathLength: 0, now: now)
         // Key first, then certificate: a crash in between leaves a mismatching pair, which
@@ -125,7 +143,7 @@ public actor LabPKI {
             unlink(url(Self.serverCertificateFileName).path)
             unlink(url(Self.serverKeyFileName).path)
         }
-        logger.info("issued lab CA '\(name, privacy: .public)' serial \(Self.hex(certificate.serialNumber), privacy: .public)")
+        logger.info("issued lab CA '\(name, privacy: .public)' (\(key.keyType.displayName, privacy: .public)) serial \(Self.hex(certificate.serialNumber), privacy: .public)")
         return .issued
     }
 
@@ -277,8 +295,9 @@ public actor LabPKI {
             return .unchanged
         }
 
-        let key = P256.Signing.PrivateKey()
-        let publicKey = Certificate.PublicKey(key.publicKey)
+        // The key follows the CA: P-384 under a P-384 CA, else P-256 (as it always was).
+        let key = ServerKey.generate(issuedBy: ca.keyType)
+        let publicKey = key.publicKey
         let notBefore = now.addingTimeInterval(-Self.backdate)
         let notAfter = min(notBefore.addingTimeInterval(TimeInterval(Self.serverLifetimeDays) * 86400),
                            ca.certificate.notValidAfter)
@@ -373,13 +392,39 @@ public actor LabPKI {
         if let issuer = try authorities().first(where: { Self.isIssued(server.certificate, by: $0.certificate) }) {
             chain.append(try issuer.der())
         }
-        return (chain, Array(server.key.derRepresentation))
+        return (chain, server.key.derRepresentation)
     }
 
     // MARK: - WPA3-Enterprise 192-bit
 
     /// Whether the P-384 802.1X root exists (it is created on first use: `CAService.ensureSuiteBAuthority`).
     public func hasSuiteBCA() throws -> Bool { try authorityIfExists(named: Self.suiteBCAName) != nil }
+
+    /// Whether the current CA itself serves WPA3-Enterprise 192-bit: it is P-384 (a domain
+    /// provisioned since 1 Oct 2026) and no separate 802.1X 192-bit CA exists. Then no second
+    /// root is made: the DC certificate (P-384, ECDSA-SHA384) is the RADIUS certificate for
+    /// 192-bit clients too, and the `Computer192` / `User192` templates are issued by the
+    /// current CA. A P-256 domain keeps the separate `dot1x-suiteb` CA, as does a P-384 domain
+    /// that already has one.
+    public func mainCAServesSuiteB() throws -> Bool {
+        guard try authorityIfExists(named: Self.suiteBCAName) == nil else { return false }
+        return (try? currentAuthority())?.keyType == .p384
+    }
+
+    /// The root WPA3-Enterprise 192-bit clients trust: the 802.1X 192-bit CA when it exists,
+    /// else the current CA when it is P-384; nil when neither (the 192-bit CA is still to be made).
+    public func suiteBAuthority() throws -> CertificateAuthority? {
+        if let ca = try authorityIfExists(named: Self.suiteBCAName) { return ca }
+        guard let current = try? currentAuthority(), current.keyType == .p384 else { return nil }
+        return current
+    }
+
+    /// The CA that issues for a template whose `issuingCA` is `name`: that CA — except the
+    /// 802.1X 192-bit CA's name while the current CA serves 192-bit itself (`mainCAServesSuiteB`).
+    public func issuingAuthority(named name: String) throws -> CertificateAuthority {
+        if name.lowercased() == Self.suiteBCAName, try mainCAServesSuiteB() { return try currentAuthority() }
+        return try authority(named: name)
+    }
 
     /// Makes sure the P-384 802.1X root exists (`cas/dot1x-suiteb`, 10 years). It is an ordinary
     /// LabDC CA: published to the Configuration NC and NTAuth with the others, trusted for
@@ -445,10 +490,103 @@ public actor LabPKI {
     /// The 192-bit RADIUS certificate (nil before `ensureSuiteBServerCertificate`).
     public func suiteBServerCertificate() -> Certificate? { suiteBServer?.certificate }
 
-    /// The 192-bit EAP credential: the P-384 leaf, the P-384 root, the key as PKCS#8 DER.
+    /// The 192-bit EAP credential: the P-384 leaf, the P-384 root, the key as PKCS#8 DER. When
+    /// the current CA serves 192-bit itself, the DC certificate (P-384 key, ECDSA-SHA384 by that
+    /// P-384 root) is that credential; nil while it is not P-384 yet.
     public func eapSuiteBCredentials() throws -> (chain: [[UInt8]], keyDER: [UInt8])? {
-        guard let suiteBServer, let ca = try authorityIfExists(named: Self.suiteBCAName) else { return nil }
-        return ([try Self.der(suiteBServer.certificate), try ca.der()], Array(suiteBServer.key.derRepresentation))
+        if let ca = try authorityIfExists(named: Self.suiteBCAName) {
+            guard let suiteBServer else { return nil }
+            return ([try Self.der(suiteBServer.certificate), try ca.der()], Array(suiteBServer.key.derRepresentation))
+        }
+        guard let server, server.key.isP384, let ca = try suiteBAuthority(),
+              Self.isIssued(server.certificate, by: ca.certificate) else { return nil }
+        return ([try Self.der(server.certificate), try ca.der()], server.key.derRepresentation)
+    }
+
+    // MARK: - RSA-only devices
+
+    /// Whether the RSA compatibility root exists (created by `CAService.setRSACompatibility(true)`).
+    public func hasRSACompatCA() throws -> Bool { try authorityIfExists(named: Self.rsaCompatCAName) != nil }
+
+    /// Makes sure the RSA compatibility root exists (`cas/rsa-compat`, RSA-3072 / SHA-256, 10
+    /// years). It never becomes current: the main CA keeps issuing for Windows.
+    @discardableResult
+    public func ensureRSACompatCA(commonName: String) throws -> Outcome {
+        if let ca = try authorityIfExists(named: Self.rsaCompatCAName) {
+            guard ca.keyType == .rsa3072 || ca.keyType == .rsa2048 else {
+                throw PKIKitError.encoding("CA \(Self.rsaCompatCAName) exists but is \(ca.keyType.displayName), not RSA")
+            }
+            return .unchanged
+        }
+        try createCA(name: Self.rsaCompatCAName, commonName: commonName, keyType: .rsa3072, years: Self.caLifetimeYears)
+        return .issued
+    }
+
+    /// The RSA RADIUS server certificate for `hostname` (RSA-2048, serverAuth, dNSName = the
+    /// DC's FQDN, SHA-256 by the RSA compatibility root; digitalSignature + keyEncipherment so
+    /// TLS_RSA key transport works for the oldest supplicants), reissued when missing, renamed,
+    /// re-rooted or close to expiry.
+    @discardableResult
+    public func ensureRSAServerCertificate(hostname: String) throws -> Outcome {
+        let ca = try authority(named: Self.rsaCompatCAName)
+        let names = try Self.canonicalNames(hostnames: [hostname], ips: [])
+        let subject = try DistinguishedName { CommonName(names.hostnames[0]) }
+        let now = Date()
+        if let current = rsaServer, current.certificate.subject == subject, Self.isIssued(current.certificate, by: ca.certificate),
+           current.certificate.notValidAfter > now.addingTimeInterval(Self.renewBefore) {
+            return .unchanged
+        }
+        let key: _RSA.Signing.PrivateKey
+        do { key = try _RSA.Signing.PrivateKey(keySize: .bits2048) } catch {
+            throw PKIKitError.encoding("RSA key generation: \(error)")
+        }
+        let publicKey = Certificate.PublicKey(key.publicKey)
+        let notBefore = now.addingTimeInterval(-Self.backdate)
+        let notAfter = min(notBefore.addingTimeInterval(TimeInterval(Self.serverLifetimeDays) * 86400), ca.certificate.notValidAfter)
+        let certificate: Certificate
+        do {
+            guard let caKeyID = try ca.certificate.extensions.subjectKeyIdentifier?.keyIdentifier else {
+                throw PKIKitError.encoding("CA has no subjectKeyIdentifier")
+            }
+            let extensions = try Certificate.Extensions {
+                Critical(BasicConstraints.notCertificateAuthority)
+                Critical(KeyUsage(digitalSignature: true, keyEncipherment: true))
+                try ExtendedKeyUsage([.serverAuth])
+                SubjectKeyIdentifier(hash: publicKey)
+                AuthorityKeyIdentifier(keyIdentifier: caKeyID)
+                SubjectAlternativeNames(names.generalNames)
+            }
+            certificate = try Certificate(version: .v3, serialNumber: Self.randomSerial(), publicKey: publicKey,
+                                          notValidBefore: notBefore, notValidAfter: notAfter, issuer: ca.certificate.subject,
+                                          subject: subject, signatureAlgorithm: ca.key.signatureAlgorithm, extensions: extensions,
+                                          issuerPrivateKey: ca.key.certificateKey)
+        } catch let error as PKIKitError {
+            throw error
+        } catch {
+            throw PKIKitError.encoding("RSA RADIUS certificate: \(error)")
+        }
+        try SecureFiles.write(Array(key.pkcs8PEMRepresentation.utf8), to: url(Self.rsaServerKeyFileName))
+        try SecureFiles.write(Array(Self.pem(certificate).utf8), to: url(Self.rsaServerCertificateFileName))
+        rsaServer = (certificate, key)
+        logger.info("issued RSA RADIUS certificate serial \(Self.hex(certificate.serialNumber), privacy: .public) for \(names.hostnames[0], privacy: .public)")
+        return .issued
+    }
+
+    /// The RSA RADIUS certificate (nil before `ensureRSAServerCertificate`).
+    public func rsaServerCertificate() -> Certificate? { rsaServer?.certificate }
+
+    /// The RSA EAP credential: the RSA leaf, the RSA root, the key as PKCS#8 DER; nil until both exist.
+    public func eapRSACredentials() throws -> (chain: [[UInt8]], keyDER: [UInt8])? {
+        guard let rsaServer, let ca = try authorityIfExists(named: Self.rsaCompatCAName),
+              Self.isIssued(rsaServer.certificate, by: ca.certificate) else { return nil }
+        return ([try Self.der(rsaServer.certificate), try ca.der()], try Self.pkcs8DER(rsaServer.key))
+    }
+
+    /// PKCS#8 DER of an RSA key (BoringSSL's `EVP_parse_private_key` wants PKCS#8, not PKCS#1).
+    static func pkcs8DER(_ key: _RSA.Signing.PrivateKey) throws -> [UInt8] {
+        let body = key.pkcs8PEMRepresentation.split(separator: "\n").filter { !$0.hasPrefix("-----") }.joined()
+        guard let data = Data(base64Encoded: body) else { throw PKIKitError.encoding("RSA key: PKCS#8 PEM") }
+        return Array(data)
     }
 
     /// Every CA of this DC (DER): what an EAP-TLS client certificate may chain to.
@@ -499,6 +637,13 @@ public actor LabPKI {
            Certificate.PublicKey(key.publicKey) == certificate.publicKey {
             suiteBServer = (certificate, key)   // anything else is reissued by the next ensure
         }
+        if let certBytes = try SecureFiles.read(url(Self.rsaServerCertificateFileName)),
+           let keyBytes = try SecureFiles.read(url(Self.rsaServerKeyFileName)),
+           let certificate = try? Certificate(pemEncoded: String(decoding: certBytes, as: UTF8.self)),
+           let key = try? _RSA.Signing.PrivateKey(pemRepresentation: String(decoding: keyBytes, as: UTF8.self)),
+           Certificate.PublicKey(key.publicKey) == certificate.publicKey {
+            rsaServer = (certificate, key)
+        }
         if let bytes = try SecureFiles.read(url(Self.currentCAFileName)) {
             guard let object = try? JSONDecoder().decode([String: String].self, from: Data(bytes)),
                   let name = object["current"], !name.isEmpty else {
@@ -509,7 +654,7 @@ public actor LabPKI {
         }
     }
 
-    /// Loads `ca.pem` + `ca-key.pem` from `dir` (P-256 or RSA key). Nil when the certificate is
+    /// Loads `ca.pem` + `ca-key.pem` from `dir` (P-256, P-384 or RSA key). Nil when the certificate is
     /// missing, or its key is missing or does not match (the lab CA is then regenerated).
     private func loadAuthority(name: String, directory dir: URL) throws -> CertificateAuthority? {
         let certURL = dir.appendingPathComponent(Self.caCertificateFileName)
@@ -531,7 +676,7 @@ public actor LabPKI {
         do {
             key = try CASigningKey(pem: String(decoding: keyBytes, as: UTF8.self))
         } catch {
-            throw PKIKitError.corruptFile(path: keyURL.path, reason: "not a P-256 or RSA PEM private key (\(error))")
+            throw PKIKitError.corruptFile(path: keyURL.path, reason: "not a P-256, P-384 or RSA PEM private key (\(error))")
         }
         guard key.publicKey == certificate.publicKey else {
             logger.warning("\(keyURL.path, privacy: .public) does not match \(certURL.path, privacy: .public)")
@@ -555,13 +700,13 @@ public actor LabPKI {
         } catch {
             throw PKIKitError.corruptFile(path: certURL.path, reason: "not a PEM certificate (\(error))")
         }
-        let key: P256.Signing.PrivateKey
+        let key: ServerKey
         do {
-            key = try P256.Signing.PrivateKey(pemRepresentation: String(decoding: keyBytes, as: UTF8.self))
+            key = try ServerKey(pem: String(decoding: keyBytes, as: UTF8.self))
         } catch {
-            throw PKIKitError.corruptFile(path: keyURL.path, reason: "not a P-256 PEM private key (\(error))")
+            throw PKIKitError.corruptFile(path: keyURL.path, reason: "not a P-256 or P-384 PEM private key (\(error))")
         }
-        guard Certificate.PublicKey(key.publicKey) == certificate.publicKey else {
+        guard key.publicKey == certificate.publicKey else {
             logger.warning("\(keyFile, privacy: .public) does not match \(certificateFile, privacy: .public); it will be regenerated")
             return nil
         }

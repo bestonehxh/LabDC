@@ -11,8 +11,9 @@ enum ActivityTab: String, CaseIterable, Identifiable {
     var title: String { self == .authentications ? "Sign-ins" : "Server log" }
 }
 
-/// The words above the sign-ins: All · Did not succeed · Kerberos · NTLM · LDAP · Certificates.
-/// "Did not succeed" is `AuthenticationsFilter.result == .failed`; the kinds filter by method.
+/// The words above the sign-ins: All · Failed · Kerberos · NTLM · LDAP · Certificates.
+/// "Failed" (the count's word, owner 2 Oct 2026) is `AuthenticationsFilter.result == .failed`;
+/// the kinds filter by method.
 enum SignInFilter: String, CaseIterable, Identifiable {
     case all, failed, kerberos, ntlm, ldap, certificates
     var id: String { rawValue }
@@ -20,7 +21,7 @@ enum SignInFilter: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .all: "All"
-        case .failed: "Did not succeed"
+        case .failed: "Failed"
         case .kerberos: "Kerberos"
         case .ntlm: "NTLM"
         case .ldap: "LDAP"
@@ -80,7 +81,7 @@ final class AuthenticationsViewModel {
         return kind == .all ? rows : rows.filter { kind.matches($0) }
     }
 
-    /// The selected word of the filter row ("Did not succeed" = failed results of every kind).
+    /// The selected word of the filter row ("Failed" = failed results of every kind).
     var signInFilter: SignInFilter {
         get { filter.result == .failed ? .failed : kind }
         set {
@@ -154,7 +155,7 @@ struct AuthenticationsPage: View {
     }
 }
 
-/// All · Did not succeed · Kerberos · NTLM · LDAP · Certificates, then the day range and the counts.
+/// All · Failed · Kerberos · NTLM · LDAP · Certificates, then the day range and the counts.
 struct AuthenticationsFilterBar: View {
     @Environment(AppModel.self) private var model
 

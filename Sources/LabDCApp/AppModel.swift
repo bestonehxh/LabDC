@@ -54,7 +54,9 @@ enum CLIDefaults {
 }
 
 enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
-    case overview, services, users, radius, certificates, activity, connect
+    case overview, services, users
+    case groupPolicy = "group-policy"
+    case certificates, connect, radius, dhcp, activity
 
     var id: String { rawValue }
 
@@ -63,7 +65,9 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .overview: "Overview"
         case .services: "Services"
         case .users: "Directory"
+        case .groupPolicy: "Group Policy"
         case .radius: "RADIUS"
+        case .dhcp: "DHCP"
         case .certificates: "Certificates"
         case .activity: "Activity"
         case .connect: "Connect"
@@ -80,6 +84,11 @@ final class AppModel {
     var selection: SidebarItem? = .overview
     /// Settings ▸ General ▸ "Try": a greeting picture to play once on the Overview.
     var greetingPreview: GreetingPreviewRequest?
+    /// A link elsewhere asked the Settings window to open on this tab (Group Policy ▸ password
+    /// policy → Settings ▸ System); SettingsView takes it and clears it.
+    var requestedSettingsTab: SettingsTab?
+    /// The Group Policy page's tab (kept while the page is left; links can open a tab).
+    var groupPolicyTab: GroupPolicyTab = .overview
     private(set) var controller: ServerController
     /// Goes up every time `controller` is replaced (a profile switch, rename or wizard Cancel),
     /// so views can reload what they read from the previous one. Never reused, unlike an
@@ -266,7 +275,7 @@ final class AppModel {
     /// Domain ▸ Export CA… / Overview ▸ Save CA…: `.pem` or `.cer` (DER) by the chosen extension.
     func exportCA() {
         let panel = NSSavePanel()
-        panel.title = "Export CA certificate"
+        panel.title = "Save CA certificate"
         panel.nameFieldStringValue = "\(controller.status.netbiosDomain ?? "LabDC") CA.pem"
         panel.allowedContentTypes = [UTType(filenameExtension: "pem") ?? .data, UTType(filenameExtension: "cer") ?? .data]
         panel.allowsOtherFileTypes = true

@@ -46,3 +46,45 @@ extension DirectoryStore {
         return db.changes
     }
 }
+
+// MARK: Dynamic-update owners (CVE audit, 1 Oct 2026)
+
+extension DirectoryStore {
+    /// `dns_owners`: which client registered a name by a dynamic update and when it last did — its
+    /// address (as text) for an unsigned update, `account:<SID>:<sAMAccountName>` for a secure
+    /// (GSS-TSIG) one; only that client may change or delete the name with an unsigned update.
+    static func createDNSOwnerSchema(_ db: SQLiteConnection) throws {
+        try db.exec("""
+            CREATE TABLE IF NOT EXISTS dns_owners(
+              zone TEXT NOT NULL COLLATE NOCASE, name TEXT NOT NULL COLLATE NOCASE,
+              owner TEXT NOT NULL, updated TEXT NOT NULL,
+              PRIMARY KEY(zone, name));
+            """)
+    }
+
+    /// The recorded owner of `name` (relative to `zone`, as in `dns_records`) and when it last
+    /// registered; nil when none is recorded.
+    public func dnsOwner(zone: String, name: String) throws -> (owner: String, updated: Date)? {
+        guard let row = try db.query("SELECT owner, updated FROM dns_owners WHERE zone = ? AND name = ?",
+                                     [.text(zone), .text(name)]).first, let owner = row[0].text else { return nil }
+        return (owner, GeneralizedTime.date(row[1].text ?? "") ?? Date(timeIntervalSince1970: 0))
+    }
+
+    /// Records `owner` for `name` (updated = now), or forgets it with nil.
+    public func setDNSOwner(zone: String, name: String, owner: String?) throws {
+        if let owner {
+            try db.run("""
+                INSERT INTO dns_owners(zone, name, owner, updated) VALUES(?, ?, ?, ?)
+                ON CONFLICT(zone, name) DO UPDATE SET owner = excluded.owner, updated = excluded.updated
+                """, [.text(zone), .text(name), .text(owner), .text(nowString)])
+        } else {
+            try db.run("DELETE FROM dns_owners WHERE zone = ? AND name = ?", [.text(zone), .text(name)])
+        }
+    }
+
+    /// Whether `name` has a record an administrator created (`dynamic = 0`).
+    public func hasStaticDNSRecords(zone: String, name: String) throws -> Bool {
+        try db.scalar("SELECT 1 FROM dns_records WHERE zone = ? AND name = ? AND dynamic = 0 LIMIT 1",
+                      [.text(zone), .text(name)]) != nil
+    }
+}

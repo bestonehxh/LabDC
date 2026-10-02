@@ -96,7 +96,12 @@ public final class NetlogonService: RPCInterface, @unchecked Sendable {
     let clock: @Sendable () -> Date
     let rng: RandomBytes
     /// Wrong-password counts per account for the NAC lockout (in memory; a restart clears them).
-    let badPasswords = BadPasswordTracker()
+    /// Shared with SAMR's password-change path (`DomainControllerServices`) so both count towards
+    /// one lockout per account.
+    public let badPasswords = BadPasswordTracker()
+    /// Failed `NetrServerAuthenticate3` credential checks per computer account (`acct:`) and per
+    /// source address (`ip:`), throttled with the same thresholds as the logon lockout.
+    let authenticateFailures = BadPasswordTracker()
 
     public init(store: DirectoryStore, state: NetlogonStateStore, dcInfo: NetlogonDCInfoProvider,
                 config: NetlogonServiceConfig = .init(), rng: RandomBytes = RandomBytes(),
@@ -116,7 +121,22 @@ public final class NetlogonService: RPCInterface, @unchecked Sendable {
         }
     }
 
+    /// Opnums that run on an established secure channel (they carry a Netlogon authenticator and/or
+    /// return secrets encrypted with the session key): NetrLogonSamLogon (2), GetCapabilities (21),
+    /// GetDomainInfo (29), ServerPasswordSet2 (30), ServerPasswordGet (31), ServerTrustPasswordsGet
+    /// (42), SamLogonWithFlags (45), ServerGetTrustInfo (46). SamLogonEx (39) checks for itself.
+    static let secureChannelOpnums: Set<UInt16> = [2, 21, 29, 30, 31, 42, 45, 46]
+
     private func dispatchOp(opnum: UInt16, input: NDRReader) async throws -> NDRWriter {
+        // RequireSignOrSeal (CVE-2022-38023): over a real transport these calls must arrive on a
+        // schannel binding that signs or seals, never on the unauthenticated binding used for
+        // ReqChallenge/Authenticate3 (Windows and Samba ≥ 4.17 refuse them the same way).
+        if Self.secureChannelOpnums.contains(opnum), let call = NetlogonCallInfo.current,
+           call.isNetworkTransport, !call.isSecureRPC {
+            logEvent("opnum \(opnum)" + fromClause(account: nil)
+                     + Self.outcome(NLStatus.accessDenied, "not over secure RPC (schannel sign/seal)"))
+            throw RPCError.fault(.accessDenied)
+        }
         switch opnum {
         case 4:  return try await reqChallenge(input)
         case 26: return try await authenticate3(input)

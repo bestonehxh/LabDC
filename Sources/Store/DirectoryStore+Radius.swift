@@ -20,12 +20,26 @@ extension DirectoryStore {
         /// CVE-2024-3596). On by default; off only for an old NAS that cannot send it. EAP
         /// requests always need one (RFC 3579).
         public var requireMessageAuthenticator: Bool
+        /// RFC 5176 CoA/Disconnect: the NAS's dynamic-authorization port (3799; Cisco IOS 1700)
+        /// and how it wants to be asked (phase 5).
+        public var coaPort: UInt16
+        public var coaVendor: CoAVendor
 
         public init(id: Int64 = 0, name: String, ip: String, secret: String, enabled: Bool = true,
-                    requireMessageAuthenticator: Bool = true) {
+                    requireMessageAuthenticator: Bool = true, coaPort: UInt16 = 3799, coaVendor: CoAVendor = .generic) {
             self.id = id; self.name = name; self.ip = ip; self.secret = secret; self.enabled = enabled
             self.requireMessageAuthenticator = requireMessageAuthenticator
+            self.coaPort = coaPort; self.coaVendor = coaVendor
         }
+
+        /// Shortest shared secret a new or changed client may have (CVE audit 1 Oct 2026; RFC 6614
+        /// era guidance: at least 16 random characters, since one captured packet lets the secret be
+        /// brute-forced offline).
+        public static let minimumSecretLength = 16
+
+        /// A secret shorter than `minimumSecretLength` (kept from an older build; the RADIUS page
+        /// shows a warning).
+        public var hasWeakSecret: Bool { secret.utf8.count < Self.minimumSecretLength }
 
         /// Whether the request's source address falls in this client's address / CIDR / range
         /// (IPv4 or IPv6; a `%scope` on the source is ignored).
@@ -44,14 +58,16 @@ extension DirectoryStore {
     public func listNASSkippingUnreadable() throws -> (clients: [NASClient], unreadable: [String]) {
         var clients: [NASClient] = []
         var unreadable: [String] = []
-        for row in try db.query("SELECT id, name, ip, secret, enabled, require_ma FROM radius_nas ORDER BY id") {
+        for row in try db.query("SELECT id, name, ip, secret, enabled, require_ma, coa_port, coa_vendor FROM radius_nas ORDER BY id") {
             let name = row[1].text ?? ""
             guard let secret = try? secretBox.open(row[3].text ?? "") else {
                 unreadable.append(name.isEmpty ? "#\(row[0].int ?? 0)" : name)
                 continue
             }
             clients.append(NASClient(id: row[0].int ?? 0, name: name, ip: row[2].text ?? "", secret: secret,
-                                     enabled: row[4].int != 0, requireMessageAuthenticator: (row[5].int ?? 1) != 0))
+                                     enabled: row[4].int != 0, requireMessageAuthenticator: (row[5].int ?? 1) != 0,
+                                     coaPort: UInt16(clamping: row[6].int ?? 3799),
+                                     coaVendor: CoAVendor(rawValue: row[7].text ?? "") ?? .generic))
         }
         return (clients, unreadable)
     }
@@ -60,19 +76,22 @@ extension DirectoryStore {
     public func addNAS(_ client: NASClient) throws -> Int64 {
         try Self.validateNAS(client)
         return try transaction {
-            try db.run("INSERT INTO radius_nas(name, ip, secret, enabled, require_ma) VALUES(?,?,?,?,?)",
+            try db.run("INSERT INTO radius_nas(name, ip, secret, enabled, require_ma, coa_port, coa_vendor) VALUES(?,?,?,?,?,?,?)",
                        [SQLValue.text(client.name), .text(client.ip), .text(try secretBox.seal(client.secret)),
-                        .int(client.enabled ? 1 : 0), .int(client.requireMessageAuthenticator ? 1 : 0)])
+                        .int(client.enabled ? 1 : 0), .int(client.requireMessageAuthenticator ? 1 : 0),
+                        .int(Int64(client.coaPort)), .text(client.coaVendor.rawValue)])
             return db.lastInsertRowID
         }
     }
 
     public func updateNAS(_ client: NASClient) throws {
-        try Self.validateNAS(client)
+        let stored = try db.scalar("SELECT secret FROM radius_nas WHERE id=?", [.int(client.id)])?.text
+        try Self.validateNAS(client, existingSecret: stored.flatMap { try? secretBox.open($0) })
         try transaction {
-            try db.run("UPDATE radius_nas SET name=?, ip=?, secret=?, enabled=?, require_ma=? WHERE id=?",
+            try db.run("UPDATE radius_nas SET name=?, ip=?, secret=?, enabled=?, require_ma=?, coa_port=?, coa_vendor=? WHERE id=?",
                        [SQLValue.text(client.name), .text(client.ip), .text(try secretBox.seal(client.secret)),
-                        .int(client.enabled ? 1 : 0), .int(client.requireMessageAuthenticator ? 1 : 0), .int(Int64(client.id))])
+                        .int(client.enabled ? 1 : 0), .int(client.requireMessageAuthenticator ? 1 : 0),
+                        .int(Int64(client.coaPort)), .text(client.coaVendor.rawValue), .int(Int64(client.id))])
         }
     }
 
@@ -85,7 +104,10 @@ extension DirectoryStore {
         try listNAS().first { $0.enabled && $0.matches(ip) }
     }
 
-    static func validateNAS(_ client: NASClient) throws {
+    /// `existingSecret`: the client's stored secret when updating — a secret shorter than the
+    /// minimum that was saved before the minimum existed may stay (the NAS keeps working; the
+    /// RADIUS page warns), but no new short secret is accepted.
+    static func validateNAS(_ client: NASClient, existingSecret: String? = nil) throws {
         guard !client.name.trimmingCharacters(in: .whitespaces).isEmpty else {
             throw StoreError.constraintViolation("a RADIUS client needs a name")
         }
@@ -93,6 +115,12 @@ extension DirectoryStore {
             throw StoreError.constraintViolation("\(client.ip) is not an IP address, CIDR or range")
         }
         guard !client.secret.isEmpty else { throw StoreError.constraintViolation("a RADIUS client needs a shared secret") }
+        if client.hasWeakSecret, client.secret != existingSecret {
+            throw StoreError.constraintViolation("the shared secret must be at least \(NASClient.minimumSecretLength) characters "
+                + "(it is \(client.secret.utf8.count)); a short secret can be guessed offline from one captured packet. "
+                + "Use Generate, and set the same secret on the device")
+        }
+        guard client.coaPort != 0 else { throw StoreError.constraintViolation("the CoA port must be 1…65535") }
     }
 
     /// Open-time migration (30 Sep 2026): shared secrets written in the clear by earlier builds
@@ -112,13 +140,13 @@ extension DirectoryStore {
     // MARK: Policies
 
     public func listRadiusPolicies() throws -> [RADIUSPolicy] {
-        try db.query("SELECT id, position, name, enabled, action, rows_json, attrs_json, vlan FROM radius_policies ORDER BY position").compactMap { row -> RADIUSPolicy? in
+        try db.query("SELECT id, position, name, enabled, action, rows_json, attrs_json, vlan, allow_mab FROM radius_policies ORDER BY position").compactMap { row -> RADIUSPolicy? in
             guard let rows = try? JSONDecoder().decode([RADIUSPolicy.Row].self, from: Data(row[5].blob ?? [])),
                   let attrs = try? JSONDecoder().decode([RADIUSPolicy.ReturnedAttribute].self, from: Data(row[6].blob ?? [])) else { return nil }
             return RADIUSPolicy(id: UUID(uuidString: row[0].text ?? "") ?? UUID(), position: Int(row[1].int ?? 0),
                                 name: row[2].text ?? "?", enabled: row[3].int != 0,
                                 rows: rows, action: RADIUSPolicy.Action(rawValue: row[4].text ?? "") ?? .reject,
-                                attributes: attrs, vlan: row[7].text)
+                                attributes: attrs, vlan: row[7].text, allowsMAB: (row[8].int ?? 0) != 0)
         }
     }
 
@@ -129,13 +157,14 @@ extension DirectoryStore {
         try transaction {
             let rows = try JSONEncoder().encode(policy.rows)
             let attrs = try JSONEncoder().encode(policy.attributes)
-            try db.run("INSERT INTO radius_policies(id, position, name, enabled, action, rows_json, attrs_json, vlan) VALUES(?,?,?,?,?,?,?,?) " +
+            try db.run("INSERT INTO radius_policies(id, position, name, enabled, action, rows_json, attrs_json, vlan, allow_mab) VALUES(?,?,?,?,?,?,?,?,?) " +
                        "ON CONFLICT(id) DO UPDATE SET position=excluded.position, name=excluded.name, enabled=excluded.enabled, " +
-                       "action=excluded.action, rows_json=excluded.rows_json, attrs_json=excluded.attrs_json, vlan=excluded.vlan",
+                       "action=excluded.action, rows_json=excluded.rows_json, attrs_json=excluded.attrs_json, vlan=excluded.vlan, " +
+                       "allow_mab=excluded.allow_mab",
                        [.text(policy.id.uuidString), .int(Int64(policy.position)), .text(policy.name),
                         .int(policy.enabled ? 1 : 0), .text(policy.action.rawValue),
                         .blob([UInt8](rows)), .blob([UInt8](attrs)),
-                        policy.action == .acceptVLAN ? .text(policy.vlan ?? "") : .null])
+                        policy.action == .acceptVLAN ? .text(policy.vlan ?? "") : .null, .int(policy.allowsMAB ? 1 : 0)])
         }
     }
 
@@ -169,6 +198,17 @@ extension DirectoryStore {
         try setDomainValue(action.rawValue, forKey: "radiusDefaultAction")
     }
 
+    /// RADIUS ▸ 802.1X ▸ "Require PEAP crypto binding": PEAP clients that do not return a valid
+    /// Crypto-Binding TLV are rejected (a tunnel not bound to the inner method can be relayed by a
+    /// rogue AP). Off by default for old supplicants; on is recommended.
+    public func radiusRequirePEAPCryptoBinding() throws -> Bool {
+        try domainValue(forKey: "radiusRequirePEAPCryptoBinding") == "1"
+    }
+
+    public func setRadiusRequirePEAPCryptoBinding(_ on: Bool) throws {
+        try setDomainValue(on ? "1" : "0", forKey: "radiusRequirePEAPCryptoBinding")
+    }
+
     // MARK: Facts
 
     /// Directory facts the policy evaluator needs for one account: groups (nested membership and
@@ -178,7 +218,7 @@ extension DirectoryStore {
         var seen: Set<Int64> = []
         var names: [String] = []
         var frontier: [Int64] = [Int64(entry.id)]
-        if let rid = entry.int("primaryGroupID"), let sid = try? domainInfo().domainSID.appending(rid: UInt32(truncatingIfNeeded: rid)),
+        if let rid = try effectivePrimaryGroupRID(entry), let sid = try? domainInfo().domainSID.appending(rid: rid),
            let primary = try read(sid: sid, attrs: ["sAMAccountName"]) {
             seen.insert(Int64(primary.id))
             names.append(primary.samAccountName ?? primary.dn.rdn?.value ?? "")

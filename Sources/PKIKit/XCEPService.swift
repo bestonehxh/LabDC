@@ -247,7 +247,7 @@ public actor XCEPService {
             : "<cryptoProviders>" + providers.map { SOAP.element("provider", $0) }.joined() + "</cryptoProviders>"
         a += "</privateKeyAttributes>"
 
-        a += "<revision>" + SOAP.element("majorRevision", String(CertificateTemplate.majorVersion))
+        a += "<revision>" + SOAP.element("majorRevision", String(t.majorRevision))
             + SOAP.element("minorRevision", String(CertificateTemplate.minorVersion)) + "</revision>"
         a += SOAP.nilElement("supersededPolicies")
         a += SOAP.element("privateKeyFlags", String(UInt32(truncatingIfNeeded: TemplateDirectory.privateKeyFlag(schemaVersion: schema))))
@@ -292,7 +292,7 @@ public actor XCEPService {
     /// `szOID_CERTIFICATE_TEMPLATE`: SEQUENCE { templateID, majorVersion, minorVersion } — the value
     /// PK-1 issues.
     static func templateExtensionValue(_ t: CertificateTemplate) -> [UInt8] {
-        DERWriter.sequence([DERWriter.oid(t.oid), DERWriter.integer(Int64(CertificateTemplate.majorVersion)),
+        DERWriter.sequence([DERWriter.oid(t.oid), DERWriter.integer(Int64(t.majorRevision)),
                             DERWriter.integer(Int64(CertificateTemplate.minorVersion))])
     }
 

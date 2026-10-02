@@ -24,8 +24,9 @@ import os
 ///   domain RIDs, primary group first.
 /// `enabled` is `!ACCOUNTDISABLE`; `flags` follow `msDS-SupportedEncryptionTypes` (0x4 RC4,
 /// 0x8/0x10 AES); `salt` is the stored MS-KILE salt; `accountExpires`, `mustChangePassword`
-/// (`pwdLastSet` 0 or PASSWORD_EXPIRED, unless DONT_EXPIRE_PASSWORD) and `directoryID` come
-/// from the account.
+/// (`pwdLastSet` 0 or PASSWORD_EXPIRED, unless DONT_EXPIRE_PASSWORD), `directoryID`,
+/// `trustedForDelegation` (TRUSTED_FOR_DELEGATION) and `notDelegated` (NOT_DELEGATED) come
+/// from the account, whichever name it was asked for by.
 public struct DirectoryPrincipalStore: PrincipalStore {
     public let directory: DirectoryStore
     public let realm: String
@@ -145,6 +146,8 @@ public struct DirectoryPrincipalStore: PrincipalStore {
                          flags: flags, salt: a.salt, accountExpires: expires, mustChangePassword: mustChange,
                          supportedEncryptionTypes: a.supportedEncryptionTypes,
                          hasExplicitUPN: a.userPrincipalName != nil, directoryID: a.id,
-                         primaryGroupID: a.kind == .krbtgt ? nil : a.primaryGroupID)
+                         primaryGroupID: a.kind == .krbtgt ? nil : a.primaryGroupID,
+                         trustedForDelegation: uac & UserAccountControl.trustedForDelegation != 0,
+                         notDelegated: uac & UserAccountControl.notDelegated != 0)
     }
 }
