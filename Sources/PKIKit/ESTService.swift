@@ -13,6 +13,11 @@ import X509
 /// a valid certificate this CA issued (the renewal keeps its template and requester). Bodies
 /// are base64 (the RFC) or raw DER / PEM; replies are base64 with
 /// `Content-Transfer-Encoding: base64`.
+///
+/// `cacerts` returns the CA that issues the template in the path (else the default device
+/// template). TLS is the DC certificate (EC, from the current CA): an RSA-only device that
+/// cannot do ECDHE-ECDSA cannot use EST — it enrols for `Computer-RSA` / `User-RSA` over SCEP,
+/// whose RA for those templates is RSA and issued by the RSA compatibility root.
 public actor ESTService {
     public let ca: CAService
     private let onEvent: (@Sendable (String) -> Void)?
@@ -58,8 +63,11 @@ public actor ESTService {
         case "cacerts":
             guard request.method == "GET" || request.method == "HEAD" else { return text(405, "use GET") }
             do {
-                let authority = try await ca.pki.currentAuthority()
-                emit("EST cacerts -> CA \(authority.name) from \(request.remoteAddress)")
+                // The CA that issues the template in the path (else the default device template),
+                // so a client checks what it enrols for against the right root.
+                let t = try await ca.template(named: template ?? CAService.defaultDeviceTemplate)
+                let authority = try await ca.issuingAuthority(for: t)
+                emit("EST cacerts (\(t.name)) -> CA \(authority.name) from \(request.remoteAddress)")
                 return base64(CMS.certsOnly(certificates: [try authority.der()]), type: "application/pkcs7-mime")
             } catch {
                 return text(500, "no CA: \(error)")

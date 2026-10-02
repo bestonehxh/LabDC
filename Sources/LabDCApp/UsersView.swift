@@ -26,7 +26,7 @@ struct UsersView: View {
                 HStack(alignment: .firstTextBaseline, spacing: 24) {
                     TabPicker()
                     Spacer(minLength: 16)
-                    TextField("Search", text: $model.search)
+                    QuietTextField("Search", text: $model.search, prompt: "Search")
                         .textFieldStyle(.quiet)
                         .focused($searchFocused)
                         .frame(width: 200)
@@ -129,7 +129,7 @@ private struct UsersActions: View {
         case .people:
             Button("Add a person") { sheet = .newUser(folder: model.newObjectFolder) }
                 .buttonStyle(.quietLink)
-                .help("New user")
+                .help("New person")
         case .groups:
             Button("Add a group") { sheet = .newGroup(folder: model.newObjectFolder) }
                 .buttonStyle(.quietLink)
@@ -189,6 +189,7 @@ struct FolderFilter: View {
                 .buttonStyle(.quietLink)
                 .fixedSize()
                 .layoutPriority(1)
+                .padding(.trailing, 16)  // clear of the inspector's divider (UI audit)
                 .help("New folder (OU) in \(model.currentFolder.canHoldFolders ? model.currentFolder.name : model.snapshot.dnsDomain)")
         }
         .padding(.bottom, 2)
@@ -280,7 +281,7 @@ private struct FolderChip: View {
         } isTargeted: { targeted = $0 && acceptsTab && folder.kind != .domain }
         .background(targeted ? Theme.inset : Color.clear, in: RoundedRectangle(cornerRadius: 4))
         .contextMenu {
-            Button("New Folder…") { sheet = .newFolder(parent: folder.canHoldFolders ? folder.id : model.snapshot.root.id) }
+            Button("New folder…") { sheet = .newFolder(parent: folder.canHoldFolders ? folder.id : model.snapshot.root.id) }
             if folder.isEditable {
                 Button("Rename…") { sheet = .renameFolder(folder.id) }
                 Button("Delete…", role: .destructive) { confirmDelete = folder }
@@ -340,7 +341,7 @@ private struct PeopleTable: View {
                     case 0: Text(p.displayName).foregroundStyle(off ? Theme.faint : Theme.ink)
                             .fontWeight(selected ? .medium : .regular)
                     case 1: Text(p.username).foregroundStyle(off ? Theme.faint : Theme.muted)
-                    case 2: Text(p.groupNames.isEmpty ? "None" : p.groupsShort)
+                    case 2: Text(p.groupNames.isEmpty ? "" : p.groupsShort)  // blank, not "None" (UI audit)
                             .foregroundStyle(off || p.groupNames.isEmpty ? Theme.faint : Theme.muted)
                             .help(p.groupsText)
                     case 3: Text(status.rawValue)

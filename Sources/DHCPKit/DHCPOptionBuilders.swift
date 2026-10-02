@@ -118,12 +118,25 @@ public struct DHCPCustomOption: Codable, Sendable, Hashable, Identifiable {
         }
     }
 
+    /// v4 options the server writes itself (a custom option would override the lease time, the
+    /// message type, the server identifier or the client's own identifier).
+    public static let serverManagedV4: [UInt16: String] = [
+        51: "lease time — set the scope's lease time", 52: "option overload", 53: "message type", 54: "server identifier",
+        55: "parameter request list", 58: "renewal time T1 — derived from the lease time",
+        59: "rebinding time T2 — derived from the lease time", 61: "client identifier", 82: "relay agent information",
+    ]
+
+    /// v6 options the server writes itself.
+    public static let serverManagedV6: [UInt16: String] = [
+        1: "client identifier", 2: "server identifier", 3: "IA_NA — addresses come from the ranges", 13: "status code",
+    ]
+
     public func validate(v6: Bool = false) throws {
         guard v6 ? (1...65534).contains(code) : (1...254).contains(code) else {
             throw DHCPError.invalid("option code \(code) is out of range")
         }
-        if !v6, [0, 52, 53, 54, 55, 82, 255].contains(code) {
-            throw DHCPError.invalid("option \(code) is managed by the server")
+        if let what = v6 ? Self.serverManagedV6[code] : Self.serverManagedV4[code] {
+            throw DHCPError.invalid("option \(code) (\(what)) is set by the server and cannot be a custom option")
         }
         let data = try encode(v6: v6)
         if !v6, data.count > 255 * 4 { throw DHCPError.invalid("option \(code) is too long") }

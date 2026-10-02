@@ -19,7 +19,7 @@ enum Theme {
     /// Hairline rules between rows.
     static let line = dynamic(light: 0xE6E4DE, dark: 0x262624)
     /// Field borders and the inactive switch track.
-    static let control = dynamic(light: 0xD9D7D0, dark: 0x3A3A38)
+    static let control = dynamic(light: 0xD9D7D0, dark: 0x4A4946)  // dark: off switches and field lines were lost on the page (UI audit)
     /// The one warning colour: what went wrong, destructive actions.
     static let attention = dynamic(light: 0x9B3B2E, dark: 0xE08A7C)
     /// An action waiting to be taken (Group Policy ▸ Publish changes): the icon's bubble green.
@@ -219,6 +219,8 @@ struct QuietLinkStyle: ButtonStyle {
 
 /// The single strong action of a screen (wizard Continue, Sign): ink fill, background text.
 struct QuietPrimaryStyle: ButtonStyle {
+    /// A primary action that destroys something (Revoke): the attention colour instead of ink.
+    var destructive = false
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
@@ -227,7 +229,7 @@ struct QuietPrimaryStyle: ButtonStyle {
             .foregroundStyle(Theme.background)
             .padding(.horizontal, 22)
             .padding(.vertical, 10)
-            .background(Theme.ink, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background(destructive ? Theme.attention : Theme.ink, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .opacity(isEnabled ? (configuration.isPressed ? 0.75 : 1) : 0.3)
             .contentShape(Rectangle())
     }
@@ -269,20 +271,105 @@ extension ToggleStyle where Self == QuietToggleStyle {
 /// A text field with only a line under it (search, wizard fields).
 struct QuietFieldStyle: TextFieldStyle {
     var size: CGFloat = 13
+    /// Monospaced, for values read character by character (a password, a shared secret). The
+    /// style sets the font, so a `.font(...monospaced())` on the field itself has no effect.
+    var monospaced = false
 
     func _body(configuration: TextField<Self._Label>) -> some View {
         VStack(spacing: 4) {
+            // The placeholder: plain fields draw it nearly as dark as the value, so an empty
+            // field's example ("10.20.0.150-10.20.0.159", "this DC") looked like a saved value.
+            // Every quiet field passes `prompt: Text(…).foregroundStyle(Theme.faint)` (UI audit,
+            // 2 Oct 2026).
             configuration
                 .textFieldStyle(.plain)
-                .font(.system(size: size))
+                .font(.system(size: size, design: monospaced ? .monospaced : .default))
                 .foregroundStyle(Theme.ink)
             Rectangle().fill(Theme.control).frame(height: 1)
         }
     }
 }
 
+/// A text field whose example ("10.20.0.1", "this DC") is drawn in the faint colour. Built
+/// against the macOS 26 SDK, a plain field draws its placeholder nearly as dark as a value and
+/// ignores a styled `prompt:`, so an empty field looked filled in (UI audit, 2 Oct 2026): the
+/// example is drawn here, over the empty field, instead. Use with `.textFieldStyle(.quiet)`.
+struct QuietTextField: View {
+    let title: String
+    @Binding var text: String
+    let prompt: String
+    var axis: Axis = .horizontal
+    var secure = false
+
+    /// The style's face (`.quietMonospaced` sets it), so the example is drawn in the same face
+    /// as a value typed over it.
+    @Environment(\.quietFieldMonospaced) private var monospaced
+    private let hasExample: Bool
+
+    /// `title` is the field's name (what VoiceOver reads); `prompt` is the example drawn faint
+    /// in the empty field, and read as the hint.
+    init(_ title: String, text: Binding<String>, prompt: String? = nil, axis: Axis = .horizontal, secure: Bool = false) {
+        self.title = title
+        _text = text
+        self.prompt = prompt ?? title
+        hasExample = !(prompt ?? "").isEmpty && prompt != title
+        self.axis = axis
+        self.secure = secure
+    }
+
+    var body: some View {
+        Group {
+            if secure {
+                SecureField(title, text: $text, prompt: Text(verbatim: ""))
+            } else {
+                TextField(title, text: $text, prompt: Text(verbatim: ""), axis: axis)
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if text.isEmpty {
+                Text(verbatim: prompt)
+                    .font(.system(size: 13, design: monospaced ? .monospaced : .default))
+                    .foregroundStyle(Theme.faint)
+                    .lineLimit(1)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+        .accessibilityHint(hasExample ? prompt : "")
+    }
+}
+
+private struct QuietFieldMonospacedKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    /// Set by `.textFieldStyle(.quietMonospaced)` around the field, so `QuietTextField` draws its
+    /// example in the monospaced face too.
+    var quietFieldMonospaced: Bool {
+        get { self[QuietFieldMonospacedKey.self] }
+        set { self[QuietFieldMonospacedKey.self] = newValue }
+    }
+}
+
+extension View {
+    /// `.textFieldStyle(.quiet)` / `.textFieldStyle(.quietMonospaced)`: also tells a
+    /// `QuietTextField` inside which face the style uses, so its example is drawn in that face
+    /// (a monospaced field's example was drawn proportional). Preferred over SwiftUI's generic
+    /// `textFieldStyle(_:)` for this one style type.
+    func textFieldStyle(_ style: QuietFieldStyle) -> some View {
+        applyingTextFieldStyle(style).environment(\.quietFieldMonospaced, style.monospaced)
+    }
+
+    /// SwiftUI's generic `textFieldStyle(_:)` (a generic context, so not the overload above).
+    private func applyingTextFieldStyle<S: TextFieldStyle>(_ style: S) -> some View {
+        textFieldStyle(style)
+    }
+}
+
 extension TextFieldStyle where Self == QuietFieldStyle {
     static var quiet: QuietFieldStyle { QuietFieldStyle() }
+    static var quietMonospaced: QuietFieldStyle { QuietFieldStyle(monospaced: true) }
 }
 
 // MARK: - State as words
@@ -315,5 +402,215 @@ struct QuietNote: View {
             .font(Theme.caption)
             .foregroundStyle(attention ? Theme.attention : Theme.faint)
             .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+// MARK: - Sheets
+
+/// The one layout of every add / edit sheet (UI audit, 2 Oct 2026): the title (and an optional
+/// muted line under it) at the top, the fields under it — each label above its field, pickers
+/// left-aligned under their label — scrolling when they are taller than the window allows, then
+/// the failure (attention colour), and the footer: an optional quiet note on the left, Cancel
+/// and the primary action at the bottom right. The footer never scrolls away.
+struct QuietSheet<Content: View, Actions: View>: View {
+    let title: String
+    var subtitle: String?
+    var width: CGFloat = 480
+    /// What went wrong, above the buttons.
+    var failure: String?
+    /// A note on the left of the footer ("Saved to the list; Publish sends it to Windows.").
+    var note: String?
+    @ViewBuilder var content: Content
+    @ViewBuilder var actions: Actions
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(Theme.emphasis)
+                    .foregroundStyle(Theme.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.isHeader)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(Theme.detail)
+                        .foregroundStyle(Theme.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 24)
+            .padding(.top, 22)
+            .padding(.bottom, 16)
+            SheetScroll {
+                VStack(alignment: .leading, spacing: 14) { content }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 2)
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                if let failure {
+                    Text(failure)
+                        .font(Theme.detail)
+                        .foregroundStyle(Theme.attention)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                HStack(alignment: .center, spacing: 20) {
+                    if let note {
+                        Text(note)
+                            .font(Theme.caption)
+                            .foregroundStyle(Theme.faint)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 12)
+                    actions
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 16)
+            .padding(.bottom, 20)
+        }
+        .frame(width: width)
+        .background(Theme.background)
+        .environment(\.inSheet, true)
+    }
+}
+
+extension EnvironmentValues {
+    /// Set by `QuietSheet`: form rows put their label above the control (`GPFormRow`).
+    @Entry var inSheet = false
+    /// The most a sheet's fields may take before they scroll (nil: from the window; `--smoke` sets it).
+    @Entry var sheetContentLimit: CGFloat? = nil
+}
+
+/// A sheet's fields at their own height, scrolling only past the limit (the window's height less
+/// the sheet's title and footer), with a hairline above the footer while they scroll.
+struct SheetScroll<Content: View>: View {
+    @Environment(\.sheetContentLimit) private var limit
+    @ViewBuilder var content: Content
+    @State private var height: CGFloat = 0
+
+    @MainActor static var windowLimit: CGFloat {
+        let window = NSApp?.mainWindow ?? NSApp?.windows.first { $0.isVisible && $0.sheetParent == nil }
+        return max(260, (window?.frame.height ?? 760) - 190)
+    }
+
+    var body: some View {
+        let cap = limit ?? Self.windowLimit
+        let scrolls = height > cap + 0.5
+        ScrollView(.vertical) {
+            content
+                .fixedSize(horizontal: false, vertical: true)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .scrollIndicators(scrolls ? .automatic : .never)
+        .frame(height: max(1, min(height, cap)))
+        .overlay(alignment: .bottom) {
+            if scrolls { Rectangle().fill(Theme.line).frame(height: 1) }
+        }
+    }
+}
+
+/// A sheet field: the label above (caption, muted), the control under it, an optional note.
+struct SheetField<Control: View>: View {
+    let label: String
+    var note: String?
+    @ViewBuilder var control: Control
+
+    init(_ label: String, note: String? = nil, @ViewBuilder control: () -> Control) {
+        self.label = label
+        self.note = note
+        self.control = control()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label).font(Theme.caption).foregroundStyle(Theme.muted)
+                .fixedSize(horizontal: false, vertical: true)
+            // No maxWidth here: a narrow field (VLAN, a port) beside a wide one keeps its own
+            // width; text fields and `SheetPicker` take the room they need themselves.
+            control
+            if let note {
+                Text(note).font(Theme.caption).foregroundStyle(Theme.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+/// A sheet's pop-up menu: its natural width, left-aligned under its label.
+struct SheetPicker<Value: Hashable, Items: View>: View {
+    /// The field's name: hidden on screen (the `SheetField` label above shows it), read by VoiceOver.
+    let label: String
+    @Binding var selection: Value
+    @ViewBuilder var items: Items
+
+    init(_ label: String, selection: Binding<Value>, @ViewBuilder items: () -> Items) {
+        self.label = label
+        _selection = selection
+        self.items = items()
+    }
+
+    var body: some View {
+        Picker(label, selection: $selection) { items }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .fixedSize()
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A sheet's on/off line: the words on the left, the quiet switch at the right edge.
+struct SheetToggle: View {
+    let title: String
+    @Binding var isOn: Bool
+
+    init(_ title: String, isOn: Binding<Bool>) {
+        self.title = title
+        _isOn = isOn
+    }
+
+    var body: some View {
+        Toggle(isOn: $isOn) {
+            Text(title).font(Theme.body).foregroundStyle(Theme.ink)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .toggleStyle(.quiet)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+/// Cancel and the primary action, bottom right (Cancel closes the sheet unless told otherwise).
+struct SheetButtons: View {
+    @Environment(\.dismiss) private var dismiss
+    let primary: String
+    var role: ButtonRole?
+    var disabled = false
+    var cancelTitle = "Cancel"
+    var cancel: (() -> Void)?
+    let action: () -> Void
+
+    init(_ primary: String, role: ButtonRole? = nil, disabled: Bool = false, cancelTitle: String = "Cancel",
+         cancel: (() -> Void)? = nil, action: @escaping () -> Void) {
+        self.primary = primary
+        self.role = role
+        self.disabled = disabled
+        self.cancelTitle = cancelTitle
+        self.cancel = cancel
+        self.action = action
+    }
+
+    var body: some View {
+        HStack(spacing: 20) {
+            Button(cancelTitle, role: .cancel) { if let cancel { cancel() } else { dismiss() } }
+                .buttonStyle(.quietLink)
+                .keyboardShortcut(.cancelAction)
+            Button(primary, role: role, action: action)
+                .buttonStyle(QuietPrimaryStyle(destructive: role == .destructive))
+                .keyboardShortcut(.defaultAction)
+                .disabled(disabled)
+        }
     }
 }

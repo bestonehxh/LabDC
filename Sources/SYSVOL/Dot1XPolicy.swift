@@ -79,6 +79,11 @@ public struct Dot1XPolicy: Sendable, Equatable {
     /// the P-256 lab certificate for WPA2/WPA3, the P-384 one for 192-bit, when a machine holds
     /// both (EapTlsConnectionPropertiesV3 `FilteringInfo/CAHashList`). nil: no filter.
     public var clientIssuerThumbprint: String?
+    /// More issuers for the EAP-TLS client-certificate filter; nil = the same as
+    /// `additionalTrustedRoots`. Separate because a profile trusting another RADIUS server
+    /// replaces its server trust while clients still hold certificates from the lab roots
+    /// (old and new during a root migration).
+    public var additionalClientIssuers: [String]?
     /// More roots trusted next to `caThumbprint` (and, with a client-issuer filter, accepted as
     /// issuers too): the old root during a root migration that keeps it trusted for a while.
     public var additionalTrustedRoots: [String] = []
@@ -282,7 +287,7 @@ public struct Dot1XPolicy: Sendable, Equatable {
         return "<TLSExtensions xmlns=\"http://www.microsoft.com/provisioning/EapTlsConnectionPropertiesV2\">"
             + "<FilteringInfo xmlns=\"http://www.microsoft.com/provisioning/EapTlsConnectionPropertiesV3\">"
             + "<CAHashList Enabled=\"true\">"
-            + ([issuer] + additionalTrustedRoots).map { "<IssuerHash>\(Self.spacedThumbprint($0))</IssuerHash>" }.joined()
+            + ([issuer] + (additionalClientIssuers ?? additionalTrustedRoots)).map { "<IssuerHash>\(Self.spacedThumbprint($0))</IssuerHash>" }.joined()
             + "</CAHashList>"
             + "</FilteringInfo></TLSExtensions>"
     }
@@ -322,22 +327,29 @@ public struct Dot1XPolicy: Sendable, Equatable {
         var out = xml
         for tag in ["TrustedRootCA", "IssuerHash"] {
             let open = "<\(tag)>", close = "</\(tag)>"
-            var ranges: [Range<String.Index>] = []
-            var values: [String] = []
+            // Each profile has its own list (ServerValidation / CAHashList): a run of adjacent
+            // elements, only whitespace between them. Every run is rewritten on its own — one
+            // policy holds several profiles, and folding them into one list destroyed all but
+            // the first (2 Oct 2026 review).
+            var runs: [(range: Range<String.Index>, values: [String])] = []
             var search = out.startIndex
             while let a = out.range(of: open, range: search..<out.endIndex),
                   let b = out.range(of: close, range: a.upperBound..<out.endIndex) {
-                ranges.append(a.lowerBound..<b.upperBound)
-                values.append(String(out[a.upperBound..<b.lowerBound]).lowercased().filter(\.isHexDigit))
+                let value = String(out[a.upperBound..<b.lowerBound]).lowercased().filter(\.isHexDigit)
+                if let last = runs.last, out[last.range.upperBound..<a.lowerBound].allSatisfy(\.isWhitespace) {
+                    runs[runs.count - 1] = (last.range.lowerBound..<b.upperBound, last.values + [value])
+                } else {
+                    runs.append((a.lowerBound..<b.upperBound, [value]))
+                }
                 search = b.upperBound
             }
-            guard let first = ranges.first, let last = ranges.last, values.contains(anchor) else { continue }
-            var list = values.filter { !remove.contains($0) }
-            for t in add where !list.contains(t) { list.append(t) }
-            guard !list.isEmpty, list != values else { continue }
-            let replacement = list.map { open + spacedThumbprint($0) + close }.joined()
-            // The elements are contiguous in what we publish: replace from the first to the last.
-            out.replaceSubrange(first.lowerBound..<last.upperBound, with: replacement)
+            // Back to front, so the ranges still ahead stay valid.
+            for run in runs.reversed() where run.values.contains(anchor) {
+                var list = run.values.filter { !remove.contains($0) }
+                for t in add where !list.contains(t) { list.append(t) }
+                guard !list.isEmpty, list != run.values else { continue }
+                out.replaceSubrange(run.range, with: list.map { open + spacedThumbprint($0) + close }.joined())
+            }
         }
         return out
     }

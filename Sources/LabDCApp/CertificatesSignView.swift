@@ -98,7 +98,7 @@ struct CertificatesSignView: View {
             if sign.needsAccount(template) {
                 VStack(alignment: .leading, spacing: 6) {
                     FieldCaption("Account")
-                    TextField("Account", text: $sign.account, prompt: Text(template?.sanPolicy == .upn ? "alice" : "WS1$"))
+                    QuietTextField("Account", text: $sign.account, prompt: template?.sanPolicy == .upn ? "alice" : "WS1$")
                         .textFieldStyle(.quiet)
                         .frame(maxWidth: 320)
                         .accessibilityHint("The directory account the certificate is for; its name comes from the directory")
@@ -111,7 +111,7 @@ struct CertificatesSignView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     VStack(alignment: .leading, spacing: 6) {
                         FieldCaption("Names")
-                        TextField("Names", text: $sign.sanText, prompt: Text("dns:host.lab.sheep, ip:10.0.0.5"))
+                        QuietTextField("Names", text: $sign.sanText, prompt: "dns:host.lab.sheep, ip:10.0.0.5")
                             .textFieldStyle(.quiet)
                     }
                     Toggle("Replace the names in the request (instead of adding)", isOn: $sign.replaceSANs)
@@ -121,13 +121,13 @@ struct CertificatesSignView: View {
                     HStack(alignment: .top, spacing: 24) {
                         VStack(alignment: .leading, spacing: 6) {
                             FieldCaption("Days")
-                            TextField("Days", text: $sign.daysText, prompt: Text("\(template?.validityDays ?? 365)"))
+                            QuietTextField("Days", text: $sign.daysText, prompt: "\(template?.validityDays ?? 365)")
                                 .textFieldStyle(.quiet)
                         }
                         .frame(width: 120)
                         VStack(alignment: .leading, spacing: 6) {
                             FieldCaption("Common name")
-                            TextField("Common name", text: $sign.commonName, prompt: Text("from the request"))
+                            QuietTextField("Common name", text: $sign.commonName, prompt: "from the request")
                                 .textFieldStyle(.quiet)
                         }
                     }

@@ -41,7 +41,7 @@ public actor DNSResponder {
     /// Who may have names outside our zones resolved (forwarded).
     public let recursion: DNSRecursionPolicy
     /// UDP response rate limiting (nil: off).
-    private var rateLimiter: DNSRateLimiter?
+    private(set) var rateLimiter: DNSRateLimiter?
     /// Monotonic seconds for the rate limiter (tests inject one).
     private let uptime: @Sendable () -> TimeInterval
     /// A name's owner that has not refreshed it for this long (Windows re-registers daily; this is
@@ -71,10 +71,10 @@ public actor DNSResponder {
         self.updatePolicy = updatePolicy
         self.updateMode = updateMode
         self.secure = secure
-        self.gssKeys = DNSGSSKeyTable(limit: secure?.maxContexts ?? 1)
+        self.gssKeys = DNSGSSKeyTable(limit: secure?.maxContexts ?? 1, pendingLimit: secure?.maxPending ?? 1)
         self.onEvent = onEvent
         self.recursion = recursion
-        self.rateLimiter = rateLimit.map(DNSRateLimiter.init)
+        self.rateLimiter = rateLimit.map { DNSRateLimiter($0) }
         self.uptime = uptime
         self.serial = initialSerial ?? UInt32(truncatingIfNeeded: Int(Date().timeIntervalSince1970))
     }
@@ -86,6 +86,8 @@ public actor DNSResponder {
 
     /// Established or pending TKEY contexts (tests, diagnostics).
     public var gssContextCount: Int { gssKeys.count }
+    /// Established TKEY contexts and pending negotiations (tests, diagnostics).
+    public var gssContextCounts: (established: Int, pending: Int) { (gssKeys.establishedCount, gssKeys.pendingCount) }
 
     // MARK: Entry points
 
@@ -110,10 +112,10 @@ public actor DNSResponder {
             return try? request.responseSkeleton(rcode: .formErr).encode()
         }
         // RRL: UDP only (TCP cannot be spoofed and is how a slipped client retries).
-        if transport == .udp, var limiter = rateLimiter, let client = DNSAddress.sender(from), !client.isLoopback,
-           let name = request.questions.first?.name {
-            let verdict = limiter.check(client: client, name: name, now: uptime())
-            rateLimiter = limiter
+        // Mutated in place (optional chaining): copying the limiter out would copy its tables.
+        if transport == .udp, rateLimiter != nil, let client = DNSAddress.sender(from), !client.isLoopback,
+           let name = request.questions.first?.name,
+           let verdict = rateLimiter?.check(client: client, name: name, now: uptime()) {
             switch verdict {
             case .answer: break
             case .drop: return nil
@@ -530,13 +532,20 @@ public actor DNSResponder {
                 // Per-name ownership: only the client that registered a name may replace or
                 // delete it (no delete-then-replace of another host's name), never a static name.
                 if await source.hasStaticRecords(name: name, zone: zone) { return "\(u.name) is a static name" }
+                // A name an account registered with a secure update never falls back to unsigned
+                // updates (CVE audit 2 Oct 2026), however long since it refreshed; an address
+                // owner that stopped refreshing does after `ownerLifetime`.
                 if let owner = await source.dynamicOwner(name: name, zone: zone) {
+                    if case .account(_, let account) = owner.holder {
+                        return "\(u.name) was registered by \(account) with a secure update"
+                    }
                     if owner.holder != .address(sender), now.timeIntervalSince(owner.updated) < Self.ownerLifetime {
-                        if case .account(_, let account) = owner.holder {
-                            return "\(u.name) was registered by \(account) with a secure update"
-                        }
                         return "\(u.name) was registered by \(owner.holder)"
                     }
+                } else if !owned.isEmpty, holders.isEmpty {
+                    // Records but no owner and no address: put there by this Mac or an
+                    // administrator (an unsigned update only ever adds A/AAAA, and records its owner).
+                    return "\(u.name) was not registered by an unsigned update"
                 } else if holders.contains(where: { $0 != sender }) {
                     // Registered before owners were recorded: its addresses say whose it is.
                     return "\(u.name) belongs to another host"

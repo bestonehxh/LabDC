@@ -108,11 +108,13 @@ enum Smoke {
         await shot("settings-general", width: 620, height: 560, SettingsView(tab: .general))
         await shot("settings-directory", width: 620, height: 560, SettingsView(tab: .directory))
         await shot("settings-backup", width: 620, height: 560, SettingsView(tab: .backup))
+        // UI audit: every page, tab and sheet light | dark at the minimum and a typical size (ui-8-*.png).
+        let audit = await AuditSmoke.run(model: model, out: out)
 
         await model.controller.stop()
         print("smoke: wrote \(written.count) screenshots to \(out.path): \(written.joined(separator: ", "))")
         return written.count - usersShots.count == 3 + SidebarItem.allCases.count + 1 + 3 + DeviceKind.allCases.count + 2
-            && usersShots.count == 5 && ui3 && dhcp && groupPolicy
+            && usersShots.count == 5 && ui3 && dhcp && groupPolicy && audit > 100
     }
 
     /// Lays `view` out in an off-screen window and writes a PNG of it (`cacheDisplay`, so

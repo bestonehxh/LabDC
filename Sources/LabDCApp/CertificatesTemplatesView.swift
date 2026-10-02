@@ -145,114 +145,117 @@ struct TemplateEditorSheet: View {
     @State private var advanced = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            Form {
-                Section("General") {
+        QuietSheet(title: draft.isNew ? "New template" : "Edit \(draft.original.displayName)", width: 560,
+                   note: "Saved and published to the directory; Windows sees it at its next policy refresh.") {
+            if draft.isNew {
+                SheetField("Name", note: "Letters, digits and hyphens.") {
+                    QuietTextField("Name", text: $draft.name, prompt: "WebServer2").textFieldStyle(.quiet)
+                        .autocorrectionDisabled()
+                }
+            }
+            SheetField("Display name") {
+                QuietTextField("Display name", text: $draft.displayName, prompt: "Web server").textFieldStyle(.quiet)
+            }
+            SheetToggle("Enabled", isOn: $draft.enabled)
+            HStack(alignment: .top, spacing: 32) {
+                SheetField("Valid for") {
+                    Stepper("\(draft.validityDays) days", value: $draft.validityDays, in: 1...36500, step: 1)
+                        .font(Theme.body).foregroundStyle(Theme.ink).fixedSize()
+                }
+                .fixedSize()
+                SheetField("Renew") {
+                    Stepper("\(draft.renewalDays) days before expiry", value: $draft.renewalDays, in: 0...36499)
+                        .font(Theme.body).foregroundStyle(Theme.ink).fixedSize()
+                }
+            }
+
+            section("Purpose")
+            ForEach(TemplateDraft.knownEKUs, id: \.oid) { eku in
+                SheetToggle(eku.name, isOn: Binding(get: { draft.ekus.contains(eku.oid) }, set: { on in
+                    if on { draft.ekus.insert(eku.oid) } else { draft.ekus.remove(eku.oid) }
+                }))
+            }
+
+            section("Key usage")
+            ForEach(TemplateDraft.keyUsages, id: \.1) { usage, name in
+                SheetToggle(name, isOn: Binding(get: { draft.keyUsage.contains(usage) }, set: { on in
+                    if on { draft.keyUsage.insert(usage) } else { draft.keyUsage.remove(usage) }
+                }))
+            }
+
+            section("Names and keys")
+            SheetField("Alternative names") {
+                SheetPicker("Alternative names", selection: $draft.sanPolicy) {
+                    ForEach(SANPolicy.allCases, id: \.self) { Text(TemplateDraft.sanPolicyTitle($0)).tag($0) }
+                }
+            }
+            ForEach(TemplateDraft.keyTypes, id: \.0) { key, name in
+                SheetToggle("Allow \(name) keys", isOn: Binding(get: { draft.allowedKeyTypes.contains(key) }, set: { on in
+                    if on { draft.allowedKeyTypes.insert(key) } else { draft.allowedKeyTypes.remove(key) }
+                }))
+            }
+            SheetField("Smallest RSA key") {
+                SheetPicker("Smallest RSA key", selection: $draft.minKeyBits) {
+                    ForEach([1024, 2048, 3072, 4096], id: \.self) { Text("\($0) bits").tag($0) }
+                }
+            }
+            .disabled(!draft.allowedKeyTypes.contains("rsa"))
+
+            section("Enrollment")
+            SheetToggle("Auto-enroll (Windows PCs and users get it by themselves)", isOn: $draft.autoEnroll)
+            SheetToggle("Administrator approval (only signed here or by an admin)", isOn: $draft.manualApproval)
+            Text("Groups that may enroll (their members, computers included)")
+                .font(Theme.caption).foregroundStyle(Theme.muted)
+                .padding(.top, 4)
+            ForEach(groups) { g in
+                SheetToggle(g.name, isOn: Binding(get: { draft.groupSIDs.contains(g.sid) }, set: { _ in draft.toggleGroup(g.sid) }))
+            }
+            ForEach(draft.groupSIDs.filter { sid in !groups.contains { $0.sid == sid } }, id: \.self) { sid in
+                SheetToggle(sid, isOn: Binding(get: { true }, set: { _ in draft.toggleGroup(sid) }))
+            }
+
+            Button(advanced ? "Hide advanced" : "Advanced") { advanced.toggle() }
+                .buttonStyle(.quietLink)
+                .padding(.top, 8)
+                .accessibilityValue(advanced ? "Shown" : "Hidden")
+            if advanced {
+                // A new template gets its own OID when it is created, not the base's (owner review, 30 Sep 2026).
+                SheetField("Template OID") {
                     if draft.isNew {
-                        TextField("Name (letters, digits, hyphens)", text: $draft.name)
-                            .autocorrectionDisabled()
-                    }
-                    TextField("Display name", text: $draft.displayName)
-                    Toggle("Enabled", isOn: $draft.enabled)
-                    Stepper("Valid for \(draft.validityDays) days", value: $draft.validityDays, in: 1...36500, step: 1)
-                    Stepper("Renew \(draft.renewalDays) days before expiry", value: $draft.renewalDays, in: 0...36499)
-                }
-                Section("Purpose") {
-                    ForEach(TemplateDraft.knownEKUs, id: \.oid) { eku in
-                        Toggle(eku.name, isOn: Binding(get: { draft.ekus.contains(eku.oid) }, set: { on in
-                            if on { draft.ekus.insert(eku.oid) } else { draft.ekus.remove(eku.oid) }
-                        }))
+                        Text("A new OID on create").font(Theme.body).foregroundStyle(Theme.muted)
+                    } else {
+                        Text(draft.original.oid).font(Theme.body).foregroundStyle(Theme.ink).textSelection(.enabled)
                     }
                 }
-                Section("Key usage") {
-                    ForEach(TemplateDraft.keyUsages, id: \.1) { usage, name in
-                        Toggle(name, isOn: Binding(get: { draft.keyUsage.contains(usage) }, set: { on in
-                            if on { draft.keyUsage.insert(usage) } else { draft.keyUsage.remove(usage) }
-                        }))
-                    }
-                }
-                Section("Names and keys") {
-                    Picker("Alternative names", selection: $draft.sanPolicy) {
-                        ForEach(SANPolicy.allCases, id: \.self) { Text(TemplateDraft.sanPolicyTitle($0)).tag($0) }
-                    }
-                    ForEach(TemplateDraft.keyTypes, id: \.0) { key, name in
-                        Toggle("Allow \(name) keys", isOn: Binding(get: { draft.allowedKeyTypes.contains(key) }, set: { on in
-                            if on { draft.allowedKeyTypes.insert(key) } else { draft.allowedKeyTypes.remove(key) }
-                        }))
-                    }
-                    Picker("Smallest RSA key", selection: $draft.minKeyBits) {
-                        ForEach([1024, 2048, 3072, 4096], id: \.self) { Text("\($0) bits").tag($0) }
-                    }
-                    .disabled(!draft.allowedKeyTypes.contains("rsa"))
-                }
-                Section {
-                    Toggle("Auto-enroll (Windows PCs and users get it by themselves)", isOn: $draft.autoEnroll)
-                    Toggle("Administrator approval (only signed here or by an admin)", isOn: $draft.manualApproval)
-                    ForEach(groups) { g in
-                        Toggle(g.name, isOn: Binding(get: { draft.groupSIDs.contains(g.sid) }, set: { _ in draft.toggleGroup(g.sid) }))
-                    }
-                    ForEach(draft.groupSIDs.filter { sid in !groups.contains { $0.sid == sid } }, id: \.self) { sid in
-                        Toggle(sid, isOn: Binding(get: { true }, set: { _ in draft.toggleGroup(sid) }))
-                    }
-                } header: {
-                    Text("Enrollment")
-                } footer: {
-                    Text("Groups that may enroll for this template (their members, computers included).").font(Theme.caption)
-                }
-                Section {
-                    Button(advanced ? "Hide advanced" : "Advanced") { advanced.toggle() }
-                        .buttonStyle(.quietLink)
-                        .accessibilityValue(advanced ? "Shown" : "Hidden")
-                    if advanced {
-                        // A new template gets its own OID when it is created, not the base's (owner review, 30 Sep 2026).
-                        LabeledContent("Template OID") {
-                            if draft.isNew {
-                                Text("A new OID on create").font(Theme.detail).foregroundStyle(Theme.muted)
-                            } else {
-                                Text(draft.original.oid).font(Theme.mono).textSelection(.enabled)
-                            }
-                        }
-                        TextField("Other purposes (OIDs)", text: $draft.customEKUs, prompt: Text("1.3.6.1.5.5.7.3.9"))
-                    }
-                }
-                if let warning = draft.template.esc1Warning() {
-                    Section {
-                        Text(warning).font(Theme.detail).foregroundStyle(Theme.attention)
-                            .accessibilityLabel("Warning: \(warning)")
-                    }
-                }
-                if !draft.errors.isEmpty {
-                    Section {
-                        ForEach(draft.errors, id: \.self) { e in
-                            Text(e).font(Theme.detail).foregroundStyle(Theme.attention)
-                        }
-                    }
+                SheetField("Other purposes (OIDs)") {
+                    QuietTextField("Other purposes (OIDs)", text: $draft.customEKUs, prompt: "1.3.6.1.5.5.7.3.9").textFieldStyle(.quietMonospaced)
                 }
             }
-            .formStyle(.grouped)
-            .toggleStyle(.quiet)
-            .scrollContentBackground(.hidden)
-            HStack(spacing: 24) {
-                QuietNote("Saved to the store and published to the directory (Windows sees the change at its next policy refresh).")
-                Spacer(minLength: 12)
-                Button("Cancel", role: .cancel) { dismiss() }
-                    .buttonStyle(.quietLink)
-                    .keyboardShortcut(.cancelAction)
-                Button("Save") {
-                    working = true
-                    Task {
-                        if await onSave(draft.template) { dismiss() }
-                        working = false
-                    }
-                }
-                .buttonStyle(.quietPrimary)
-                .keyboardShortcut(.defaultAction)
-                .disabled(!draft.isValid || !draft.hasChanges || working)
+            if let warning = draft.template.esc1Warning() {
+                Text(warning).font(Theme.detail).foregroundStyle(Theme.attention)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Warning: \(warning)")
             }
-            .padding(16)
+            ForEach(draft.errors, id: \.self) { e in
+                Text(e).font(Theme.detail).foregroundStyle(Theme.attention)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } actions: {
+            SheetButtons("Save", disabled: !draft.isValid || !draft.hasChanges || working) {
+                working = true
+                Task {
+                    if await onSave(draft.template) { dismiss() }
+                    working = false
+                }
+            }
         }
-        .frame(width: 560, height: 640)
-        .background(Theme.background)
         .navigationTitle(draft.isNew ? "New template" : "Template \(draft.original.displayName)")
+    }
+
+    /// A group title inside the sheet, with room above it.
+    private func section(_ title: String) -> some View {
+        Text(title).font(Theme.emphasis).foregroundStyle(Theme.ink)
+            .padding(.top, 10)
+            .accessibilityAddTraits(.isHeader)
     }
 }

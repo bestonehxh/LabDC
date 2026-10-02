@@ -184,8 +184,11 @@ final class AppModel {
         startOverBackup = nil
         if profilesApply { AppProfile.setActive(name) }
         let data = launch.data ?? (AppProfile.named(name)?.url ?? AppProfile.url(for: name))
-        // The old controller must never start again (a restart or rename it still has pending).
+        // The old controller must never start again (a restart or rename it still has pending),
+        // and its sockets must be closed before the next controller binds the same ports: a stop
+        // during `.starting` used to start the next profile while they were still held.
         await controller.retire()
+        await controller.stopAndWaitForPorts()
         controller = ServerController(dataDirectory: data, portOverride: launch.ports, echo: launch.echo)
         controllerGeneration += 1
         logModel.attach(controller.logs)

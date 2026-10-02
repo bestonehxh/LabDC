@@ -6,8 +6,8 @@ import Store
 import SwiftASN1
 import X509
 
-/// The SCEP registration authority: an RSA-2048 certificate issued by the current CA
-/// (`<ca dir>/scep-ra.pem` + `scep-ra-key.pem`). Devices encrypt their requests to it and it
+/// The SCEP registration authority: an RSA-2048 certificate issued by a CA (the current one, or
+/// the issuer of the template `GetCACert` asks about) (`<ca dir>/scep-ra.pem` + `scep-ra-key.pem`). Devices encrypt their requests to it and it
 /// signs the replies; a P-256 CA cannot do RSA key transport, so SCEP always needs one.
 public struct SCEPRegistrationAuthority: Sendable {
     public let caName: String
@@ -39,7 +39,8 @@ public struct SCEPRegistrationAuthority: Sendable {
 public actor SCEPService {
     public let ca: CAService
     private let onEvent: (@Sendable (String) -> Void)?
-    private var ra: SCEPRegistrationAuthority?
+    /// The RA of each CA that answered a `GetCACert` (by CA name, lower-case).
+    private var ras: [String: SCEPRegistrationAuthority] = [:]
     private var transactions: [String: Transaction] = [:]
     private let logger = Logger(subsystem: "dev.labdc.app", category: "scep")
 
@@ -112,18 +113,22 @@ public actor SCEPService {
 
     // MARK: - Registration authority
 
-    /// Loads the RA of the current CA, issuing a new one when it is missing, issued by another
-    /// CA or within 30 days of expiry. Returns it and whether it was issued now.
+    /// Loads the RA of `caName` (default: the current CA), issuing a new one when it is missing,
+    /// issued by another CA or within 30 days of expiry. Returns it and whether it was issued now.
+    /// Each CA has its own RA (RSA-2048, signed by that CA: RSA-signed under the RSA
+    /// compatibility root), so a device checks the RA against the root its template issues from.
     @discardableResult
-    public func prepare() async throws -> (ra: SCEPRegistrationAuthority, issued: Bool) {
-        let authority = try await ca.pki.currentAuthority()
-        if let ra, ra.caName == authority.name, Self.usable(ra.certificate, ca: authority, now: ca.clock()) { return (ra, false) }
+    public func prepare(caName: String? = nil) async throws -> (ra: SCEPRegistrationAuthority, issued: Bool) {
+        let authority: CertificateAuthority
+        if let caName { authority = try await ca.pki.authority(named: caName) } else { authority = try await ca.pki.currentAuthority() }
+        let key = authority.name.lowercased()
+        if let ra = ras[key], Self.usable(ra.certificate, ca: authority, now: ca.clock()) { return (ra, false) }
         let dir = ca.pki.caDirectory(authority.name)
         let certURL = dir.appendingPathComponent(SCEPRegistrationAuthority.certificateFileName)
         let keyURL = dir.appendingPathComponent(SCEPRegistrationAuthority.keyFileName)
         if let loaded = try? Self.load(certURL: certURL, keyURL: keyURL, caName: authority.name),
            Self.usable(loaded.certificate, ca: authority, now: ca.clock()) {
-            ra = loaded
+            ras[key] = loaded
             return (loaded, false)
         }
         let issued = try await issueRA(authority: authority)
@@ -131,7 +136,7 @@ public actor SCEPService {
         try SecureFiles.write(Array(issued.signingKey.pkcs8PEMRepresentation.utf8), to: keyURL, mode: 0o600)
         try await ca.record(issued.certificate, caName: authority.name, templateName: SCEPRegistrationAuthority.templateName,
                             requester: RequesterIdentity(name: "SCEP RA"))
-        ra = issued
+        ras[key] = issued
         logger.info("issued SCEP RA certificate \(LabPKI.hex(issued.certificate.serialNumber), privacy: .public) from CA \(authority.name, privacy: .public)")
         return (issued, true)
     }
@@ -209,8 +214,11 @@ public actor SCEPService {
             return .init(status: 200, contentType: "text/plain", body: Array((Self.capabilities.joined(separator: "\n") + "\n").utf8))
         case "getcacert", "getcacertchain":
             do {
-                let ra = try await prepare().ra
-                let authority = try await ca.pki.authority(named: ra.caName)
+                // `message` (RFC 8894 §4.2: the CA identifier) may name a template or a CA; else
+                // the default device template. The CA that issues it, and its RA, answer.
+                let message = request.query.first { $0.key.lowercased() == "message" }?.value
+                let authority = try await caForGetCACert(message)
+                let ra = try await prepare(caName: authority.name).ra
                 let body = CMS.certsOnly(certificates: [ra.der, try authority.der()])
                 let chain = operation.lowercased() == "getcacertchain"
                 emit("SCEP \(chain ? "GetCACertChain" : "GetCACert") -> RA + CA \(authority.name) from \(request.remoteAddress)")
@@ -279,9 +287,46 @@ public actor SCEPService {
         var device = "?"
     }
 
+    /// The CA `GetCACert` answers with: the issuer of the template `message` names, the CA it
+    /// names, or the issuer of the default device template.
+    func caForGetCACert(_ message: String?) async throws -> CertificateAuthority {
+        if let message, !message.isEmpty {
+            if let t = try? await ca.template(named: message) { return try await ca.issuingAuthority(for: t) }
+            if let named = try? await ca.pki.authority(named: message), (try? await ca.checkMayIssue(from: named)) != nil {
+                return named
+            }
+        }
+        return try await ca.issuingAuthority(for: try await ca.template(named: CAService.defaultDeviceTemplate))
+    }
+
+    /// The RA a request was encrypted to: the current CA's, or another CA's RA handed out by
+    /// `GetCACert` (in memory or on disk; never issued here).
+    func registrationAuthority(for message: [UInt8]) async throws -> SCEPRegistrationAuthority {
+        let current = try await prepare().ra
+        guard let signed = try? CMSSignedMessage.parse(message), let content = signed.content,
+              let envelope = try? CMSEnvelopedMessage.parse(content) else { return current }
+        func addressed(_ ra: SCEPRegistrationAuthority) -> Bool {
+            envelope.recipients.contains { $0.rid.matches(ra.certificate, der: ra.der) }
+        }
+        if addressed(current) { return current }
+        for authority in try await ca.pki.authorities() where authority.name != current.caName {
+            var ra = ras[authority.name.lowercased()]
+            if ra == nil {
+                let dir = ca.pki.caDirectory(authority.name)
+                ra = try? Self.load(certURL: dir.appendingPathComponent(SCEPRegistrationAuthority.certificateFileName),
+                                    keyURL: dir.appendingPathComponent(SCEPRegistrationAuthority.keyFileName), caName: authority.name)
+            }
+            if let ra, Self.usable(ra.certificate, ca: authority, now: ca.clock()), addressed(ra) {
+                ras[authority.name.lowercased()] = ra
+                return ra
+            }
+        }
+        return current
+    }
+
     func pkiOperation(_ message: [UInt8], remote: String) async -> PKIHTTPServer.Response {
         let ra: SCEPRegistrationAuthority
-        do { ra = try await prepare().ra } catch {
+        do { ra = try await registrationAuthority(for: message) } catch {
             return .init(status: 500, contentType: "text/plain", body: Array("SCEP RA unavailable: \(error)\n".utf8))
         }
         let signed: CMSSignedMessage

@@ -127,6 +127,12 @@ public struct RADIUSDuplicateCache: Sendable {
         entries[key] = (.reply(reply), now)
     }
 
+    /// Forgets `key` (a request that was not answered and must not be remembered as dropped: an
+    /// Accounting-Request whose record could not be stored — its retransmission is handled anew).
+    public mutating func forget(_ key: Key) {
+        entries[key] = nil
+    }
+
     public mutating func prune(now: Date) {
         entries = entries.filter { now.timeIntervalSince($0.value.at) < lifetime }
     }

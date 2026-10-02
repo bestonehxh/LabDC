@@ -220,11 +220,15 @@ public enum CACommands {
 
         case .use(let name):
             let pki = try await openPKI(dir)
-            do { try await pki.useCA(name: name) } catch { throw CLIError.failure("\(error)") }
+            let hasStore = FileManager.default.fileExists(atPath: dir.storeURL.path)
+            do {
+                // With a store, a retired CA made current is un-retired (trusted again).
+                if hasStore { try await openService(dir, pki: pki).useCA(name: name, publish: false) } else { try await pki.useCA(name: name) }
+            } catch let e as CLIError { throw e } catch { throw CLIError.failure("\(error)") }
             let ca = try await pki.currentAuthority()
             out("current CA is now \(ca.name) (\(ca.certificate.subject)); restart `labdc serve` to reissue the DC certificate from it")
             out("clients must trust \(ca.certificateURL.path)")
-            if FileManager.default.fileExists(atPath: dir.storeURL.path) {
+            if hasStore {
                 try await publish(try await openService(dir, pki: pki), out: out)
             }
 

@@ -427,8 +427,8 @@ struct GroupPolicyView: View {
             VStack(alignment: .leading, spacing: 10) {
                 GPFormRow("Trusted roots") {
                     HStack(alignment: .firstTextBaseline, spacing: 16) {
-                        Text(s.trustedRoots.isEmpty ? "None" : s.trustedRoots.joined(separator: ", "))
-                            .font(Theme.body).foregroundStyle(Theme.ink)
+                        Text(s.trustedRoots.isEmpty ? "No trusted roots yet" : s.trustedRoots.joined(separator: ", "))
+                            .font(Theme.body).foregroundStyle(s.trustedRoots.isEmpty ? Theme.muted : Theme.ink)
                             .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
                         Button("Certificates ▸ Trusted roots") {
                             model.certificates.section = .trustedRoots
@@ -593,10 +593,12 @@ struct GPProfileTable<Actions: View>: View {
 }
 
 /// A label in the label column, the control after it (left-aligned, never pushed to the far edge).
+/// In a sheet the label goes above the control, like every other sheet (UI audit, 2 Oct 2026).
 struct GPFormRow<Control: View>: View {
     let label: String
     var alignment: VerticalAlignment = .firstTextBaseline
     @ViewBuilder var control: Control
+    @Environment(\.inSheet) private var inSheet
 
     init(_ label: String, alignment: VerticalAlignment = .firstTextBaseline, @ViewBuilder control: () -> Control) {
         self.label = label
@@ -605,24 +607,44 @@ struct GPFormRow<Control: View>: View {
     }
 
     var body: some View {
-        HStack(alignment: alignment, spacing: 16) {
-            Text(label)
-                .font(Theme.body).foregroundStyle(Theme.muted)
-                .frame(width: GroupPolicyLayout.labelWidth, alignment: .leading)
-            control
-                .frame(maxWidth: .infinity, alignment: .leading)
+        if inSheet {
+            SheetField(label) { control }
+        } else {
+            HStack(alignment: alignment, spacing: 16) {
+                Text(label)
+                    .font(Theme.body).foregroundStyle(Theme.muted)
+                    .frame(width: GroupPolicyLayout.labelWidth, alignment: .leading)
+                control
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 }
 
-/// A pop-up choice drawn as a quiet link: the current value, a menu of the others.
+/// A pop-up choice drawn as a quiet link: the current value, a menu of the others. In a sheet,
+/// the pop-up menu every sheet uses (`SheetPicker`).
 struct QuietChoice<Value: Hashable>: View {
+    /// The field's name (the row's label), read by VoiceOver.
+    let label: String
     let options: [Value]
     let title: KeyPath<Value, String>
     @Binding var selection: Value
     var disabled: (Value) -> Bool = { _ in false }
+    @Environment(\.inSheet) private var inSheet
 
     var body: some View {
+        if inSheet {
+            SheetPicker(label, selection: $selection) {
+                ForEach(options, id: \.self) { option in
+                    Text(option[keyPath: title]).tag(option).selectionDisabled(disabled(option))
+                }
+            }
+        } else {
+            link
+        }
+    }
+
+    private var link: some View {
         Menu(selection[keyPath: title]) {
             ForEach(options, id: \.self) { option in
                 Button(option[keyPath: title]) { selection = option }
@@ -632,6 +654,8 @@ struct QuietChoice<Value: Hashable>: View {
         .menuStyle(.button)
         .buttonStyle(.quietLink)
         .fixedSize()
+        .accessibilityLabel(label)
+        .accessibilityValue(selection[keyPath: title])
     }
 }
 
@@ -710,37 +734,31 @@ struct WiFiProfileSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text(profile == nil ? "New Wi-Fi profile" : "Edit “\(profile?.name ?? "")”")
-                .font(Theme.emphasis).foregroundStyle(Theme.ink)
-            VStack(alignment: .leading, spacing: 14) {
+        QuietSheet(title: profile == nil ? "New Wi-Fi profile" : "Edit “\(profile?.name ?? "")”", width: 600,
+                   failure: failure ?? problem, note: "Saved to the list; Publish sends it to Windows.") {
                 GPFormRow("Profile name") {
-                    TextField("Staff", text: $name)
+                    QuietTextField("Profile name", text: $name, prompt: "Staff")
                         .textFieldStyle(.quiet)
                         .onChange(of: name) { _, new in if ssidFollowsName { ssidText = new } }
                 }
-                GPFormRow("Network name (SSID)") {
-                    VStack(alignment: .leading, spacing: 4) {
-                        TextField("Staff", text: Binding(get: { ssidText }, set: { ssidText = $0; ssidFollowsName = false }))
-                            .textFieldStyle(.quiet)
-                        Text("As the access points broadcast it (case-sensitive). Several SSIDs: separate with commas.")
-                            .font(Theme.caption).foregroundStyle(Theme.faint)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+                SheetField("Network name (SSID)",
+                           note: "As the access points broadcast it (case-sensitive). Several SSIDs: separate with commas.") {
+                    QuietTextField("Network name (SSID)", text: Binding(get: { ssidText }, set: { ssidText = $0; ssidFollowsName = false }), prompt: "Staff")
+                        .textFieldStyle(.quiet)
                 }
                 GPFormRow("Security") {
-                    QuietChoice(options: Dot1XPolicy.Security.allCases, title: \.title,
+                    QuietChoice(label: "Security", options: Dot1XPolicy.Security.allCases, title: \.title,
                                 selection: Binding(get: { security }, set: { s in
                                     security = s
                                     if s == .wpa3Suite192 { method = .tls }
                                 }))
                 }
                 GPFormRow("Method") {
-                    QuietChoice(options: Dot1XPolicy.Method.allCases, title: \.title, selection: $method,
+                    QuietChoice(label: "Method", options: Dot1XPolicy.Method.allCases, title: \.title, selection: $method,
                                 disabled: { security == .wpa3Suite192 && $0 != .tls })
                 }
                 GPFormRow("Sign in as") {
-                    QuietChoice(options: Dot1XPolicy.AuthMode.allCases, title: \.title, selection: $signInAs)
+                    QuietChoice(label: "Sign in as", options: Dot1XPolicy.AuthMode.allCases, title: \.title, selection: $signInAs)
                 }
                 RadiusServerFields(choice: $server, certificates: certificates)
                 ServerValidationFields(validation: $validation)
@@ -758,34 +776,16 @@ struct WiFiProfileSheet: View {
                         check("Cache user information for later connections", $cacheUserData)
                     }
                 }
-            }
-            Text(methodNote).font(Theme.detail).foregroundStyle(Theme.muted)
-                .fixedSize(horizontal: false, vertical: true)
+            QuietNote(methodNote)
             if published, let old = profile?.name, name.trimmingCharacters(in: .whitespaces) != old,
                !name.trimmingCharacters(in: .whitespaces).isEmpty {
-                Text("Renaming removes the profile named “\(old)” from PCs at their next gpupdate; they get “\(name.trimmingCharacters(in: .whitespaces))” instead.")
-                    .font(Theme.detail).foregroundStyle(Theme.muted)
-                    .fixedSize(horizontal: false, vertical: true)
+                QuietNote("Renaming removes the profile named “\(old)” from PCs at their next gpupdate; they get “\(name.trimmingCharacters(in: .whitespaces))” instead.")
             }
-            if let message = failure ?? problem {
-                Text(message).font(Theme.detail).foregroundStyle(Theme.attention)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            HStack(spacing: 20) {
-                Text("Saved to the list; Publish sends it to Windows.")
-                    .font(Theme.caption).foregroundStyle(Theme.faint)
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button("Save") {
-                    do { try save(candidate, server.pendingRoots); dismiss() } catch { failure = "\(error)" }
-                }
-                .buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
-                .disabled(!canSave)
+        } actions: {
+            SheetButtons("Save", disabled: !canSave) {
+                do { try save(candidate, server.pendingRoots); dismiss() } catch { failure = "\(error)" }
             }
         }
-        .padding(24)
-        .frame(width: 680)
-        .background(Theme.background)
         .onAppear {
             guard let p = profile else { return }
             name = p.name; ssidText = p.ssids.joined(separator: ", "); ssidFollowsName = p.ssids == [p.name]
@@ -854,54 +854,32 @@ struct WiredProfileSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text(profile == nil ? "New wired policy" : "Edit “\(Self.profileName)”")
-                .font(Theme.emphasis).foregroundStyle(Theme.ink)
-            VStack(alignment: .leading, spacing: 14) {
-                GPFormRow("Profile name") {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(Self.profileName).font(Theme.body).foregroundStyle(Theme.ink)
-                        Text("A wired policy carries one profile, used on every wired adapter.")
-                            .font(Theme.caption).foregroundStyle(Theme.faint)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+        QuietSheet(title: profile == nil ? "New wired policy" : "Edit “\(Self.profileName)”", width: 600,
+                   failure: failure ?? server.problem(certificates: certificates, suiteB: false),
+                   note: "Saved to the list; Publish sends it to Windows.") {
+                SheetField("Profile name", note: "A wired policy carries one profile, used on every wired adapter.") {
+                    Text(Self.profileName).font(Theme.body).foregroundStyle(Theme.ink)
                 }
                 GPFormRow("Method") {
-                    QuietChoice(options: Dot1XPolicy.Method.allCases, title: \.title, selection: $method)
+                    QuietChoice(label: "Method", options: Dot1XPolicy.Method.allCases, title: \.title, selection: $method)
                 }
                 GPFormRow("Sign in as") {
-                    QuietChoice(options: Dot1XPolicy.AuthMode.allCases, title: \.title, selection: $signInAs)
+                    QuietChoice(label: "Sign in as", options: Dot1XPolicy.AuthMode.allCases, title: \.title, selection: $signInAs)
                 }
                 RadiusServerFields(choice: $server, certificates: certificates)
                 ServerValidationFields(validation: $validation)
                 GPFormRow("Connection") {
-                    Text("Automatic: Windows signs in when a cable is plugged in.").font(Theme.body).foregroundStyle(Theme.muted)
+                    Text("Automatic: Windows signs in when a cable is plugged in.").font(Theme.body).foregroundStyle(Theme.ink)
                 }
-            }
-            Text(method == .tls
+            QuietNote(method == .tls
                  ? "EAP-TLS signs in with the auto-enrolled Computer or User certificate."
                  : "PEAP-MSCHAPv2 signs in with the Windows password.")
-                .font(Theme.detail).foregroundStyle(Theme.muted)
-                .fixedSize(horizontal: false, vertical: true)
-            if let message = failure ?? server.problem(certificates: certificates, suiteB: false) {
-                Text(message).font(Theme.detail).foregroundStyle(Theme.attention)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            HStack(spacing: 20) {
-                Text("Saved to the list; Publish sends it to Windows.")
-                    .font(Theme.caption).foregroundStyle(Theme.faint)
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button(profile == nil ? "Create" : "Save") {
-                    do { try save(candidate, server.pendingRoots); dismiss() } catch { failure = "\(error)" }
-                }
-                .buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
-                .disabled(!server.complete || server.problem(certificates: certificates, suiteB: false) != nil)
+        } actions: {
+            SheetButtons(profile == nil ? "Create" : "Save",
+                         disabled: !server.complete || server.problem(certificates: certificates, suiteB: false) != nil) {
+                do { try save(candidate, server.pendingRoots); dismiss() } catch { failure = "\(error)" }
             }
         }
-        .padding(24)
-        .frame(width: 680)
-        .background(Theme.background)
     }
 }
 
@@ -1024,12 +1002,12 @@ struct RadiusServerFields: View {
 
     var body: some View {
         GPFormRow("RADIUS server") {
-            QuietChoice(options: RadiusServerChoice.Kind.allCases, title: \.title, selection: $choice.kind)
+            QuietChoice(label: "RADIUS server", options: RadiusServerChoice.Kind.allCases, title: \.title, selection: $choice.kind)
         }
         if choice.kind == .other {
             GPFormRow("Server name(s)") {
                 VStack(alignment: .leading, spacing: 4) {
-                    TextField("cppm.lab.sheep", text: $choice.namesText).textFieldStyle(.quiet)
+                    QuietTextField("Server names", text: $choice.namesText, prompt: "cppm.lab.sheep").textFieldStyle(.quiet)
                     HStack(alignment: .firstTextBaseline, spacing: 12) {
                         Text("The names in that server's certificate (separate with semicolons). Empty: Windows checks only the trusted certificate, not the name.")
                             .font(Theme.caption).foregroundStyle(Theme.faint)
@@ -1165,29 +1143,17 @@ struct PolicyNameSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text(title).font(Theme.emphasis).foregroundStyle(Theme.ink)
-            GPFormRow("Name") { TextField(Dot1XPolicy.defaultName, text: $name).textFieldStyle(.quiet) }
-            GPFormRow("Description") {
+        QuietSheet(title: title, width: 520, failure: failure) {
+            SheetField("Name") { QuietTextField("Name", text: $name, prompt: Dot1XPolicy.defaultName).textFieldStyle(.quiet) }
+            SheetField("Description") {
                 // Two to four lines, not one clipped line (owner, 2 Oct 2026).
-                TextField("Optional", text: $description, axis: .vertical).textFieldStyle(.quiet).lineLimit(2...4)
+                QuietTextField("Description", text: $description, prompt: "Optional", axis: .vertical).textFieldStyle(.quiet).lineLimit(2...4)
             }
-            Text("Shown in Group Policy Management on Windows. Publish updates the published policy in place.")
-                .font(Theme.detail).foregroundStyle(Theme.muted)
-                .fixedSize(horizontal: false, vertical: true)
-            if let failure { Text(failure).font(Theme.detail).foregroundStyle(Theme.attention) }
-            HStack(spacing: 20) {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button("Save") {
-                    do { try save(name.trimmingCharacters(in: .whitespaces), description); dismiss() } catch { failure = "\(error)" }
-                }
-                .buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
-                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            QuietNote("Shown in Group Policy Management on Windows. Publish updates the published policy in place.")
+        } actions: {
+            SheetButtons("Save", disabled: name.trimmingCharacters(in: .whitespaces).isEmpty) {
+                do { try save(name.trimmingCharacters(in: .whitespaces), description.trimmingCharacters(in: .whitespacesAndNewlines)); dismiss() } catch { failure = "\(error)" }
             }
         }
-        .padding(24)
-        .frame(width: 520)
-        .background(Theme.background)
     }
 }

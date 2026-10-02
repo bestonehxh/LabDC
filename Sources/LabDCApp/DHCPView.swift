@@ -79,16 +79,30 @@ struct DHCPView: View {
 }
 
 /// Field label above a control (the sheets' layout).
-private func dhcpField(_ label: String, @ViewBuilder control: () -> some View) -> some View {
-    VStack(alignment: .leading, spacing: 4) {
-        Text(label).font(Theme.caption).foregroundStyle(Theme.muted)
-        control()
-    }
+@MainActor private func dhcpField(_ label: String, @ViewBuilder control: () -> some View) -> some View {
+    SheetField(label, control: control)
 }
 
-/// `10.0.0.1, 10.0.0.2` ↔ list.
-private func dhcpList(_ text: String) -> [String] {
-    text.split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\n" }).map(String.init).filter { !$0.isEmpty }
+/// `10.0.0.1, 10.0.0.2` ↔ list (commas or new lines; `a - b` stays one entry).
+private func dhcpList(_ text: String) -> [String] { DHCPInput.list(text) }
+
+/// A sheet's pop-up menu under its label: left-aligned, its natural width.
+@MainActor private func dhcpPicker<V: Hashable>(_ label: String, _ selection: Binding<V>, @ViewBuilder _ items: () -> some View) -> some View {
+    SheetPicker(label, selection: selection, items: items)
+}
+
+/// The Option 43 row of a sheet: what is set (or what applies without it) in body text, then the actions.
+@MainActor private func dhcpOption43Row(_ option: VendorOption43?, unset: String, edit: @escaping () -> Void, remove: @escaping () -> Void) -> some View {
+    dhcpField("Option 43") {
+        HStack(alignment: .firstTextBaseline, spacing: 16) {
+            Text(option.map { "\($0.vendor.title) · " + ($0.controllers.isEmpty ? $0.hexPreview : $0.controllers.joined(separator: ", ")) } ?? unset)
+                .font(Theme.body).foregroundStyle(option == nil ? Theme.muted : Theme.ink)
+                .lineLimit(1).truncationMode(.tail).textSelection(.enabled)
+            Button(option == nil ? "Set…" : "Edit…", action: edit).buttonStyle(.quietLink)
+            if option != nil { Button("Remove", action: remove).buttonStyle(.quietLink) }
+            Spacer(minLength: 0)
+        }
+    }
 }
 
 // MARK: - Scopes
@@ -101,6 +115,7 @@ struct DHCPScopesTab: View {
     @State private var adding = false
     @State private var confirmDelete: DHCPScope?
     @State private var failure: String?
+    @State private var notice: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -113,6 +128,7 @@ struct DHCPScopesTab: View {
             }
             .padding(.bottom, 16)
             if let failure { QuietNote(failure, attention: true).padding(.bottom, 12).textSelection(.enabled) }
+            if let notice { QuietNote(notice).padding(.bottom, 12).textSelection(.enabled) }
             if scopes.isEmpty {
                 QuietNote("No scope yet. Add one per test VLAN, then point that VLAN's switch relay (ip helper-address) at this Mac. "
                           + "LabDC only answers relayed requests, so the production DHCP server keeps the rest of the network.")
@@ -128,7 +144,7 @@ struct DHCPScopesTab: View {
                                             StateText(text: scope.family.title, dimmed: true)
                                             if !scope.enabled { StateText(text: "Disabled", dimmed: true) }
                                         }
-                                        Text(summary(scope)).font(Theme.detail.monospaced()).foregroundStyle(Theme.muted)
+                                        Text(summary(scope)).font(Theme.detail).foregroundStyle(Theme.muted)
                                             .lineLimit(2).textSelection(.enabled)
                                     }
                                     Spacer(minLength: 8)
@@ -136,7 +152,7 @@ struct DHCPScopesTab: View {
                                         Button("Edit…") { editing = scope }
                                         Button(scope.enabled ? "Disable" : "Enable") {
                                             var s = scope; s.enabled.toggle()
-                                            run("\(s.enabled ? "Enable" : "Disable") \(scope.name)") { try await model.controller.saveDHCPScope(s) }
+                                            run("\(s.enabled ? "Enable" : "Disable") \(scope.name)") { show(try await model.controller.saveDHCPScope(s)) }
                                         }
                                         Button("Delete…", role: .destructive) { confirmDelete = scope }
                                     }
@@ -154,8 +170,8 @@ struct DHCPScopesTab: View {
             }
         }
         .task { await reload() }
-        .sheet(isPresented: $adding) { DHCPScopeSheet(onDone: { Task { await reload() } }) }
-        .sheet(item: $editing) { scope in DHCPScopeSheet(scope: scope, onDone: { Task { await reload() } }) }
+        .sheet(isPresented: $adding) { DHCPScopeSheet(onDone: { notes in show(notes); Task { await reload() } }) }
+        .sheet(item: $editing) { scope in DHCPScopeSheet(scope: scope, onDone: { notes in show(notes); Task { await reload() } }) }
         .alert("Delete the scope “\(confirmDelete?.name ?? "")”?",
                isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
                presenting: confirmDelete) { scope in
@@ -184,7 +200,14 @@ struct DHCPScopesTab: View {
         status = await model.controller.dhcpStatus()
     }
 
+    /// Save notes (e.g. "option 51 removed: the server sets it") stay on the page until the next save.
+    private func show(_ notes: [String]) {
+        notice = notes.isEmpty ? nil : notes.joined(separator: "\n")
+    }
+
     private func run(_ what: String, _ body: @escaping () async throws -> Void) {
+        // A delete (or a failed save) clears the last save's notes: they were about another row.
+        notice = nil
         Task {
             do { try await body(); failure = nil } catch { failure = "\(what) failed: \(error)" }
             await reload()
@@ -196,7 +219,8 @@ struct DHCPScopeSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     var scope: DHCPScope?
-    let onDone: () -> Void
+    /// Notes from the save (server-set options dropped from an older row), shown on the page.
+    let onDone: ([String]) -> Void
 
     @State private var name = ""
     @State private var family = DHCPFamily.v4
@@ -230,67 +254,57 @@ struct DHCPScopeSheet: View {
     @State private var failure: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(scope == nil ? "New scope" : "Edit \(scope?.name ?? "")").font(Theme.emphasis).foregroundStyle(Theme.ink)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+        QuietSheet(title: scope == nil ? "New scope" : "Edit \(scope?.name ?? "")", width: 640, failure: failure) {
                     HStack(alignment: .top, spacing: 16) {
-                        dhcpField("Name") { TextField("Staff VLAN 20", text: $name).textFieldStyle(.quiet) }
-                        dhcpField("VLAN") { TextField("20", text: $vlan).textFieldStyle(.quiet).frame(width: 70) }
-                        dhcpField("Family") {
-                            Picker("", selection: $family) { ForEach(DHCPFamily.allCases, id: \.self) { Text($0.title).tag($0) } }
-                                .labelsHidden().frame(width: 100).disabled(scope != nil)
-                        }
+                        dhcpField("Name") { QuietTextField("Name", text: $name, prompt: "Staff VLAN 20").textFieldStyle(.quiet) }
+                        dhcpField("VLAN") { QuietTextField("VLAN", text: $vlan, prompt: "20").textFieldStyle(.quiet).frame(width: 70) }
+                    }
+                    dhcpField("Family") {
+                        dhcpPicker("Family", $family) { ForEach(DHCPFamily.allCases, id: \.self) { Text($0.title).tag($0) } }.disabled(scope != nil)
                     }
                     dhcpField(family == .v4 ? "Subnet" : "Prefix") {
-                        TextField(family == .v4 ? "10.20.0.0/24" : "2001:db8:20::/64", text: $subnet).textFieldStyle(.quiet).font(Theme.body.monospaced())
+                        QuietTextField(family == .v4 ? "Subnet" : "Prefix", text: $subnet, prompt: family == .v4 ? "10.20.0.0/24" : "2001:db8:20::/64").textFieldStyle(.quietMonospaced)
                     }
                     dhcpField("Address ranges (comma separated)") {
-                        TextField(family == .v4 ? "10.20.0.100-10.20.0.199" : "2001:db8:20::100-2001:db8:20::1ff", text: $ranges)
-                            .textFieldStyle(.quiet).font(Theme.body.monospaced())
+                        QuietTextField("Address ranges (comma separated)", text: $ranges, prompt: family == .v4 ? "10.20.0.100-10.20.0.199" : "2001:db8:20::100-2001:db8:20::1ff")
+                            .textFieldStyle(.quietMonospaced)
                     }
-                    dhcpField("Excluded (optional)") { TextField("10.20.0.150-10.20.0.159", text: $exclusions).textFieldStyle(.quiet).font(Theme.body.monospaced()) }
+                    dhcpField("Excluded (optional)") { QuietTextField("Excluded (optional)", text: $exclusions, prompt: family == .v4 ? "10.20.0.150-10.20.0.159" : "2001:db8:20::150-2001:db8:20::15f").textFieldStyle(.quietMonospaced) }
                     if family == .v4 {
                         HStack(alignment: .top, spacing: 16) {
-                            dhcpField("Router (option 3)") { TextField("10.20.0.1", text: $routers).textFieldStyle(.quiet) }
-                            dhcpField("Lease (hours)") { TextField("8", text: $leaseHours).textFieldStyle(.quiet).frame(width: 80) }
+                            dhcpField("Router (option 3)") { QuietTextField("Router (option 3)", text: $routers, prompt: "10.20.0.1").textFieldStyle(.quietMonospaced) }
+                            dhcpField("Lease (hours)") { QuietTextField("Lease (hours)", text: $leaseHours, prompt: "8").textFieldStyle(.quiet).frame(width: 80) }
                         }
                     } else {
-                        dhcpField("Valid lifetime (hours)") { TextField("24", text: $leaseHours).textFieldStyle(.quiet).frame(width: 80) }
+                        dhcpField("Valid lifetime (hours)") { QuietTextField("Valid lifetime (hours)", text: $leaseHours, prompt: "24").textFieldStyle(.quiet).frame(width: 80) }
                     }
                     HStack(alignment: .top, spacing: 16) {
-                        dhcpField("DNS servers (blank = this DC)") { TextField(family == .v4 ? "this DC" : "this DC's IPv6", text: $dns).textFieldStyle(.quiet) }
-                        dhcpField("NTP servers (blank = this DC)") { TextField("this DC", text: $ntp).textFieldStyle(.quiet) }
+                        dhcpField("DNS servers (blank = this DC)") { QuietTextField("DNS servers (blank = this DC)", text: $dns, prompt: family == .v4 ? "this DC" : "this DC's IPv6").textFieldStyle(.quiet) }
+                        dhcpField("NTP servers (blank = this DC)") { QuietTextField("NTP servers (blank = this DC)", text: $ntp, prompt: "this DC").textFieldStyle(.quiet) }
                     }
                     HStack(alignment: .top, spacing: 16) {
-                        dhcpField("Domain (blank = the AD domain)") { TextField(model.controller.status.dnsDomain ?? "lab.sheep", text: $domain).textFieldStyle(.quiet) }
-                        dhcpField("Search list") { TextField("lab.sheep, corp.example", text: $search).textFieldStyle(.quiet) }
+                        dhcpField("Domain (blank = the AD domain)") { QuietTextField("Domain (blank = the AD domain)", text: $domain, prompt: model.controller.status.dnsDomain ?? "lab.sheep").textFieldStyle(.quiet) }
+                        dhcpField("Search list") { QuietTextField("Search list", text: $search, prompt: "lab.sheep, corp.example").textFieldStyle(.quiet) }
                     }
                     if family == .v4 {
                         HStack(alignment: .top, spacing: 16) {
-                            dhcpField("MTU (26)") { TextField("1500", text: $mtu).textFieldStyle(.quiet).frame(width: 80) }
-                            dhcpField("Static routes (121): cidr@gateway") { TextField("10.30.0.0/16@10.20.0.254", text: $routes).textFieldStyle(.quiet) }
+                            dhcpField("MTU (26)") { QuietTextField("MTU (26)", text: $mtu, prompt: "1500").textFieldStyle(.quiet).frame(width: 80) }
+                            dhcpField("Static routes (121): cidr@gateway") { QuietTextField("Static routes (121): cidr@gateway", text: $routes, prompt: "10.30.0.0/16@10.20.0.254").textFieldStyle(.quietMonospaced) }
                         }
-                        HStack(alignment: .firstTextBaseline, spacing: 16) {
-                            Text("Option 43").font(Theme.caption).foregroundStyle(Theme.muted)
-                            Text(option43.map { "\($0.vendor.title) · \($0.hexPreview)" } ?? "none")
-                                .font(Theme.detail.monospaced()).foregroundStyle(Theme.ink).textSelection(.enabled).lineLimit(1)
-                            Button(option43 == nil ? "Add…" : "Edit…") { editing43 = true }.buttonStyle(.quietLink)
-                            if option43 != nil { Button("Remove") { option43 = nil }.buttonStyle(.quietLink) }
+                        dhcpOption43Row(option43, unset: "Not sent", edit: { editing43 = true }, remove: { option43 = nil })
+                        HStack(alignment: .top, spacing: 16) {
+                            dhcpField("CAPWAP controllers (138)") { QuietTextField("CAPWAP controllers (138)", text: $capwap, prompt: "10.0.0.9").textFieldStyle(.quietMonospaced) }
+                            dhcpField("TFTP servers (150)") { QuietTextField("TFTP servers (150)", text: $tftp150, prompt: "10.0.0.20").textFieldStyle(.quietMonospaced) }
                         }
                         HStack(alignment: .top, spacing: 16) {
-                            dhcpField("CAPWAP controllers (138)") { TextField("10.0.0.9", text: $capwap).textFieldStyle(.quiet) }
-                            dhcpField("TFTP servers (150)") { TextField("10.0.0.20", text: $tftp150).textFieldStyle(.quiet) }
-                        }
-                        HStack(alignment: .top, spacing: 16) {
-                            dhcpField("TFTP server name (66)") { TextField("tftp.lab.sheep", text: $tftp).textFieldStyle(.quiet) }
-                            dhcpField("Boot file (67)") { TextField("SEP{mac}.cnf.xml", text: $bootfile).textFieldStyle(.quiet) }
+                            dhcpField("TFTP server name (66)") { QuietTextField("TFTP server name (66)", text: $tftp, prompt: "tftp.lab.sheep").textFieldStyle(.quiet) }
+                            dhcpField("Boot file (67)") { QuietTextField("Boot file (67)", text: $bootfile, prompt: "SEP{mac}.cnf.xml").textFieldStyle(.quiet) }
                         }
                         QuietNote("LabDC hands out 66/67/150 for phones and zero-touch switches; it does not serve TFTP or PXE itself.")
                     }
                     HStack(alignment: .top, spacing: 16) {
-                        dhcpField("Shared network (optional)") { TextField("floor2", text: $shared).textFieldStyle(.quiet) }
-                        dhcpField("Offer delay (ms)") { TextField("0", text: $offerDelay).textFieldStyle(.quiet).frame(width: 80) }
+                        dhcpField("Shared network (optional)") { QuietTextField("Shared network (optional)", text: $shared, prompt: "floor2").textFieldStyle(.quiet) }
+                        dhcpField("Offer delay (ms)") { QuietTextField("Offer delay (ms)", text: $offerDelay, prompt: "0").textFieldStyle(.quiet).frame(width: 80) }
                     }
                     VStack(alignment: .leading, spacing: 6) {
                         Toggle("Enabled", isOn: $enabled).toggleStyle(.quiet)
@@ -304,19 +318,9 @@ struct DHCPScopeSheet: View {
                                 .font(Theme.detail).foregroundStyle(Theme.attention).fixedSize(horizontal: false, vertical: true)
                         }
                     }
-                }
-            }
-            if let failure { Text(failure).foregroundStyle(Theme.attention).font(Theme.detail).textSelection(.enabled) }
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button("Save") { save() }
-                    .buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
-                    .disabled(busy || name.isEmpty || subnet.isEmpty || ranges.isEmpty)
-            }
+        } actions: {
+            SheetButtons("Save", disabled: busy || name.isEmpty || subnet.isEmpty || ranges.isEmpty) { save() }
         }
-        .padding(24).frame(width: 640, height: 680)
-        .background(Theme.background)
         .sheet(isPresented: $editing43) { Option43Editor(option: option43) { option43 = $0 } }
         .onAppear(perform: load)
     }
@@ -339,35 +343,42 @@ struct DHCPScopeSheet: View {
         var s = scope ?? DHCPScope(name: name, family: family, subnet: subnet)
         s.name = name.trimmingCharacters(in: .whitespaces)
         s.family = family
-        s.vlan = Int(vlan.trimmingCharacters(in: .whitespaces))
         s.subnet = subnet.trimmingCharacters(in: .whitespaces)
-        s.ranges = dhcpList(ranges).compactMap { DHCPRange(text: $0) }
-        s.exclusions = dhcpList(exclusions).compactMap { DHCPRange(text: $0) }
-        s.routers = dhcpList(routers)
-        s.leaseSeconds = Int((Double(leaseHours.replacingOccurrences(of: ",", with: ".")) ?? 8) * 3600)
-        s.dnsServers = dhcpList(dns)
-        s.domainName = domain.trimmingCharacters(in: .whitespaces).isEmpty ? nil : domain.trimmingCharacters(in: .whitespaces)
-        s.ntpServers = dhcpList(ntp)
-        s.searchList = dhcpList(search)
-        s.mtu = Int(mtu)
-        s.staticRoutes = dhcpList(routes).compactMap { r in
-            let p = r.split(separator: "@").map(String.init)
-            return p.count == 2 ? DHCPOptionBuilder.StaticRoute(destination: p[0], gateway: p[1]) : nil
+        // Every typed value parses or the sheet says which one does not — nothing is dropped
+        // or replaced by a default silently.
+        do {
+            s.vlan = try DHCPInput.integer(vlan, field: "VLAN", in: 1...4094)
+            s.ranges = try DHCPInput.ranges(ranges, family: family, field: "Address ranges")
+            s.exclusions = try DHCPInput.ranges(exclusions, family: family, field: "Excluded")
+            s.leaseSeconds = try DHCPInput.hours(leaseHours, field: family == .v4 ? "Lease (hours)" : "Valid lifetime (hours)")
+                ?? (family == .v4 ? 8 * 3600 : 86_400)
+            s.offerDelayMs = try DHCPInput.integer(offerDelay, field: "Offer delay (ms)", in: 0...5000) ?? 0
+            if family == .v4 {
+                s.routers = try DHCPInput.addresses(routers, family: .v4, field: "Router")
+                s.mtu = try DHCPInput.integer(mtu, field: "MTU", in: 68...65535)
+                s.staticRoutes = try DHCPInput.routes(routes)
+                s.capwap = try DHCPInput.addresses(capwap, family: .v4, field: "CAPWAP controllers")
+                s.tftpServers150 = try DHCPInput.addresses(tftp150, family: .v4, field: "TFTP servers (150)")
+            }
+            s.dnsServers = try DHCPInput.addresses(dns, family: family, field: "DNS servers")
+            s.ntpServers = try DHCPInput.addresses(ntp, family: family, field: "NTP servers")
+        } catch {
+            failure = "\(error)"
+            return
         }
-        s.capwap = dhcpList(capwap)
+        s.domainName = domain.trimmingCharacters(in: .whitespaces).isEmpty ? nil : domain.trimmingCharacters(in: .whitespaces)
+        s.searchList = dhcpList(search)
         s.tftpServer = tftp.isEmpty ? nil : tftp
         s.bootfile = bootfile.isEmpty ? nil : bootfile
-        s.tftpServers150 = dhcpList(tftp150)
         s.sharedNetwork = shared.trimmingCharacters(in: .whitespaces).isEmpty ? nil : shared.trimmingCharacters(in: .whitespaces)
-        s.offerDelayMs = Int(offerDelay) ?? 0
         s.authoritative = authoritative; s.knownClientsOnly = knownOnly; s.pingBeforeOffer = ping
         s.dnsUpdates = dnsUpdates; s.rapidCommit = rapidCommit; s.enabled = enabled
         s.option43 = family == .v4 ? option43 : nil
         busy = true
         Task {
             do {
-                try await model.controller.saveDHCPScope(s)
-                onDone(); dismiss()
+                let notes = try await model.controller.saveDHCPScope(s)
+                onDone(notes); dismiss()
             } catch { failure = "\(error)" }
             busy = false
         }
@@ -389,23 +400,20 @@ struct Option43Editor: View {
     var body: some View {
         let current = VendorOption43(vendor: vendor, controllers: dhcpList(controllers), rawHex: rawHex, vendorClass: vendorClass)
         let encoded = Result { try current.encode() }
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Option 43").font(Theme.emphasis).foregroundStyle(Theme.ink)
+        QuietSheet(title: "Option 43", width: 520) {
             dhcpField("Vendor") {
-                Picker("", selection: $vendor) { ForEach(VendorOption43.Vendor.allCases) { Text($0.title).tag($0) } }
-                    .labelsHidden().fixedSize()
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                dhcpPicker("Vendor", $vendor) { ForEach(VendorOption43.Vendor.allCases) { Text($0.title).tag($0) } }
                     .onChange(of: vendor) { _, v in vendorClass = v.defaultVendorClass }
             }
             if vendor == .raw {
-                dhcpField("Bytes (hex)") { TextField("f1040a000009", text: $rawHex).textFieldStyle(.quiet).font(Theme.body.monospaced()) }
+                dhcpField("Bytes (hex)") { QuietTextField("Bytes (hex)", text: $rawHex, prompt: "f1040a000009").textFieldStyle(.quietMonospaced) }
             } else {
                 dhcpField(vendor.maxControllers == 1 ? "Controller address" : "Controller addresses (in order of preference)") {
-                    TextField("10.0.0.9", text: $controllers).textFieldStyle(.quiet).font(Theme.body.monospaced())
+                    QuietTextField(vendor.maxControllers == 1 ? "Controller address" : "Controller addresses (in order of preference)", text: $controllers, prompt: "10.0.0.9").textFieldStyle(.quietMonospaced)
                 }
             }
             dhcpField("Only for clients whose vendor class (option 60) contains") {
-                TextField("blank = every client that asks for 43", text: $vendorClass).textFieldStyle(.quiet)
+                QuietTextField("Only for clients whose vendor class (option 60) contains", text: $vendorClass, prompt: "blank = every client that asks for 43").textFieldStyle(.quiet)
             }
             VStack(alignment: .leading, spacing: 4) {
                 Text("On the wire").font(Theme.caption).foregroundStyle(Theme.muted)
@@ -414,20 +422,19 @@ struct Option43Editor: View {
                     Text(DHCPHex.string(bytes)).font(Theme.body.monospaced()).foregroundStyle(Theme.ink).textSelection(.enabled)
                     Text("\(bytes.count) bytes").font(Theme.detail).foregroundStyle(Theme.muted)
                 case .failure(let error):
-                    Text(verbatim: "\(error)").font(Theme.detail).foregroundStyle(Theme.attention)
+                    // Nothing typed yet is not an error (the red line greeted every new option).
+                    if (vendor == .raw ? rawHex : controllers).trimmingCharacters(in: .whitespaces).isEmpty {
+                        Text(vendor == .raw ? "The bytes appear here." : "The bytes appear here once a controller address is typed.")
+                            .font(Theme.detail).foregroundStyle(Theme.muted)
+                    } else {
+                        Text(verbatim: "\(error)").font(Theme.detail).foregroundStyle(Theme.attention)
+                    }
                 }
             }
             Text(note).font(Theme.detail).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button("Use") { onSave(current); dismiss() }
-                    .buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
-                    .disabled((try? encoded.get()) == nil)
-            }
+        } actions: {
+            SheetButtons("Use", disabled: (try? encoded.get()) == nil) { onSave(current); dismiss() }
         }
-        .padding(24).frame(width: 520)
-        .background(Theme.background)
         .onAppear {
             if let option {
                 vendor = option.vendor; controllers = option.controllers.joined(separator: ", ")
@@ -460,6 +467,7 @@ struct DHCPReservationsTab: View {
     @State private var adding = false
     @State private var confirmDelete: DHCPReservation?
     @State private var failure: String?
+    @State private var notice: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -470,6 +478,7 @@ struct DHCPReservationsTab: View {
             }
             .padding(.bottom, 16)
             if let failure { QuietNote(failure, attention: true).padding(.bottom, 12).textSelection(.enabled) }
+            if let notice { QuietNote(notice).padding(.bottom, 12).textSelection(.enabled) }
             if reservations.isEmpty {
                 QuietNote(scopes.isEmpty ? "Add a scope first." : "No reservations. A reservation gives one client (by MAC, client-id, DUID or the switch port's circuit-id) the same address every time.")
             } else {
@@ -484,14 +493,14 @@ struct DHCPReservationsTab: View {
                                             Text(r.address).font(Theme.body.monospaced()).foregroundStyle(Theme.ink).textSelection(.enabled)
                                         }
                                         Text(r.identifierText + " · " + (scopes.first { $0.id == r.scopeID }?.name ?? "?"))
-                                            .font(Theme.detail.monospaced()).foregroundStyle(Theme.muted).lineLimit(1)
+                                            .font(Theme.detail).foregroundStyle(Theme.muted).lineLimit(1)
                                     }
                                     Spacer(minLength: 8)
                                     Menu("Edit") {
                                         Button("Edit…") { editing = r }
                                         Button(r.enabled ? "Disable" : "Enable") {
                                             var c = r; c.enabled.toggle()
-                                            run("\(c.enabled ? "Enable" : "Disable") \(r.name)") { try await model.controller.saveDHCPReservation(c) }
+                                            run("\(c.enabled ? "Enable" : "Disable") \(r.name)") { show(try await model.controller.saveDHCPReservation(c)) }
                                         }
                                         Button("Delete…", role: .destructive) { confirmDelete = r }
                                     }
@@ -504,8 +513,8 @@ struct DHCPReservationsTab: View {
             }
         }
         .task { await reload() }
-        .sheet(isPresented: $adding) { DHCPReservationSheet(scopes: scopes, onDone: { Task { await reload() } }) }
-        .sheet(item: $editing) { r in DHCPReservationSheet(reservation: r, scopes: scopes, onDone: { Task { await reload() } }) }
+        .sheet(isPresented: $adding) { DHCPReservationSheet(scopes: scopes, onDone: { notes in show(notes); Task { await reload() } }) }
+        .sheet(item: $editing) { r in DHCPReservationSheet(reservation: r, scopes: scopes, onDone: { notes in show(notes); Task { await reload() } }) }
         .alert("Delete the reservation “\(confirmDelete?.name ?? "")”?",
                isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
                presenting: confirmDelete) { r in
@@ -521,7 +530,14 @@ struct DHCPReservationsTab: View {
         reservations = await model.controller.dhcpReservations().sorted { $0.address.localizedStandardCompare($1.address) == .orderedAscending }
     }
 
+    /// Save notes (e.g. "option 51 removed: the server sets it") stay on the page until the next save.
+    private func show(_ notes: [String]) {
+        notice = notes.isEmpty ? nil : notes.joined(separator: "\n")
+    }
+
     private func run(_ what: String, _ body: @escaping () async throws -> Void) {
+        // A delete (or a failed save) clears the last save's notes: they were about another row.
+        notice = nil
         Task {
             do { try await body(); failure = nil } catch { failure = "\(what) failed: \(error)" }
             await reload()
@@ -534,7 +550,8 @@ struct DHCPReservationSheet: View {
     @Environment(\.dismiss) private var dismiss
     var reservation: DHCPReservation?
     let scopes: [DHCPScope]
-    let onDone: () -> Void
+    /// Notes from the save (server-set options dropped from an older row), shown on the page.
+    let onDone: ([String]) -> Void
 
     @State private var name = ""
     @State private var scopeID: Int64 = 0
@@ -553,48 +570,31 @@ struct DHCPReservationSheet: View {
 
     var body: some View {
         let family = scopes.first { $0.id == scopeID }?.family ?? .v4
-        VStack(alignment: .leading, spacing: 14) {
-            Text(reservation == nil ? "New reservation" : "Edit \(reservation?.name ?? "")").font(Theme.emphasis).foregroundStyle(Theme.ink)
-            HStack(alignment: .top, spacing: 16) {
-                dhcpField("Name") { TextField("Printer 2F", text: $name).textFieldStyle(.quiet) }
-                dhcpField("Scope") {
-                    Picker("", selection: $scopeID) { ForEach(scopes) { Text($0.name).tag($0.id) } }.labelsHidden().frame(width: 200)
-                }
-            }
-            dhcpField("Address") { TextField(family == .v4 ? "10.20.0.50" : "2001:db8:20::50", text: $address).textFieldStyle(.quiet).font(Theme.body.monospaced()) }
+        QuietSheet(title: reservation == nil ? "New reservation" : "Edit \(reservation?.name ?? "")", width: 560, failure: failure) {
+            dhcpField("Name") { QuietTextField("Name", text: $name, prompt: "Printer 2F").textFieldStyle(.quiet) }
+            dhcpField("Scope") { dhcpPicker("Scope", $scopeID) { ForEach(scopes) { Text($0.name).tag($0.id) } } }
+            dhcpField("Address") { QuietTextField("Address", text: $address, prompt: family == .v4 ? "10.20.0.50" : "2001:db8:20::50").textFieldStyle(.quietMonospaced) }
             QuietNote("Identify the client by any one of these (the first that matches wins).")
             HStack(alignment: .top, spacing: 16) {
-                dhcpField("MAC") { TextField("aa:bb:cc:dd:ee:ff", text: $mac).textFieldStyle(.quiet).font(Theme.body.monospaced()) }
+                dhcpField("MAC") { QuietTextField("MAC", text: $mac, prompt: "aa:bb:cc:dd:ee:ff").textFieldStyle(.quietMonospaced) }
                 if family == .v4 {
-                    dhcpField("Client-id (61, hex)") { TextField("01aabbccddeeff", text: $clientID).textFieldStyle(.quiet).font(Theme.body.monospaced()) }
+                    dhcpField("Client-id (61, hex)") { QuietTextField("Client-id (61, hex)", text: $clientID, prompt: "01aabbccddeeff").textFieldStyle(.quietMonospaced) }
                 } else {
-                    dhcpField("DUID (hex)") { TextField("000300010aabbccddeeff", text: $duid).textFieldStyle(.quiet).font(Theme.body.monospaced()) }
+                    dhcpField("DUID (hex)") { QuietTextField("DUID (hex)", text: $duid, prompt: "000300010aabbccddeeff").textFieldStyle(.quietMonospaced) }
                 }
             }
             HStack(alignment: .top, spacing: 16) {
-                dhcpField("Switch port (82 circuit-id)") { TextField("vlan 20 mod 1 port 3 or 1/1/7", text: $circuitID).textFieldStyle(.quiet) }
-                dhcpField("Remote-id (82/2)") { TextField("text or hex", text: $remoteID).textFieldStyle(.quiet) }
+                dhcpField("Switch port (82 circuit-id)") { QuietTextField("Switch port (82 circuit-id)", text: $circuitID, prompt: "vlan 20 mod 1 port 3 or 1/1/7").textFieldStyle(.quiet) }
+                dhcpField("Remote-id (82/2)") { QuietTextField("Remote-id (82/2)", text: $remoteID, prompt: "text or hex").textFieldStyle(.quiet) }
             }
-            dhcpField("DNS name (blank = the client's own)") { TextField("printer-2f", text: $hostname).textFieldStyle(.quiet) }
+            dhcpField("DNS name (blank = the client's own)") { QuietTextField("DNS name (blank = the client's own)", text: $hostname, prompt: "printer-2f").textFieldStyle(.quiet) }
             if family == .v4 {
-                HStack(alignment: .firstTextBaseline, spacing: 16) {
-                    Text("Option 43").font(Theme.caption).foregroundStyle(Theme.muted)
-                    Text(option43.map { "\($0.vendor.title) · \($0.hexPreview)" } ?? "the scope's").font(Theme.detail.monospaced()).lineLimit(1)
-                    Button(option43 == nil ? "Set…" : "Edit…") { editing43 = true }.buttonStyle(.quietLink)
-                    if option43 != nil { Button("Remove") { option43 = nil }.buttonStyle(.quietLink) }
-                }
+                dhcpOption43Row(option43, unset: "Same as the scope", edit: { editing43 = true }, remove: { option43 = nil })
             }
             Toggle("Enabled", isOn: $enabled).toggleStyle(.quiet)
-            if let failure { Text(failure).foregroundStyle(Theme.attention).font(Theme.detail) }
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button("Save") { save() }.buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
-                    .disabled(busy || name.isEmpty || address.isEmpty || scopeID == 0)
-            }
+        } actions: {
+            SheetButtons("Save", disabled: busy || name.isEmpty || address.isEmpty || scopeID == 0) { save() }
         }
-        .padding(24).frame(width: 560)
-        .background(Theme.background)
         .sheet(isPresented: $editing43) { Option43Editor(option: option43) { option43 = $0 } }
         .onAppear {
             scopeID = reservation?.scopeID ?? scopes.first?.id ?? 0
@@ -614,8 +614,8 @@ struct DHCPReservationSheet: View {
         busy = true
         Task {
             do {
-                try await model.controller.saveDHCPReservation(r)
-                onDone(); dismiss()
+                let notes = try await model.controller.saveDHCPReservation(r)
+                onDone(notes); dismiss()
             } catch { failure = "\(error)" }
             busy = false
         }
@@ -636,7 +636,7 @@ struct DHCPLeasesTab: View {
         let shown = filtered
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 20) {
-                TextField("Search address, MAC, name, device", text: $search).textFieldStyle(.quiet).frame(width: 280)
+                QuietTextField("Search leases", text: $search, prompt: "Search address, MAC, name, device").textFieldStyle(.quiet).frame(width: 280)
                 Toggle("Include history", isOn: $showAll).toggleStyle(.quiet).fixedSize()
                 Spacer(minLength: 12)
                 Text("\(shown.count) lease\(shown.count == 1 ? "" : "s")").font(Theme.detail).foregroundStyle(Theme.muted)
@@ -724,13 +724,7 @@ struct DHCPLeaseDetail: View {
     @State private var failure: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(lease.address).font(Theme.emphasis.monospaced()).foregroundStyle(Theme.ink).textSelection(.enabled)
-                StateText(text: lease.state.title)
-                Spacer()
-            }
-            ScrollView {
+        QuietSheet(title: lease.address, subtitle: lease.state.title, width: 600, failure: failure) {
                 VStack(alignment: .leading, spacing: 12) {
                     Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 6) {
                         row("Client", lease.whoText)
@@ -745,7 +739,9 @@ struct DHCPLeaseDetail: View {
                         if let other = lease.otherServer { row("Other server", other) }
                         row("DNS", lease.dnsName.map { $0 + (lease.dnsForward ? " (A/AAAA + DHCID" : " (PTR only") + (lease.dnsPTR != nil ? ", PTR)" : ")") } ?? "not registered")
                         if let p = profile {
-                            row("Device", "\(p.category.title) — \(p.os ?? "?") (\(p.confidence)%\(p.manualOverride ? ", set by hand" : ""))")
+                            // "Windows (90%)", not "Windows — Windows (90%)" when the OS is only the category.
+                            let os = p.os.flatMap { $0 == p.category.title ? nil : $0 }
+                            row("Device", "\(p.category.title)\(os.map { " — \($0)" } ?? "") (\(p.confidence)%\(p.manualOverride ? ", set by hand" : ""))")
                         } else if let c = lease.deviceCategory.flatMap({ DeviceClassifier.Category(rawValue: $0) }) {
                             row("Device", "\(c.title) — \(lease.deviceOS ?? "?")")
                         }
@@ -759,20 +755,15 @@ struct DHCPLeaseDetail: View {
                         Text("History").font(Theme.caption).foregroundStyle(Theme.muted)
                         ForEach(history) { e in
                             Text("\(PKIText.stamp(e.date))  \(e.kind)  \(e.detail)")
-                                .font(Theme.detail.monospaced()).foregroundStyle(Theme.muted).textSelection(.enabled)
+                                .font(Theme.detail.monospaced()).foregroundStyle(Theme.ink).textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
-            }
-            if let failure { Text(failure).foregroundStyle(Theme.attention).font(Theme.detail) }
-            HStack {
-                if lease.state == .active { Button("Release…") { confirmRelease = true }.buttonStyle(.quietDestructive) }
-                Spacer()
-                Button("Done") { dismiss() }.buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
-            }
+        } actions: {
+            if lease.state == .active { Button("Release…") { confirmRelease = true }.buttonStyle(.quietDestructive) }
+            Button("Done") { dismiss() }.buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
         }
-        .padding(24).frame(width: 600, height: 560)
-        .background(Theme.background)
         .task {
             history = await model.controller.dhcpHistory(lease)
             if let mac = lease.mac { profile = await model.controller.deviceProfile(mac: mac) }
@@ -793,6 +784,7 @@ struct DHCPLeaseDetail: View {
         GridRow {
             Text(label).font(Theme.caption).foregroundStyle(Theme.muted)
             Text(value).font(Theme.detail).foregroundStyle(Theme.ink).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -813,7 +805,7 @@ struct DHCPDevicesTab: View {
         let shown = filtered
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 20) {
-                TextField("Search MAC, name, category, OS", text: $search).textFieldStyle(.quiet).frame(width: 280)
+                QuietTextField("Search devices", text: $search, prompt: "Search MAC, name, category, OS").textFieldStyle(.quiet).frame(width: 280)
                 Spacer(minLength: 12)
                 Text("\(shown.count) device\(shown.count == 1 ? "" : "s")").font(Theme.detail).foregroundStyle(Theme.muted)
                 Button("Refresh") { Task { await reload() } }.buttonStyle(.quietLink)
@@ -913,26 +905,16 @@ struct DHCPDeviceSheet: View {
     @State private var os = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(profile.mac).font(Theme.emphasis.monospaced()).foregroundStyle(Theme.ink)
-            dhcpField("Category") {
-                Picker("", selection: $category) { ForEach(DeviceCategory.allCases, id: \.self) { Text($0.title).tag($0) } }
-                    .labelsHidden().frame(width: 220)
-            }
-            dhcpField("OS / model (optional)") { TextField("HP LaserJet", text: $os).textFieldStyle(.quiet) }
+        QuietSheet(title: "Set the category of \(profile.mac)", width: 440) {
+            dhcpField("Category") { dhcpPicker("Category", $category) { ForEach(DeviceCategory.allCases, id: \.self) { Text($0.title).tag($0) } } }
+            dhcpField("OS / model (optional)") { QuietTextField("OS / model (optional)", text: $os, prompt: "HP LaserJet").textFieldStyle(.quiet) }
             QuietNote("Set by hand, DHCP fingerprints no longer change it. If the category changes and the device has an open RADIUS session, LabDC sends that switch a CoA so the new policy applies.")
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button("Save") {
-                    let t = os.trimmingCharacters(in: .whitespaces)
-                    onSave(category, t.isEmpty ? nil : t); dismiss()
-                }
-                .buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
+        } actions: {
+            SheetButtons("Save") {
+                let t = os.trimmingCharacters(in: .whitespaces)
+                onSave(category, t.isEmpty ? nil : t); dismiss()
             }
         }
-        .padding(24).frame(width: 440)
-        .background(Theme.background)
         .onAppear { category = profile.category; os = profile.os ?? "" }
     }
 }
@@ -982,7 +964,7 @@ struct DHCPSettingsTab: View {
                 QuietSection("Relays and profilers") {
                     VStack(alignment: .leading, spacing: 10) {
                         dhcpField("Allowed relays (addresses, CIDRs or ranges; blank = relays whose giaddr is inside a scope)") {
-                            TextField("10.0.0.0/8", text: $relays).textFieldStyle(.quiet).font(Theme.body.monospaced())
+                            QuietTextField("Allowed relays", text: $relays, prompt: "10.0.0.0/8").textFieldStyle(.quietMonospaced)
                         }
                         if relays.trimmingCharacters(in: .whitespaces).isEmpty {
                             Text("Recommended: list your relays (the switches' helper addresses). With the list blank, LabDC accepts any "
@@ -992,7 +974,7 @@ struct DHCPSettingsTab: View {
                                 .font(Theme.detail).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
                         }
                         dhcpField("Profilers (ClearPass / ISE data-port addresses; get a relay copy of each client message)") {
-                            TextField("10.0.0.40", text: $profilers).textFieldStyle(.quiet).font(Theme.body.monospaced())
+                            QuietTextField("Profilers", text: $profilers, prompt: "10.0.0.40").textFieldStyle(.quietMonospaced)
                         }
                         Toggle("Also send LabDC's replies (ACKs) to the profilers", isOn: $settings.forwardReplies).toggleStyle(.quiet)
                         Toggle("Also send DHCPv6 messages (wrapped in Relay-forward)", isOn: $settings.forwardV6).toggleStyle(.quiet)
@@ -1018,13 +1000,13 @@ struct DHCPSettingsTab: View {
                 QuietSection("Safety") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(alignment: .top, spacing: 16) {
-                            dhcpField("Declined address quarantine (minutes)") { TextField("10", text: $quarantine).textFieldStyle(.quiet).frame(width: 80) }
-                            dhcpField("Server address (blank = automatic)") { TextField("toward each relay", text: $serverAddress).textFieldStyle(.quiet).frame(width: 180) }
+                            dhcpField("Declined address quarantine (minutes)") { QuietTextField("Declined address quarantine (minutes)", text: $quarantine, prompt: "10").textFieldStyle(.quiet).frame(width: 80) }
+                            dhcpField("Server address (blank = automatic)") { QuietTextField("Server address (blank = automatic)", text: $serverAddress, prompt: "toward each relay").textFieldStyle(.quiet).frame(width: 180) }
                         }
                         HStack(alignment: .top, spacing: 16) {
-                            dhcpField("Leases per relay (0 = no cap)") { TextField("0", text: $capRelay).textFieldStyle(.quiet).frame(width: 80) }
-                            dhcpField("Leases per switch port") { TextField("0", text: $capCircuit).textFieldStyle(.quiet).frame(width: 80) }
-                            dhcpField("Client-ids per MAC per hour") { TextField("8", text: $churn).textFieldStyle(.quiet).frame(width: 80) }
+                            dhcpField("Leases per relay (0 = no cap)") { QuietTextField("Leases per relay (0 = no cap)", text: $capRelay, prompt: "0").textFieldStyle(.quiet).frame(width: 80) }
+                            dhcpField("Leases per switch port") { QuietTextField("Leases per switch port", text: $capCircuit, prompt: "0").textFieldStyle(.quiet).frame(width: 80) }
+                            dhcpField("Client-ids per MAC per hour") { QuietTextField("Client-ids per MAC per hour", text: $churn, prompt: "8").textFieldStyle(.quiet).frame(width: 80) }
                         }
                     }
                 }
@@ -1035,6 +1017,9 @@ struct DHCPSettingsTab: View {
                 }
                 if let message { QuietNote(message, attention: failed).textSelection(.enabled) }
             }
+            // One reading column, like RADIUS ▸ Settings (lines across 1 800 px were hard to read).
+            .frame(maxWidth: GroupPolicyLayout.columnWidth, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .task { await reload() }
         .alert("Answer DHCP broadcasts on \(confirmDirect?.label ?? "")?",
@@ -1060,9 +1045,17 @@ struct DHCPSettingsTab: View {
         var s = settings
         s.allowedRelays = dhcpList(relays)
         s.profilers = dhcpList(profilers)
-        s.declineQuarantineSeconds = (Int(quarantine) ?? 10) * 60
         s.serverAddress = serverAddress.trimmingCharacters(in: .whitespaces).isEmpty ? nil : serverAddress.trimmingCharacters(in: .whitespaces)
-        s.maxLeasesPerRelay = Int(capRelay) ?? 0; s.maxLeasesPerCircuit = Int(capCircuit) ?? 0; s.clientIDChurnLimit = Int(churn) ?? 8
+        // A typo must not save 0 (which switches a cap off): refuse and say which field.
+        do {
+            s.declineQuarantineSeconds = (try DHCPInput.integer(quarantine, field: "Declined address quarantine (minutes)", in: 1...1440) ?? 10) * 60
+            s.maxLeasesPerRelay = try DHCPInput.integer(capRelay, field: "Leases per relay", in: 0...1_000_000) ?? 0
+            s.maxLeasesPerCircuit = try DHCPInput.integer(capCircuit, field: "Leases per switch port", in: 0...1_000_000) ?? 0
+            s.clientIDChurnLimit = try DHCPInput.integer(churn, field: "Client-ids per MAC per hour", in: 0...1_000_000) ?? 8
+        } catch {
+            message = "Not saved: \(error)"; failed = true
+            return
+        }
         Task {
             do { try await model.controller.saveDHCPSettings(s); message = "Saved."; failed = false } catch { message = "\(error)"; failed = true }
             await reload()
@@ -1129,17 +1122,17 @@ struct DHCPTestTab: View {
             Toggle("IPv6 (SOLICIT through a relay)", isOn: $v6).toggleStyle(.quiet)
             HStack(alignment: .top, spacing: 16) {
                 if v6 {
-                    dhcpField("Relay link-address") { TextField("2001:db8:20::1", text: $link6).textFieldStyle(.quiet).font(Theme.body.monospaced()) }
+                    dhcpField("Relay link-address") { QuietTextField("Relay link-address", text: $link6, prompt: "2001:db8:20::1").textFieldStyle(.quietMonospaced) }
                 } else {
-                    dhcpField("Relay address (giaddr)") { TextField("10.20.0.1", text: $giaddr).textFieldStyle(.quiet).font(Theme.body.monospaced()) }
-                    dhcpField("Link selection (82/5, optional)") { TextField("", text: $linkSelection).textFieldStyle(.quiet).font(Theme.body.monospaced()) }
+                    dhcpField("Relay address (giaddr)") { QuietTextField("Relay address (giaddr)", text: $giaddr, prompt: "10.20.0.1").textFieldStyle(.quietMonospaced) }
+                    dhcpField("Link selection (82/5, optional)") { QuietTextField("Link selection (82/5, optional)", text: $linkSelection, prompt: "").textFieldStyle(.quietMonospaced) }
                 }
-                dhcpField("Client MAC") { TextField("aa:bb:cc:dd:ee:01", text: $mac).textFieldStyle(.quiet).font(Theme.body.monospaced()) }
+                dhcpField("Client MAC") { QuietTextField("Client MAC", text: $mac, prompt: "aa:bb:cc:dd:ee:01").textFieldStyle(.quietMonospaced) }
             }
             HStack(alignment: .top, spacing: 16) {
-                dhcpField("Vendor class (60)") { TextField("Cisco AP c9120, MSFT 5.0", text: $vendorClass).textFieldStyle(.quiet) }
-                dhcpField("Host name") { TextField("LAPTOP-7", text: $hostname).textFieldStyle(.quiet) }
-                if !v6 { dhcpField("Circuit-id (82/1)") { TextField("Gi1/0/3", text: $circuitID).textFieldStyle(.quiet) } }
+                dhcpField("Vendor class (60)") { QuietTextField("Vendor class (60)", text: $vendorClass, prompt: "Cisco AP c9120, MSFT 5.0").textFieldStyle(.quiet) }
+                dhcpField("Host name") { QuietTextField("Host name", text: $hostname, prompt: "LAPTOP-7").textFieldStyle(.quiet) }
+                if !v6 { dhcpField("Circuit-id (82/1)") { QuietTextField("Circuit-id (82/1)", text: $circuitID, prompt: "Gi1/0/3").textFieldStyle(.quiet) } }
             }
             HStack {
                 Button(busy ? "Testing…" : "Test") { test() }.buttonStyle(.quietPrimary).disabled(busy)

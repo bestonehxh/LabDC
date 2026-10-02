@@ -170,7 +170,7 @@ public enum RadiusCommands {
             try await store.updateNAS(c)
             out("\(c.name): CoA \(c.coaVendor.title), udp \(c.coaPort)")
         case .sessions(let all):
-            let sessions = try await store.radiusSessions(activeOnly: !all)
+            let sessions = try await store.radiusSessions(activeOnly: !all, now: Date())
             if sessions.isEmpty { out(all ? "no accounting sessions" : "no active sessions") }
             for s in sessions { out(describe(s)) }
         case let .coa(action, target):
@@ -212,10 +212,13 @@ public enum RadiusCommands {
     }
 
     /// `#12  alice  aa:bb:…  AP-3F port 7  since 2026-10-01 09:30  active  1.2 MB in / 300 kB out`
-    static func describe(_ s: DirectoryStore.RadiusSession) -> String {
+    /// An open session without a Start/Interim-Update for a day says `no recent updates since …`.
+    static func describe(_ s: DirectoryStore.RadiusSession, now: Date = Date()) -> String {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH:mm"
-        let state = s.active ? "active" : "ended \(f.string(from: s.stoppedAt ?? s.updatedAt))"
+        let state = s.isActive(at: now) ? "active"
+            : s.open ? "no recent updates since \(f.string(from: s.updatedAt))"
+            : "ended \(f.string(from: s.stoppedAt ?? s.updatedAt))"
             + (s.terminateCause.map { " (\(RADIUSNames.terminateCause($0)))" } ?? "")
         let bytes = ByteCountFormatter()
         let port = s.nasPortId ?? s.nasPort.map(String.init)
@@ -230,8 +233,8 @@ public enum RadiusCommands {
     static func findSession(_ store: DirectoryStore, _ target: String) async throws -> DirectoryStore.RadiusSession {
         let t = target.hasPrefix("#") ? String(target.dropFirst()) : target
         if let id = Int64(t), let s = try await store.radiusSession(id: id) { return s }
-        if RADIUSMAC.normalize(target) != nil, let s = try await store.activeRadiusSessions(mac: target).first { return s }
-        if let s = try await store.radiusSessions(activeOnly: false, limit: 5000).first(where: { $0.sessionId == target }) { return s }
+        if RADIUSMAC.normalize(target) != nil, let s = try await store.activeRadiusSessions(mac: target, now: Date()).first { return s }
+        if let s = try await store.radiusSessions(activeOnly: false, now: Date(), limit: 5000).first(where: { $0.sessionId == target }) { return s }
         throw CLIError.failure("no session \(target) (try `labdc radius sessions`)")
     }
 

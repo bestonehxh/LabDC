@@ -12,7 +12,7 @@ extension DirectoryStore {
     static func createDHCPSchema(_ db: SQLiteConnection) throws {
         try db.exec("""
             CREATE TABLE IF NOT EXISTS dhcp_scopes(
-              id INTEGER PRIMARY KEY,
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
               name TEXT NOT NULL,
               family TEXT NOT NULL,
               subnet TEXT NOT NULL,
@@ -55,6 +55,38 @@ extension DirectoryStore {
             CREATE INDEX IF NOT EXISTS dhcp_events_address ON dhcp_events(family, address);
             CREATE INDEX IF NOT EXISTS dhcp_events_mac ON dhcp_events(mac);
             """)
+        try migrateDHCPScopesToAutoincrement(db)
+    }
+
+    /// Scope ids are never reused: leases and events keyed by a deleted scope's id must not
+    /// attach to a new scope. Databases made before AUTOINCREMENT get their table rebuilt with
+    /// the same ids (SQLite's documented table-rebuild steps, foreign keys off meanwhile so the
+    /// reservations' `ON DELETE CASCADE` does not fire), and the sequence starts above every
+    /// scope id still referenced by a lease.
+    static func migrateDHCPScopesToAutoincrement(_ db: SQLiteConnection) throws {
+        let sql = try db.scalar("SELECT sql FROM sqlite_master WHERE type='table' AND name='dhcp_scopes'")?.text ?? ""
+        guard !sql.uppercased().contains("AUTOINCREMENT") else { return }
+        try db.exec("PRAGMA foreign_keys=OFF")
+        defer { try? db.exec("PRAGMA foreign_keys=ON") }
+        try db.exec("""
+            BEGIN;
+            CREATE TABLE dhcp_scopes_new(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              name TEXT NOT NULL,
+              family TEXT NOT NULL,
+              subnet TEXT NOT NULL,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              data BLOB NOT NULL);
+            INSERT INTO dhcp_scopes_new(id, name, family, subnet, enabled, data)
+              SELECT id, name, family, subnet, enabled, data FROM dhcp_scopes;
+            DROP TABLE dhcp_scopes;
+            ALTER TABLE dhcp_scopes_new RENAME TO dhcp_scopes;
+            INSERT INTO sqlite_sequence(name, seq)
+              SELECT 'dhcp_scopes', MAX(COALESCE((SELECT MAX(id) FROM dhcp_scopes), 0), COALESCE((SELECT MAX(scope_id) FROM dhcp_leases), 0))
+              WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name='dhcp_scopes');
+            UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT MAX(scope_id) FROM dhcp_leases), 0)) WHERE name='dhcp_scopes';
+            COMMIT;
+            """)
     }
 
     private static let jsonEncoder: JSONEncoder = {
@@ -65,11 +97,26 @@ extension DirectoryStore {
 
     // MARK: Scopes
 
+    /// The scopes whose data decodes (an undecodable row is left out: `dhcpUndecodableScopes`).
     public func dhcpScopes() throws -> [DHCPScope] {
         try db.query("SELECT id, data FROM dhcp_scopes ORDER BY id").compactMap { row in
             guard var scope = try? JSONDecoder().decode(DHCPScope.self, from: Data(row[1].blob ?? [])) else { return nil }
             scope.id = row[0].int ?? 0
             return scope
+        }
+    }
+
+    /// Every scope id in the table, decodable or not: what "this scope still exists" means
+    /// (its leases and DNS records are never dropped because its data failed to decode).
+    public func dhcpScopeIDs() throws -> Set<Int64> {
+        Set(try db.query("SELECT id FROM dhcp_scopes").compactMap { $0[0].int })
+    }
+
+    /// Rows of `dhcp_scopes` whose data does not decode (id, name): skipped by `dhcpScopes`.
+    public func dhcpUndecodableScopes() throws -> [(id: Int64, name: String)] {
+        try db.query("SELECT id, name, data FROM dhcp_scopes ORDER BY id").compactMap { row in
+            if (try? JSONDecoder().decode(DHCPScope.self, from: Data(row[2].blob ?? []))) != nil { return nil }
+            return (row[0].int ?? 0, row[1].text ?? "")
         }
     }
 
@@ -79,6 +126,8 @@ extension DirectoryStore {
 
     @discardableResult
     public func addDHCPScope(_ scope: DHCPScope) throws -> Int64 {
+        var scope = scope
+        scope.searchList = DHCPScope.splitSearchList(scope.searchList)
         try validateScope(scope, replacing: nil)
         return try transaction {
             var s = scope
@@ -90,14 +139,23 @@ extension DirectoryStore {
         }
     }
 
-    public func updateDHCPScope(_ scope: DHCPScope) throws {
-        guard try dhcpScope(id: scope.id) != nil else { throw StoreError.noSuchObject("DHCP scope \(scope.id)") }
+    /// Replaces the scope. Custom options the server sets itself that the stored scope already
+    /// had (saved before validation refused them) are dropped instead of failing the update;
+    /// the returned notes say so (the CLI prints them, the app logs them). Adding one is refused.
+    @discardableResult
+    public func updateDHCPScope(_ scope: DHCPScope) throws -> [String] {
+        guard let saved = try dhcpScope(id: scope.id) else { throw StoreError.noSuchObject("DHCP scope \(scope.id)") }
+        let stripped = scope.strippingSavedServerManagedOptions(saved: saved)
+        var scope = stripped.scope
+        let note = stripped.note
+        scope.searchList = DHCPScope.splitSearchList(scope.searchList)
         try validateScope(scope, replacing: scope.id)
         try transaction {
             try db.run("UPDATE dhcp_scopes SET name=?, family=?, subnet=?, enabled=?, data=? WHERE id=?",
                        [.text(scope.name), .text(scope.family.rawValue), .text(scope.subnet), .int(scope.enabled ? 1 : 0),
                         .blob([UInt8](try Self.jsonEncoder.encode(scope))), .int(scope.id)])
         }
+        return note.map { [$0] } ?? []
     }
 
     /// Deletes the scope, its reservations, its leases and their history.
@@ -174,13 +232,20 @@ extension DirectoryStore {
         }
     }
 
-    public func updateDHCPReservation(_ reservation: DHCPReservation) throws {
+    /// Replaces the reservation; server-set custom options it already had are dropped with a
+    /// note, as in `updateDHCPScope`.
+    @discardableResult
+    public func updateDHCPReservation(_ reservation: DHCPReservation) throws -> [String] {
+        let saved = try dhcpReservations().first { $0.id == reservation.id }
+        let v6 = try dhcpScope(id: reservation.scopeID)?.family == .v6
+        let (reservation, note) = reservation.strippingSavedServerManagedOptions(saved: saved, v6: v6)
         try validateReservation(reservation, replacing: reservation.id)
         try transaction {
             try db.run("UPDATE dhcp_reservations SET scope_id=?, name=?, address=?, mac=?, data=? WHERE id=?",
                        [.int(reservation.scopeID), .text(reservation.name), .text(reservation.address), .optional(reservation.mac),
                         .blob([UInt8](try Self.jsonEncoder.encode(reservation))), .int(reservation.id)])
         }
+        return note.map { [$0] } ?? []
     }
 
     public func deleteDHCPReservation(id: Int64) throws {

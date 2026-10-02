@@ -184,16 +184,22 @@ public actor WSTEPService {
             throw Refusal(errorCode: Self.invalidArgument, message: "the PKCS#10 request does not parse: \(error)", denied: false)
         }
         let template = try await resolveTemplate(csr: csr, pairs: wrapped.nameValuePairs, context: context)
-        let authority: CertificateAuthority
-        do { authority = try await ca.pki.authority(named: caName) } catch {
+        do { _ = try await ca.pki.authority(named: caName) } catch {
             throw Refusal(errorCode: Self.failure, message: "no CA named \(caName)", denied: false).with(template: template.name)
         }
+        // The CA in the URL is only the endpoint: the template's issuer signs (a client still
+        // using an old root's CES URL re-enrols from the current root, a 192-bit / RSA template
+        // from its own root), and a retired or untrusted root never issues (`CAService.plan`).
         let certificate: Certificate
         do {
-            certificate = try await ca.issue(csr: csr, template: template, requester: caller.requester,
-                                             overrides: IssuanceOverrides(caName: authority.name))
+            certificate = try await ca.issue(csr: csr, template: template, requester: caller.requester)
         } catch let e as IssuanceError {
             throw Self.refusal(for: e).with(template: template.name)
+        }
+        let issuer = try await ca.issuedCertificate(serial: LabPKI.hex(certificate.serialNumber))?.caName ?? caName
+        let authority = try await ca.pki.authority(named: issuer)
+        if authority.name.lowercased() != caName.lowercased() {
+            emit("WSTEP: \(template.name) is issued by CA \(authority.name), requested at the CES URL of \(caName)")
         }
         let leaf = try LabPKI.der(certificate)
         let cmc = try CMCResponse.issued(leafDER: leaf, chain: [try authority.der()], bodyPartID: wrapped.bodyPartID,

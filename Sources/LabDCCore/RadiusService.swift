@@ -310,7 +310,11 @@ public final class RadiusServer: @unchecked Sendable {
         case .inProgress, .dropped: return nil
         }
         let reply = await answer(packet, nas: nas, config: config, source: source, started: started)
-        state.withLock { $0.duplicates.finish(key, reply: reply, now: clock()) }
+        state.withLock {
+            // An unanswered Accounting-Request is one whose record was not stored: its
+            // retransmission must be tried again, not dropped as a duplicate (RFC 2866 §2).
+            if accounting, reply == nil { $0.duplicates.forget(key) } else { $0.duplicates.finish(key, reply: reply, now: clock()) }
+        }
         return reply
     }
 
@@ -347,7 +351,9 @@ public final class RadiusServer: @unchecked Sendable {
                         started: ContinuousClock.Instant) async -> [UInt8]? {
         let secret = Array(nas.secret.utf8)
         if packet.code == .accountingRequest {
-            await recordAccounting(packet, nas: nas, source: source)
+            // RFC 2866 §2: Accounting-Response only once the record is safe; a record that could
+            // not be stored gets no answer, so the NAS retransmits it (review fix, 2 Oct 2026).
+            guard await recordAccounting(packet, nas: nas, source: source) else { return nil }
             logAccounting(packet, nas: nas)
             var reply = RADIUSPacket(code: .accountingResponse, id: packet.id, authenticator: packet.authenticator)
             reply.echoProxyState(from: packet)
@@ -442,8 +448,11 @@ public final class RadiusServer: @unchecked Sendable {
 
     /// Start / Interim-Update / Stop go into `radius_sessions`; Accounting-On/Off closes the
     /// NAS's open sessions. Sessions older than 30 days are purged (at most hourly).
-    private func recordAccounting(_ packet: RADIUSPacket, nas: DirectoryStore.NASClient, source: String) async {
-        guard let record = AccountingRecord(packet: packet, source: source) else { return }
+    /// False when the store failed (the request then goes unanswered); true when the record was
+    /// stored or deliberately not kept (unknown Acct-Status-Type, no Acct-Session-Id, a late
+    /// record for an ended session) — those are acknowledged, a retransmission would change nothing.
+    private func recordAccounting(_ packet: RADIUSPacket, nas: DirectoryStore.NASClient, source: String) async -> Bool {
+        guard let record = AccountingRecord(packet: packet, source: source) else { return true }
         let now = clock()
         do {
             let result = try await store.recordAccounting(record, nasName: nas.name, now: now)
@@ -451,7 +460,8 @@ public final class RadiusServer: @unchecked Sendable {
                 log("Accounting \(record.status == .nasOn ? "On" : "Off") from \(nas.name): \(result.closed) open session\(result.closed == 1 ? "" : "s") ended")
             }
         } catch {
-            limitedLog("acct store \(nas.name)", "Accounting-Request from \(nas.name) not stored (\(error))")
+            limitedLog("acct store \(nas.name)", "Accounting-Request from \(nas.name) not stored (\(error)); no response, the NAS retransmits")
+            return false
         }
         let purge = state.withLock { s -> Bool in
             guard now.timeIntervalSince(s.lastPurge) > 3600 else { return false }
@@ -461,6 +471,7 @@ public final class RadiusServer: @unchecked Sendable {
         if purge, let n = try? await store.purgeRadiusSessions(before: now.addingTimeInterval(-DirectoryStore.radiusSessionRetention)), n > 0 {
             log("accounting: \(n) session\(n == 1 ? "" : "s") older than 30 days removed")
         }
+        return true
     }
 
     // MARK: CoA / Disconnect (RFC 5176)
@@ -501,7 +512,7 @@ public final class RadiusServer: @unchecked Sendable {
     @discardableResult
     func profileChanged(_ rawMAC: String) async -> [CoAResult] {
         guard let mac = RADIUSMAC.normalize(rawMAC) ?? DeviceProfile.normalizeMAC(rawMAC),
-              let sessions = try? await store.activeRadiusSessions(mac: mac), !sessions.isEmpty else { return [] }
+              let sessions = try? await store.activeRadiusSessions(mac: mac, now: clock()), !sessions.isEmpty else { return [] }
         let profile = try? await profiles.deviceProfile(mac: mac)
         // A profile that went (back) to unknown never triggers a CoA: a forged DHCP packet with
         // no fingerprint must not be able to bounce a device that is already in.
@@ -642,6 +653,11 @@ public final class RadiusServer: @unchecked Sendable {
         ].compactMap { $0 }
     }
 
+    /// Domain Admins and Enterprise Admins: who enrollment treats as an administrator.
+    static let adminRIDs: Set<UInt32> = [512, 519]
+    /// Rows issued before this stopped recording the admin's SID for device enrollment.
+    static let boundSIDFixDate = Date(timeIntervalSince1970: 1_790_985_600)  // 2026-10-03T00:00:00Z
+
     /// Templates whose certificates never sign anyone in over 802.1X: servers, the SCEP RA,
     /// CAs — a stolen DC or RA key must not become a network credential.
     static let nonClientTemplates: Set<String> = ["domaincontrollertls", "scepra", "webserver", "subca",
@@ -649,9 +665,10 @@ public final class RadiusServer: @unchecked Sendable {
 
     /// EAP-TLS: the client certificate must chain to a lab CA (RFC 5280 path validation at
     /// `now`), carry the clientAuth EKU, not be revoked, and map to a live account:
-    /// - issued by this DC (in `pki_issued`): an account-bound template (Computer, User, any
-    ///   template whose SAN comes from the account) maps to the requester's SID; other templates
-    ///   map by the UPN / dNSName SAN, then the CN. Server/RA/CA templates are refused.
+    /// - issued by this DC (in `pki_issued`): a certificate recorded with its requester's SID (an
+    ///   account-bound template, or one a non-administrator enrolled for with names from the
+    ///   request) maps to that account only; others (administrator / device issuance) map by the
+    ///   UPN / dNSName SAN, then the CN. Server/RA/CA templates are refused.
     /// - not in `pki_issued` (signed by a lab CA key elsewhere): only a UPN or dNSName SAN maps —
     ///   a bare CN never does — and only with a current CRL of its CA that does not list it
     ///   (no CRL, a stale one or one that does not verify refuses: revocation is never skipped).
@@ -689,10 +706,26 @@ public final class RadiusServer: @unchecked Sendable {
         }
 
         var entry: DirectoryEntry?
-        if let record, let sidText = record.requesterSID, let sid = try? SID(string: sidText),
-           let template = try? await store.pkiTemplate(named: record.templateName),
-           template.sanPolicy == "dnsHostName" || template.sanPolicy == "upn" {
-            // The subject came from this account at issuance: the SID is the mapping.
+        // Certificates issued before admin device enrollment stopped recording the admin's SID
+        // (2 Oct 2026): a "names from the request" template enrolled by an administrator is a
+        // device/server certificate and maps by its names, never as the administrator.
+        // Only rows recorded before that change: newer ones already carry the right binding, and
+        // a later group change must never unbind a certificate (its CN could then name anyone).
+        // "Admin" is what enrollment used: Domain Admins / Enterprise Admins.
+        var boundSID = record?.requesterSID
+        if let record, record.issuedAt < Self.boundSIDFixDate, let sidText = boundSID, let sid = try? SID(string: sidText),
+           (try? await store.pkiTemplate(named: record.templateName))??.sanPolicy == "fromRequest",
+           let requester = try? await store.read(sid: sid),
+           let groups = try? await store.groupSIDs(of: requester.id),
+           groups.contains(where: { Self.adminRIDs.contains($0.rid ?? 0) }) {
+            boundSID = nil
+        }
+        if let record, let sidText = boundSID {
+            // Issued to an account (an account-bound template: the subject came from it; or a
+            // "names from the request" template a non-administrator enrolled for): that account
+            // is the mapping, whatever names the CSR put in — CN=Administrator asked for by bob
+            // signs bob in, never Administrator.
+            guard let sid = try? SID(string: sidText) else { return .failure("certificate \(serial) has an unreadable requester SID") }
             entry = try? await store.read(sid: sid)
             if entry == nil { return .failure("the account certificate \(serial) was issued to no longer exists") }
         } else {

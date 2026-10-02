@@ -95,7 +95,7 @@ struct RadiusClients: View {
                                         Text(client.name).font(Theme.body).foregroundStyle(client.enabled ? Theme.ink : Theme.faint)
                                         Text("\(client.ip) · secret •••••••• · CoA \(client.coaVendor.title), udp \(client.coaPort)"
                                              + (client.requireMessageAuthenticator ? "" : " · Message-Authenticator optional"))
-                                            .font(Theme.detail.monospaced()).foregroundStyle(Theme.muted)
+                                            .font(Theme.detail).foregroundStyle(Theme.muted)
                                         if client.hasWeakSecret {
                                             Text("Weak shared secret (\(client.secret.utf8.count) characters, at least \(DirectoryStore.NASClient.minimumSecretLength) recommended): it still works, but one captured packet lets it be guessed offline. Edit ▸ Generate, and set the new secret on the device.")
                                                 .font(Theme.detail).foregroundStyle(Theme.attention)
@@ -170,46 +170,40 @@ struct RadiusClientSheet: View {
     @State private var failure: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(client == nil ? "New RADIUS client" : "Edit \(client?.name ?? "")")
-                .font(Theme.emphasis).foregroundStyle(Theme.ink)
-            VStack(alignment: .leading, spacing: 14) {
-                field("Name") { TextField("Switch 3F", text: $name).textFieldStyle(.quiet) }
-                field("IP or CIDR") { TextField("10.10.0.5, 10.10.0.0/24 or fd00::/64", text: $ip).textFieldStyle(.quiet) }
-                HStack(alignment: .firstTextBaseline, spacing: 16) {
-                    field("Shared secret") { TextField("secret", text: $secret).textFieldStyle(.quiet).font(.body.monospaced()) }
-                    Button("Generate") { secret = UsersModel.suggestPassword(length: 24) }.buttonStyle(.quietLink)
+        QuietSheet(title: client == nil ? "New RADIUS client" : "Edit \(client?.name ?? "")", width: 520, failure: failure) {
+                SheetField("Name") { QuietTextField("Name", text: $name, prompt: "Switch 3F").textFieldStyle(.quiet) }
+                SheetField("IP or CIDR") { QuietTextField("IP or CIDR", text: $ip, prompt: "10.10.0.5, 10.10.0.0/24 or fd00::/64").textFieldStyle(.quietMonospaced) }
+                SheetField("Shared secret") {
+                    HStack(alignment: .firstTextBaseline, spacing: 16) {
+                        QuietTextField("Shared secret", text: $secret, prompt: "secret").textFieldStyle(.quietMonospaced)
+                        Button("Generate") { secret = UsersModel.suggestPassword(length: 24) }.buttonStyle(.quietLink)
+                        CopyButton(value: secret)
+                    }
                 }
-                Toggle("Enabled", isOn: $enabled).toggleStyle(.quiet)
+                SheetToggle("Enabled", isOn: $enabled)
                 VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Require Message-Authenticator", isOn: $requireMA).toggleStyle(.quiet)
+                    SheetToggle("Require Message-Authenticator", isOn: $requireMA)
                     Text(requireMA
                          ? "Requests without it are dropped (Blast-RADIUS protection). EAP always needs it."
                          : "Only for an old NAS that cannot send it: PAP/MS-CHAPv2 requests are then open to Blast-RADIUS forgery.")
-                        .font(Theme.detail).foregroundStyle(requireMA ? Theme.muted : Theme.attention)
+                        .font(Theme.caption).foregroundStyle(requireMA ? Theme.faint : Theme.attention)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                HStack(alignment: .firstTextBaseline, spacing: 16) {
-                    field("Change of Authorization") {
-                        Menu(coaVendor.title) {
-                            ForEach(CoAVendor.allCases, id: \.self) { v in
-                                Button(v.title) {
-                                    // Moving between vendors follows the usual port unless it was changed by hand.
-                                    if coaPort == String(coaVendor.suggestedPort) { coaPort = String(v.suggestedPort) }
-                                    coaVendor = v
-                                }
-                            }
+                HStack(alignment: .top, spacing: 16) {
+                    SheetField("Change of Authorization") {
+                        SheetPicker("Change of Authorization", selection: Binding(get: { coaVendor }, set: { v in
+                            // Moving between vendors follows the usual port unless it was changed by hand.
+                            if coaPort == String(coaVendor.suggestedPort) { coaPort = String(v.suggestedPort) }
+                            coaVendor = v
+                        })) {
+                            ForEach(CoAVendor.allCases, id: \.self) { Text($0.title).tag($0) }
                         }
-                        .menuStyle(.button).buttonStyle(.quietLink).fixedSize()
                     }
-                    field("CoA port") { TextField("3799", text: $coaPort).textFieldStyle(.quiet).frame(width: 80) }
+                    SheetField("CoA port") { QuietTextField("CoA port", text: $coaPort, prompt: "3799").textFieldStyle(.quiet) }
+                        .frame(width: 100)
                 }
-                Text("Used to reauthenticate or disconnect a session (RFC 5176), by hand or when a device's profile changes. Cisco IOS listens on 1700, most others on 3799; the NAS must accept CoA from this Mac with the same shared secret.")
-                    .font(Theme.detail).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
-            }
-            if let failure { Text(failure).foregroundStyle(Theme.attention).font(Theme.detail) }
-            HStack {
-                Spacer()
+                QuietNote("Used to reauthenticate or disconnect a session (RFC 5176), by hand or when a device's profile changes. Cisco IOS listens on 1700, most others on 3799; the NAS must accept CoA from this Mac with the same shared secret.")
+        } actions: {
                 Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
                 Button("Save") {
                     busy = true
@@ -227,23 +221,13 @@ struct RadiusClientSheet: View {
                 }
                 .buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
                 .disabled(busy || name.isEmpty || ip.isEmpty || secret.isEmpty || (UInt16(coaPort.trimmingCharacters(in: .whitespaces)) ?? 0) == 0)
-            }
         }
-        .padding(24).frame(width: 480)
-        .background(Theme.background)
         .onAppear {
             if let client {
                 name = client.name; ip = client.ip; secret = client.secret; enabled = client.enabled
                 requireMA = client.requireMessageAuthenticator
                 coaVendor = client.coaVendor; coaPort = String(client.coaPort)
             }
-        }
-    }
-
-    private func field(_ label: String, @ViewBuilder control: () -> some View) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(label).font(Theme.caption).foregroundStyle(Theme.muted)
-            control()
         }
     }
 }
@@ -374,41 +358,40 @@ struct RadiusPolicySheet: View {
     @State private var failure: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(policy == nil ? "New policy" : "Edit \(policy?.name ?? "")")
-                .font(Theme.emphasis).foregroundStyle(Theme.ink)
-            TextField("Policy name", text: $name).textFieldStyle(.quiet)
-            HStack(spacing: 24) {
-                Toggle("Enabled", isOn: $enabled).toggleStyle(.quiet)
-                Toggle("Allow MAC Authentication Bypass", isOn: $allowsMAB).toggleStyle(.quiet)
-            }
-            if allowsMAB {
-                Text("MAB requests (the NAS sends the device's MAC instead of credentials) are tried only against rules that allow them, with auth_method = mab. Match them by device_category, registered_device or device_group — a MAC is easy to copy.")
-                    .font(Theme.detail).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
-            }
-            HStack(alignment: .firstTextBaseline, spacing: 16) {
-                Text("Then").font(Theme.caption).foregroundStyle(Theme.muted)
-                Menu(action.title) {
-                    ForEach(RADIUSPolicy.Action.allCases, id: \.self) { a in Button(a.title) { action = a } }
+        QuietSheet(title: policy == nil ? "New policy" : "Edit \(policy?.name ?? "")", width: 680, failure: failure) {
+            SheetField("Name") { QuietTextField("Name", text: $name, prompt: "Staff Wi-Fi").textFieldStyle(.quiet) }
+            SheetToggle("Enabled", isOn: $enabled)
+            VStack(alignment: .leading, spacing: 4) {
+                SheetToggle("Allow MAC Authentication Bypass", isOn: $allowsMAB)
+                if allowsMAB {
+                    Text("MAB requests (the NAS sends the device's MAC instead of credentials) are tried only against rules that allow them, with auth_method = mab. Match them by device_category, registered_device or device_group — a MAC is easy to copy.")
+                        .font(Theme.caption).foregroundStyle(Theme.faint).fixedSize(horizontal: false, vertical: true)
                 }
-                .menuStyle(.button).buttonStyle(.quietLink).fixedSize()
+            }
+            HStack(alignment: .top, spacing: 16) {
+                SheetField("Then") {
+                    SheetPicker("Then", selection: $action) {
+                        ForEach(RADIUSPolicy.Action.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                }
+                .fixedSize()
                 if action == .acceptVLAN {
-                    TextField("VLAN", text: $vlan).textFieldStyle(.quiet).frame(width: 90)
+                    SheetField("VLAN") { QuietTextField("VLAN", text: $vlan, prompt: "20").textFieldStyle(.quiet) }
+                        .frame(width: 100)
                 }
+                Spacer(minLength: 0)
             }
 
-            Text("When ALL of these match").font(Theme.caption).foregroundStyle(Theme.muted)
-            Text("User-Name is what the NAS sent — for PEAP/TTLS the outer identity, often anonymous. "
-                 + "account is who actually signed in: the sAMAccountName or UPN of the inner identity, the certificate or the PAP user.")
-                .font(Theme.detail).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
-            ScrollView {
+            SheetField("When ALL of these match") {
                 VStack(alignment: .leading, spacing: 10) {
+                    // What the two names mean, before the rows that use them.
+                    QuietNote("User-Name is what the NAS sent — for PEAP/TTLS the outer identity, often anonymous. "
+                              + "account is who actually signed in: the sAMAccountName or UPN of the inner identity, the certificate or the PAP user.")
                     ForEach($rows) { $item in
-                        HStack(alignment: .top) {
+                        HStack(alignment: .firstTextBaseline, spacing: 12) {
                             RadiusRowEditor(row: $item.row)
                             Button("Remove") { rows.removeAll { $0.id == item.id } }.buttonStyle(.quietLink)
                         }
-                        Divider().overlay(Theme.line)
                     }
                 }
             }
@@ -422,10 +405,11 @@ struct RadiusPolicySheet: View {
 
             if action.accepts {
                 Text(action == .acceptVLAN ? "Also return" : "Return attributes").font(Theme.caption).foregroundStyle(Theme.muted)
+                    .padding(.top, 6)
                 ForEach($attributes) { $attr in
-                    HStack {
-                        Text(attr.title).font(Theme.detail).foregroundStyle(Theme.ink).frame(width: 200, alignment: .leading)
-                        TextField("value", text: $attr.value).textFieldStyle(.quiet).font(Theme.detail.monospaced())
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Text(attr.title).font(Theme.body).foregroundStyle(Theme.ink).frame(width: 220, alignment: .leading)
+                        QuietTextField(attr.title, text: $attr.value, prompt: "value").textFieldStyle(.quiet)
                         Button("Remove") { attributes.removeAll { $0.id == attr.id } }.buttonStyle(.quietLink)
                     }
                 }
@@ -442,10 +426,7 @@ struct RadiusPolicySheet: View {
                 }
                 .menuStyle(.button).buttonStyle(.quietLink).fixedSize()
             }
-
-            if let failure { Text(failure).foregroundStyle(Theme.attention).font(Theme.detail) }
-            HStack {
-                Spacer()
+        } actions: {
                 Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
                 Button("Save") {
                     busy = true
@@ -465,10 +446,7 @@ struct RadiusPolicySheet: View {
                 }
                 .buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
                 .disabled(busy || name.isEmpty || (action == .acceptVLAN && vlan.trimmingCharacters(in: .whitespaces).isEmpty))
-            }
         }
-        .padding(24).frame(width: 680, height: 660)
-        .background(Theme.background)
         .onAppear {
             if let policy {
                 name = policy.name; enabled = policy.enabled
@@ -525,6 +503,7 @@ struct RadiusRowEditor: View {
             }
         }
         .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.inset, in: RoundedRectangle(cornerRadius: 6))
     }
 }
@@ -534,17 +513,17 @@ struct RadiusConditionEditor: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Menu(condition.field.rawValue) {
-                ForEach(RADIUSPolicy.Condition.Field.allCases, id: \.self) { f in Button(f.rawValue) { condition.field = f } }
+            Picker("Attribute", selection: $condition.field) {
+                ForEach(RADIUSPolicy.Condition.Field.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
-            .menuStyle(.button).buttonStyle(.quietLink).fixedSize()
-            Menu(condition.op.rawValue) {
-                ForEach(RADIUSPolicy.Condition.Op.allCases, id: \.self) { o in Button(o.rawValue) { condition.op = o } }
+            .labelsHidden().pickerStyle(.menu).fixedSize()
+            Picker("Comparison", selection: $condition.op) {
+                ForEach(RADIUSPolicy.Condition.Op.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
-            .menuStyle(.button).buttonStyle(.quietLink).fixedSize()
-            TextField(condition.field.placeholder, text: $condition.value).textFieldStyle(.quiet).frame(width: 200)
+            .labelsHidden().pickerStyle(.menu).fixedSize()
+            QuietTextField("Value", text: $condition.value, prompt: condition.field.placeholder).textFieldStyle(.quiet)
+                .frame(minWidth: 140, maxWidth: .infinity)
         }
-        .font(Theme.detail)
     }
 }
 
@@ -552,11 +531,15 @@ struct RadiusConditionEditor: View {
 
 /// Accounting sessions (Start / Interim-Update / Stop, kept 30 days) with RFC 5176 actions:
 /// Reauthenticate (the NAS's flavour: Cisco reauthenticate, Aruba port bounce, else Disconnect)
-/// and Disconnect, each confirmed first.
+/// and Disconnect, each confirmed first. Active = no Stop and a Start/Interim-Update within a
+/// day (`DirectoryStore.radiusSessionStaleAfter`); an open session past that (its Stop was
+/// probably lost) is listed with the ended ones as "no recent updates", still actionable.
 struct RadiusSessions: View {
     @Environment(AppModel.self) private var model
     @State private var sessions: [DirectoryStore.RadiusSession] = []
     @State private var showEnded = false
+    /// When the list was loaded: what active / no recent updates are judged against.
+    @State private var loadedAt = Date()
     @State private var confirm: (action: CoAAction, session: DirectoryStore.RadiusSession)?
     @State private var message: String?
     @State private var failed = false
@@ -585,10 +568,12 @@ struct RadiusSessions: View {
                                     VStack(alignment: .leading, spacing: 2) {
                                         HStack(spacing: 10) {
                                             Text(session.userName ?? "-").font(Theme.body)
-                                                .foregroundStyle(session.active ? Theme.ink : Theme.faint)
+                                                .foregroundStyle(session.isActive(at: loadedAt) ? Theme.ink : Theme.faint)
                                             Text(session.mac ?? session.callingStationId ?? "")
                                                 .font(Theme.detail.monospaced()).foregroundStyle(Theme.muted)
-                                            if !session.active {
+                                            if session.isStale(at: loadedAt) {
+                                                StateText(text: "no recent updates", attention: false, dimmed: true)
+                                            } else if !session.open {
                                                 StateText(text: "ended" + (session.terminateCause.map { " · \(RADIUSNames.terminateCause($0))" } ?? ""),
                                                           attention: false, dimmed: true)
                                             }
@@ -597,7 +582,7 @@ struct RadiusSessions: View {
                                             .lineLimit(1).textSelection(.enabled)
                                     }
                                     Spacer(minLength: 8)
-                                    if session.active {
+                                    if session.open {
                                         Menu("Act") {
                                             Button("Reauthenticate…") { confirm = (.reauthenticate, session) }
                                             Button("Disconnect…", role: .destructive) { confirm = (.disconnect, session) }
@@ -648,7 +633,9 @@ struct RadiusSessions: View {
     }
 
     private func reload() async {
+        let now = Date()
         sessions = await model.controller.radiusSessions(activeOnly: !showEnded)
+        loadedAt = now
     }
 }
 
@@ -737,30 +724,24 @@ struct RadiusDeviceSheet: View {
     @State private var failure: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(device == nil ? "Register a device" : "Edit \(device?.mac ?? "")").font(Theme.emphasis).foregroundStyle(Theme.ink)
-            TextField("MAC (aa:bb:cc:dd:ee:ff, AABBCCDDEEFF, aabb.ccdd.eeff)", text: $mac).textFieldStyle(.quiet)
-                .font(.body.monospaced()).disabled(device != nil)
-            TextField("Description (Printer 3F)", text: $description).textFieldStyle(.quiet)
-            TextField("Group (optional, e.g. Printers)", text: $group).textFieldStyle(.quiet)
-            if let failure { Text(failure).foregroundStyle(Theme.attention).font(Theme.detail) }
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button("Save") {
-                    let d = DirectoryStore.RegisteredDevice(mac: mac, description: description, group: group,
-                                                            addedAt: device?.addedAt ?? Date())
-                    Task {
-                        do { try await model.controller.saveRegisteredDevice(d); onDone(); dismiss() }
-                        catch { failure = "\(error)" }
-                    }
+        QuietSheet(title: device == nil ? "Register a device" : "Edit \(device?.mac ?? "")", width: 480, failure: failure) {
+            if device == nil {
+                SheetField("MAC", note: "aa:bb:cc:dd:ee:ff, AABBCCDDEEFF or aabb.ccdd.eeff") {
+                    QuietTextField("MAC", text: $mac, prompt: "aa:bb:cc:dd:ee:ff").textFieldStyle(.quietMonospaced)
                 }
-                .buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
-                .disabled(RADIUSMAC.normalize(mac) == nil)
+            }
+            SheetField("Description") { QuietTextField("Description", text: $description, prompt: "Printer 3F").textFieldStyle(.quiet) }
+            SheetField("Group (optional)") { QuietTextField("Group", text: $group, prompt: "Printers").textFieldStyle(.quiet) }
+        } actions: {
+            SheetButtons("Save", disabled: RADIUSMAC.normalize(mac) == nil) {
+                let d = DirectoryStore.RegisteredDevice(mac: mac, description: description, group: group,
+                                                        addedAt: device?.addedAt ?? Date())
+                Task {
+                    do { try await model.controller.saveRegisteredDevice(d); onDone(); dismiss() }
+                    catch { failure = "\(error)" }
+                }
             }
         }
-        .padding(24).frame(width: 440)
-        .background(Theme.background)
         .onAppear {
             if let device { mac = device.mac; description = device.description; group = device.group ?? "" }
         }

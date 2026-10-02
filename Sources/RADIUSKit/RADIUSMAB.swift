@@ -53,8 +53,8 @@ public enum RADIUSMAC {
 /// directory: a MAB request is evaluated only by policies that allow MAB, with
 /// `auth_method = mab`, and no directory account is ever signed in by it.
 ///
-/// Recognised forms (no EAP-Message; User-Name is a MAC in a known format; Calling-Station-Id,
-/// when it is a MAC, the same one):
+/// Recognised forms (no EAP-Message; User-Name is a MAC in a known format; Calling-Station-Id
+/// present, a MAC, and the same one):
 /// - Cisco: Service-Type = Call-Check (10) — the password, if any, is not consulted.
 /// - Aruba / Huawei / generic PAP: User-Password (decrypted) is the same MAC in any format.
 /// - CHAP (Huawei `mac-authen` CHAP, some HPE): CHAP-Password over the MAC as the password.
@@ -69,9 +69,12 @@ public enum MABDetector {
     public static func detect(_ packet: RADIUSPacket, secret: [UInt8]) -> Result? {
         guard packet.code == .accessRequest, packet.first(.eapMessage) == nil,
               let user = packet.string(.userName), let mac = RADIUSMAC.normalize(user) else { return nil }
-        if let calling = packet.string(.callingStationId), let callingMAC = RADIUSMAC.normalize(calling), callingMAC != mac {
-            return nil
-        }
+        // Review fix (2 Oct 2026): the Calling-Station-Id is what makes it MAB. Every switch and
+        // controller doing MAB sends it; a request without one (or with a non-MAC one, e.g. a VPN
+        // concentrator's client IP) comes from a PAP/CHAP client — VPN, captive portal — where
+        // anyone can type a registered device's MAC as user and password and would otherwise get
+        // that device's VLAN. Such a request takes the normal password path instead.
+        guard let calling = packet.string(.callingStationId), RADIUSMAC.normalize(calling) == mac else { return nil }
         if packet.integer(.serviceType) == 10 { return Result(mac: mac, form: "Call-Check") }
         if let hidden = packet.first(.userPassword)?.value {
             guard let plain = RADIUSPacket.userPassword(hidden, secret: secret, authenticator: packet.authenticator),

@@ -93,4 +93,7 @@ public enum ServeRuntimeEvent: Sendable, Equatable {
     case addressesChanged(advertised: String?, addresses: [String], pinned: Bool)
     /// DHCP's listeners changed by themselves (a busy port came free and the retry bound it).
     case dhcpChanged
+    /// Listeners restarted by themselves (LDAP/EST/HTTPS after the DC certificate was reissued
+    /// for a new address); `failures` holds the errors of those that did not come back.
+    case listenersChanged(failures: [String])
 }

@@ -32,6 +32,17 @@ public enum GPOCommand: Equatable, Sendable {
     case wiredShow
     case wiredSet(WiredOptions)
     case wiredOff
+    /// A publishing `wifi`/`wired` command with `--include-draft`: the app's unpublished Group
+    /// Policy ▸ Wi-Fi / Wired changes are published along with it (refused without the flag).
+    indirect case includingDraft(GPOCommand)
+
+    /// The `wifi`/`wired` commands that publish the 802.1X profiles.
+    public var publishesDot1X: Bool {
+        switch self {
+        case .wifiAdd, .wifiSet, .wifiRemove, .wifiPolicy, .wiredSet, .wiredOff, .includingDraft: true
+        default: false
+        }
+    }
 }
 
 /// `--server labdc` / `--server-names a;b --trusted-root <sha1|file>`: which RADIUS server a
@@ -139,6 +150,8 @@ extension CLIParser {
           labdc gpo wired [show] | set [--method tls|peap] [--sign-in …] [--name …] [--description …] [RADIUS server] | off [--data <dir>]
             (wifi add/set/remove/policy and wired set/off publish to the Default Domain Policy at once;
              the SSID defaults to the profile name; renaming a profile removes the old-named one from PCs)
+            --include-draft (wifi add/set/remove/policy, wired set/off): when the app's Group Policy page has
+              changes not published yet, publish them together with this one (without it the command refuses)
         """
 
     static func parseSecurity(_ s: String) throws -> Dot1XPolicy.Security {
@@ -220,8 +233,24 @@ extension CLIParser {
          try o.values["--prompt-user"].map { try parseOnOff("--prompt-user", $0) })
     }
 
+    /// `--include-draft` taken out of `args`; the publishing command parsed from the rest is
+    /// wrapped in `.includingDraft`.
+    static func parseIncludingDraft(_ args: [String], _ parse: ([String]) throws -> CLICommand) throws -> CLICommand {
+        let rest = args.filter { $0 != "--include-draft" }
+        let command = try parse(rest)
+        guard rest.count != args.count else { return command }
+        guard case let .gpo(data, sub) = command, sub.publishesDot1X else {
+            throw CLIError.usage("--include-draft goes with a command that publishes (wifi add/set/remove/policy, wired set/off)")
+        }
+        return .gpo(data: data, .includingDraft(sub))
+    }
+
     /// `labdc gpo wifi …`
     static func parseWiFi(_ args: [String], defaultData: URL) throws -> CLICommand {
+        try parseIncludingDraft(args) { try parseWiFiCommand($0, defaultData: defaultData) }
+    }
+
+    static func parseWiFiCommand(_ args: [String], defaultData: URL) throws -> CLICommand {
         guard let verb = args.first else { throw CLIError.usage("gpo wifi needs list, add, set, remove or policy") }
         let rest = Array(args.dropFirst())
         switch verb {
@@ -276,6 +305,10 @@ extension CLIParser {
 
     /// `labdc gpo wired …`
     static func parseWired(_ args: [String], defaultData: URL) throws -> CLICommand {
+        try parseIncludingDraft(args) { try parseWiredCommand($0, defaultData: defaultData) }
+    }
+
+    static func parseWiredCommand(_ args: [String], defaultData: URL) throws -> CLICommand {
         let verb = args.first.flatMap { $0.hasPrefix("--") ? nil : $0 } ?? "show"
         let rest = args.first == verb ? Array(args.dropFirst()) : args
         switch verb {
@@ -383,8 +416,11 @@ public enum GPOCommands {
     }
 
     static func run(_ command: GPOCommand, editor: GroupPolicyEditor, info: DomainInfo, dir: DataDirectory,
-                    out: (String) -> Void) async throws {
+                    includeDraft: Bool = false, out: (String) -> Void) async throws {
         switch command {
+        case .includingDraft(let inner):
+            try await run(inner, editor: editor, info: info, dir: dir, includeDraft: true, out: out)
+
         case .initialize:
             let result = try await editor.ensureDefaultGPOs()
             for gpo in result.createdGPOs { out("created \(gpo.displayName) \(gpo.guid)") }
@@ -483,7 +519,7 @@ public enum GPOCommands {
             out(publishState(draft: draft, published: published))
 
         case let .wifiAdd(name, options):
-            try await editDot1X(dir: dir, editor: editor, out: out) { set in
+            try await editDot1X(dir: dir, editor: editor, includeDraft: includeDraft, out: out) { set in
                 if set.wireless(named: name) != nil { throw CLIError.failure("there is already a Wi-Fi profile named \(name); use gpo wifi set") }
                 var profile = options.applied(to: Dot1XProfileSet.Wireless(name: name))
                 profile.name = name
@@ -494,7 +530,7 @@ public enum GPOCommands {
             }
 
         case let .wifiSet(name, options):
-            try await editDot1X(dir: dir, editor: editor, out: out) { set in
+            try await editDot1X(dir: dir, editor: editor, includeDraft: includeDraft, out: out) { set in
                 guard let current = set.wireless(named: name) else { throw CLIError.failure("no Wi-Fi profile named \(name)") }
                 var changed = options.applied(to: current)
                 changed.server = try resolve(options.server, current: current.server, in: &set)
@@ -505,15 +541,15 @@ public enum GPOCommands {
             }
 
         case .wifiRemove(let name):
-            try await editDot1X(dir: dir, editor: editor, out: out) { set in
+            try await editDot1X(dir: dir, editor: editor, includeDraft: includeDraft, out: out) { set in
                 guard set.remove(named: name) else { throw CLIError.failure("no Wi-Fi profile named \(name)") }
                 return "removed \(name)"
             }
 
         case let .wifiPolicy(name, description):
-            try await editDot1X(dir: dir, editor: editor, out: out) { set in
+            try await editDot1X(dir: dir, editor: editor, includeDraft: includeDraft, out: out) { set in
                 if let name { set.name = name.trimmingCharacters(in: .whitespaces) }
-                if let description { set.description = description }
+                if let description { set.description = description.trimmingCharacters(in: .whitespacesAndNewlines) }
                 return "wireless policy \"\(set.name)\"" + (set.description.isEmpty ? "" : ": \(set.description)")
             }
 
@@ -529,7 +565,7 @@ public enum GPOCommands {
             out(publishState(draft: draft, published: published))
 
         case let .wiredSet(options):
-            try await editDot1X(dir: dir, editor: editor, out: out) { set in
+            try await editDot1X(dir: dir, editor: editor, includeDraft: includeDraft, out: out) { set in
                 var w = set.wired ?? Dot1XProfileSet.Wired()
                 if let m = options.method { w.method = m }
                 if let s = options.signInAs { w.signInAs = s }
@@ -543,7 +579,7 @@ public enum GPOCommands {
             }
 
         case .wiredOff:
-            try await editDot1X(dir: dir, editor: editor, out: out) { set in
+            try await editDot1X(dir: dir, editor: editor, includeDraft: includeDraft, out: out) { set in
                 set.wired = nil
                 return "wired 802.1X off"
             }
@@ -552,9 +588,23 @@ public enum GPOCommands {
 
     /// Edits the 802.1X profiles (the same list as the app's Group Policy page), publishes them
     /// to the Default Domain Policy and keeps them as the page's list.
-    static func editDot1X(dir: DataDirectory, editor: GroupPolicyEditor, out: (String) -> Void,
-                          _ edit: (inout Dot1XProfileSet) throws -> String) async throws {
-        var set = try await GroupPolicyDot1X.draft(dir, editor: editor)
+    ///
+    /// The page's list may hold edits the owner has not published yet. A CLI change starts from
+    /// what is published and refuses while such edits exist (it would publish them too, unseen);
+    /// `includeDraft` (`--include-draft`) starts from the page's list and publishes everything.
+    static func editDot1X(dir: DataDirectory, editor: GroupPolicyEditor, includeDraft: Bool = false,
+                          out: (String) -> Void, _ edit: (inout Dot1XProfileSet) throws -> String) async throws {
+        let published = try await editor.publishedDot1XProfiles().set
+        var set = published
+        if let saved = GroupPolicyDot1X.savedDraft(dir) {
+            if saved != published, !includeDraft {
+                out("warning: the app's Group Policy ▸ Wi-Fi / Wired list has changes not published yet")
+                throw CLIError.failure("refused: this change would publish those unpublished changes too. Publish or undo them "
+                                       + "in the app first, or pass --include-draft to publish them together with this change")
+            }
+            if saved != published { out("note: publishing the app's unpublished Group Policy changes too (--include-draft)") }
+            set = saved
+        }
         let what: String
         do { what = try edit(&set) } catch let e as Dot1XPolicy.Invalid { throw CLIError.failure("\(e)") }
         let pki: LabPKI

@@ -61,9 +61,11 @@ public enum DHCPv6Engine {
         var scopes: [DHCPScope] = []
         var linkText: String
         if env.isRelayed {
-            guard settings.allowsRelay([arrival.source.description] + env.relays.map(\.linkAddress.description).filter { $0 != "::" }) else {
+            guard config.admitsRelay(source: arrival.source, linkAddresses: env.relays.map(\.linkAddress)) else {
                 out.common.counters = [.droppedRelay]
-                out.common.quiet = ("relay6 \(arrival.source)", "DHCPv6 \(m.type) via relay \(arrival.source) dropped: not an allowed relay")
+                let why = settings.allowedRelays.isEmpty
+                    ? "link-address and source outside every v6 scope (list the relay under allowed relays)" : "not an allowed relay"
+                out.common.quiet = ("relay6 \(arrival.source)", "DHCPv6 \(m.type) via relay \(arrival.source) dropped: \(why)")
                 return out
             }
             // RFC 8415 §13.1: the innermost non-:: link-address, else the relay's source.
@@ -79,9 +81,18 @@ public enum DHCPv6Engine {
             scopes = config.scopes(forLink: g)
             linkText = "direct on \(ifname)"
         } else {
-            // A client unicast to us without Server Unicast: RFC 8415 §18.3 UseMulticast.
-            guard [.request, .renew, .release, .decline].contains(m.type), let cid = m.clientDUID else {
+            // A client unicast to us without Server Unicast: RFC 8415 §18.3 UseMulticast — only
+            // on an interface LabDC serves directly (relay-only otherwise) and only to a message
+            // addressed to this server's DUID.
+            guard let ifname = arrival.interfaceName, settings.directInterfaces.contains(ifname) else {
                 out.common.counters = [.ignoredLocal]
+                out.common.quiet = ("local6", "DHCPv6 \(m.type) unicast from \(arrival.source) ignored (relay-only)")
+                return out
+            }
+            guard [.request, .renew, .release, .decline].contains(m.type), let cid = m.clientDUID,
+                  let sid = m.serverDUID, sid == config.serverDUID else {
+                out.common.counters = [.ignoredLocal]
+                out.common.quiet = ("unicast6 \(arrival.source)", "DHCPv6 \(m.type) unicast from \(arrival.source) not for this server, ignored")
                 return out
             }
             var reply = DHCPv6Message(type: .reply, transactionID: m.transactionID)
@@ -224,8 +235,12 @@ public enum DHCPv6Engine {
         if rapid { reply.options.append(DHCPv6Option(DHCPv6OptionCode.rapidCommit, [])) }
         var granted: [String] = []
         var anyAddress = false
-        for ia in c.m.iaNAs {
+        for (n, ia) in c.m.iaNAs.enumerated() {
             let key = clientKey(duid: c.clientDUID, iaid: ia.iaid)
+            guard n < Self.maxIAsPerMessage else {
+                reply.options.append(DHCPv6IANA(iaid: ia.iaid, options: [DHCPv6Option.status(.noAddrsAvail, "too many IA_NAs in one message")]).option)
+                continue
+            }
             // A REQUEST naming addresses on the wrong link: NotOnLink for that IA.
             if c.m.type == .request, !ia.addresses.isEmpty, ia.addresses.allSatisfy({ c.scope(containing: $0.address) == nil }) {
                 reply.options.append(DHCPv6IANA(iaid: ia.iaid, options: [DHCPv6Option.status(.notOnLink, "not on this link")]).option)
@@ -235,8 +250,17 @@ public enum DHCPv6Engine {
                 reply.options.append(DHCPv6IANA(iaid: ia.iaid, options: [DHCPv6Option.status(.noAddrsAvail, "no addresses available")]).option)
                 continue
             }
-            anyAddress = true
             let (address, scope, reservation) = picked
+            // A new binding (not this IA's current one, not a reservation): the per-DUID, relay
+            // and circuit caps apply.
+            let current = leases.lease(.v6, address.description).map { $0.clientKey == key && $0.holds(at: c.now) } ?? false
+            if !current, reservation == nil, let why = capReason(c, leases, key: key) {
+                out.common.counters.append(.capped)
+                out.common.quiet = (why.key, "\(why.text); no address for \(c.who)")
+                reply.options.append(DHCPv6IANA(iaid: ia.iaid, options: [DHCPv6Option.status(.noAddrsAvail, "no addresses available")]).option)
+                continue
+            }
+            anyAddress = true
             var l = leases.lease(.v6, address.description) ?? DHCPLease(family: .v6, address: address.description, scopeID: scope.id,
                                                                          state: .offered, clientKey: key, start: c.now, expires: c.now)
             if l.clientKey != key {
@@ -282,6 +306,38 @@ public enum DHCPv6Engine {
                 + (rapid ? " (rapid commit)" : "")
         }
         return reply
+    }
+
+    /// IA_NAs answered per message (the rest get NoAddrsAvail).
+    static let maxIAsPerMessage = 8
+    /// Addresses one DUID may hold across its IAs.
+    static let maxLeasesPerDUID = 16
+
+    /// The per-DUID cap and the relay / circuit caps (Settings), nil when none is reached.
+    static func capReason(_ c: Context, _ leases: DHCPLeaseTable, key: String) -> (key: String, text: String)? {
+        let settings = c.config.settings
+        let duid = DHCPHex.string(c.clientDUID)
+        let mine = DHCPLeaseTable.holding(leases.leases(duid: duid), now: c.now, limit: Self.maxLeasesPerDUID,
+                                          includeForeign: true, excludingClient: key)
+        if mine >= Self.maxLeasesPerDUID {
+            return ("cap duid \(duid)", "DHCPv6: DUID \(duid.prefix(20)) holds \(mine) addresses (cap \(Self.maxLeasesPerDUID))")
+        }
+        if settings.maxLeasesPerRelay > 0, c.env.isRelayed {
+            let n = DHCPLeaseTable.holding(leases.leases(relay: c.arrival.source.description, family: .v6), now: c.now,
+                                           limit: settings.maxLeasesPerRelay, includeForeign: false)
+            if n >= settings.maxLeasesPerRelay {
+                return ("cap relay6 \(c.arrival.source)", "DHCPv6: relay \(c.arrival.source) has \(n) leases (cap \(settings.maxLeasesPerRelay))")
+            }
+        }
+        if settings.maxLeasesPerCircuit > 0, let iid = c.env.relays.last?.interfaceID {
+            let hex = DHCPHex.string(iid)
+            let n = DHCPLeaseTable.holding(leases.leases(circuit: hex, family: .v6), now: c.now,
+                                           limit: settings.maxLeasesPerCircuit, includeForeign: false)
+            if n >= settings.maxLeasesPerCircuit {
+                return ("cap circuit6 \(hex)", "DHCPv6: interface-id \(hex) has \(n) leases (cap \(settings.maxLeasesPerCircuit))")
+            }
+        }
+        return nil
     }
 
     /// The client's binding for this IA, its reservation, the address it asked for, else a
@@ -334,47 +390,57 @@ public enum DHCPv6Engine {
         return nil
     }
 
-    /// RENEW / REBIND: extend the client's bindings; zero lifetimes for addresses that are not
-    /// ours or not on the link; NoBinding for a RENEW we know nothing about.
+    /// RENEW / REBIND (RFC 8415 §18.3.4–5): extend the client's bindings on this link; zero
+    /// lifetimes for addresses that are not on the link; NoBinding for a RENEW IA we know nothing
+    /// about; silence for an unknown REBIND (the production server may hold it).
     static func renew(_ c: Context, _ leases: inout DHCPLeaseTable, _ out: inout DHCPv6Outcome) -> DHCPv6Message? {
         out.common.counters.append(.renew)
         var reply = DHCPv6Message(type: .reply, transactionID: c.m.transactionID)
         reply.options = [DHCPv6Option(DHCPv6OptionCode.clientID, c.clientDUID), DHCPv6Option(DHCPv6OptionCode.serverID, c.config.serverDUID)]
         var extended: [String] = []
         var answered = false
-        for ia in c.m.iaNAs {
+        for ia in c.m.iaNAs.prefix(Self.maxIAsPerMessage) {
             let key = clientKey(duid: c.clientDUID, iaid: ia.iaid)
             var addresses: [DHCPv6IANA.Address] = []
-            var found = false
+            var bound: DHCPScope?
             for hint in ia.addresses {
+                guard let linkScope = c.scope(containing: hint.address) else {
+                    // Not appropriate for the link the client is on.
+                    addresses.append(.init(address: hint.address, preferred: 0, valid: 0))
+                    continue
+                }
                 if var l = leases.lease(.v6, hint.address.description), l.clientKey == key,
                    [.active, .expired, .released].contains(l.state),
-                   let scope = c.config.scope(id: l.scopeID), scope.enabled, scope.contains(l.address),
                    !leases.heldByOther(.v6, l.address, client: key, now: c.now) {
-                    found = true
+                    // The lease's own scope when it is one of this link's (enabled) scopes.
+                    let scope = c.scopes.first { $0.id == l.scopeID && $0.contains(l.address) } ?? linkScope
+                    if bound == nil { bound = scope }
                     let wasActive = l.state == .active && l.expires > c.now
+                    let reservation = c.reservation().flatMap { IPv6Address($0.address) == hint.address ? $0 : nil }
                     if !wasActive { l.start = c.now }
                     l.state = .active
                     l.expires = c.now.addingTimeInterval(TimeInterval(scope.leaseSeconds))
-                    fill(&l, c, scope: scope, reservation: nil, iaid: ia.iaid)
+                    fill(&l, c, scope: scope, reservation: reservation, iaid: ia.iaid)
                     leases.put(l)
                     addresses.append(.init(address: hint.address, preferred: UInt32(scope.preferredLifetime), valid: UInt32(scope.leaseSeconds)))
                     extended.append(l.address)
-                    if !wasActive, let action = dnsAction(c, scope: scope, reservation: nil, lease: l) { out.common.dns.append(action) }
+                    if !wasActive, let action = dnsAction(c, scope: scope, reservation: reservation, lease: l) { out.common.dns.append(action) }
                     out.common.events.append(DHCPEvent(date: c.now, family: .v6, address: l.address, mac: l.mac, clientKey: key,
                                                        kind: "REPLY", detail: "\(c.m.type == .renew ? "renew" : "rebind") \(c.via)"))
-                } else if c.scope(containing: hint.address) == nil || c.m.type == .renew {
-                    // Not appropriate for the link, or a RENEW for an address that is not this client's here.
-                    addresses.append(.init(address: hint.address, preferred: 0, valid: 0))
                 }
             }
-            if found || !addresses.isEmpty {
+            if let bound {
+                // T1/T2 from the scope of the binding.
                 answered = true
-                let scope = addresses.first.flatMap { c.scope(containing: $0.address) } ?? c.scopes[0]
-                let pref = scope.preferredLifetime
-                reply.options.append(DHCPv6IANA(iaid: ia.iaid, t1: found ? UInt32(pref / 2) : 0, t2: found ? UInt32(pref * 4 / 5) : 0,
-                                                addresses: addresses).option)
+                let pref = bound.preferredLifetime
+                reply.options.append(DHCPv6IANA(iaid: ia.iaid, t1: UInt32(pref / 2), t2: UInt32(pref * 4 / 5), addresses: addresses).option)
+            } else if !addresses.isEmpty {
+                // Addresses that are not on this link: zero lifetimes, so the client stops using
+                // them (§18.3.4 / §18.3.5).
+                answered = true
+                reply.options.append(DHCPv6IANA(iaid: ia.iaid, t1: 0, t2: 0, addresses: addresses).option)
             } else if c.m.type == .renew {
+                // RFC 8415 §18.3.4: no binding for the IA → the IA with NoBinding, no addresses.
                 answered = true
                 reply.options.append(DHCPv6IANA(iaid: ia.iaid, options: [DHCPv6Option.status(.noBinding, "no binding")]).option)
             }
@@ -496,15 +562,18 @@ public enum DHCPv6Engine {
             if !data.isEmpty { r.options.append(DHCPv6Option(DHCPv6OptionCode.ntpServer, data)) }
         }
         for o in scope.customOptions + (c.policy(in: scope)?.options ?? []) {
-            guard wanted(o.code), let b = try? o.encode(v6: true) else { continue }
+            // Never the client/server ids, IA_NA or status (rows saved before validation refused them).
+            guard DHCPCustomOption.serverManagedV6[o.code] == nil, wanted(o.code), let b = try? o.encode(v6: true) else { continue }
             r.options.removeAll { $0.code == o.code }
             r.options.append(DHCPv6Option(o.code, b))
         }
     }
 
+    /// The Client FQDN answer: the name DNS registration uses (the reservation's host name
+    /// when the client has one).
     static func fqdnReply(_ c: Context, scope: DHCPScope) -> DHCPv6Option? {
         guard let f = c.m.clientFQDN else { return nil }
-        let plan = dnsPlan(c, scope: scope, reservation: nil)
+        let plan = dnsPlan(c, scope: scope, reservation: c.reservation())
         let r = ClientFQDN(s: plan.forward, o: plan.forward && !f.s, n: f.n && !plan.forward && !plan.ptr,
                            name: plan.fqdn ?? f.name, fullyQualified: plan.fqdn != nil || f.fullyQualified)
         return DHCPv6Option(DHCPv6OptionCode.clientFQDN, r.encodeV6())

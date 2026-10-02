@@ -166,56 +166,99 @@ public struct DNSRateLimit: Sendable, Equatable {
     public init() {}
 }
 
+/// The RRL state: two fixed-size tables of token buckets (client networks, and client network ×
+/// query name), as in BIND. A key is hashed (with the process's random seed, so a client cannot
+/// aim at another one's slot) to a set of `ways` adjacent slots; an unknown key takes an empty
+/// or else the stalest slot of its set. Memory is fixed whatever a flood of random names or
+/// random /56s sends, and a check is O(1) — no growing dictionary, no sweep (CVE audit 2 Oct 2026).
 struct DNSRateLimiter {
     enum Verdict: Equatable { case answer, slip, drop }
 
-    private struct Bucket {
-        var tokens: Double
-        var last: TimeInterval
+    private struct Slot {
+        /// The key's hash; 0: empty.
+        var key: Int = 0
+        var tokens: Double = 0
+        var last: TimeInterval = 0
         var limited = 0
     }
 
-    private struct NameKey: Hashable {
-        var client: DNSAddress
-        var name: DNSName
+    /// `count` slots in sets of `ways`, allocated on first use.
+    private struct Table {
+        static let ways = 4
+        private var slots: [Slot] = []
+        let count: Int
+
+        init(count: Int) { self.count = max(1, count / Self.ways) * Self.ways }
+
+        /// The index of `key`'s slot; a new key gets a full bucket.
+        mutating func slot(_ key: Int, burst: Double, now: TimeInterval) -> Int {
+            if slots.isEmpty { slots = Array(repeating: Slot(), count: count) }
+            let key = key == 0 ? 1 : key
+            let base = Int(UInt(bitPattern: key) % UInt(count / Self.ways)) * Self.ways
+            var victim = base
+            for i in base..<base + Self.ways {
+                if slots[i].key == key { return i }
+                if slots[victim].key == 0 { continue }
+                if slots[i].key == 0 || slots[i].last < slots[victim].last { victim = i }
+            }
+            slots[victim] = Slot(key: key, tokens: burst, last: now)
+            return victim
+        }
+
+        /// Refills slot `i` and takes one token; false (and the miss counted) when it is empty.
+        mutating func take(_ i: Int, rate: Double, burst: Double, now: TimeInterval) -> Bool {
+            slots[i].tokens = min(burst, slots[i].tokens + max(0, now - slots[i].last) * rate)
+            slots[i].last = now
+            guard slots[i].tokens >= 1 else {
+                slots[i].limited += 1
+                return false
+            }
+            slots[i].tokens -= 1
+            return true
+        }
+
+        func limited(_ i: Int) -> Int { slots[i].limited }
+
+        var occupied: Int { slots.reduce(0) { $0 + ($1.key == 0 ? 0 : 1) } }
     }
 
     let limit: DNSRateLimit
-    private var clients: [DNSAddress: Bucket] = [:]
-    private var names: [NameKey: Bucket] = [:]
-    private static let maxEntries = 20_000
+    private var clients: Table
+    private var names: Table
 
-    init(_ limit: DNSRateLimit) { self.limit = limit }
+    init(_ limit: DNSRateLimit, clientSlots: Int = 8192, nameSlots: Int = 32768) {
+        self.limit = limit
+        clients = Table(count: clientSlots)
+        names = Table(count: nameSlots)
+    }
 
-    /// Whether a response to `client` for `name` at `now` (seconds, monotonic) may go out.
+    /// Slots in use and slots in all, per table (tests).
+    var occupied: (clients: Int, names: Int) { (clients.occupied, names.occupied) }
+    var capacity: (clients: Int, names: Int) { (clients.count, names.count) }
+
+    /// Whether a response to `client` for `name` at `now` (seconds, monotonic) may go out. A
+    /// client network over its rate is limited before its name is looked at, so a flood of
+    /// random names from one network takes no name slots.
     mutating func check(client: DNSAddress, name: DNSName, now: TimeInterval) -> Verdict {
         let a = client.unmapped
         let net = a.masked(a.isIPv4 ? limit.ipv4Prefix : limit.ipv6Prefix)
-        let nameKey = NameKey(client: net, name: DNSName(labels: name.canonicalLabels))
-        if clients.count > Self.maxEntries { clients = clients.filter { now - $0.value.last < 60 } }
-        if names.count > Self.maxEntries { names = names.filter { now - $0.value.last < 60 } }
-        let clientOK = Self.take(&clients[net, default: Bucket(tokens: limit.clientBurst, last: now)],
-                                 rate: limit.clientRate, burst: limit.clientBurst, now: now)
-        let nameOK = Self.take(&names[nameKey, default: Bucket(tokens: limit.nameBurst, last: now)],
-                               rate: limit.nameRate, burst: limit.nameBurst, now: now)
-        if clientOK && nameOK { return .answer }
-        var count = 0
-        if !nameOK {
-            names[nameKey]?.limited += 1
-            count = names[nameKey]?.limited ?? 0
-        } else {
-            clients[net]?.limited += 1
-            count = clients[net]?.limited ?? 0
+        var hc = Hasher()
+        hc.combine(net)
+        let c = clients.slot(hc.finalize(), burst: limit.clientBurst, now: now)
+        guard clients.take(c, rate: limit.clientRate, burst: limit.clientBurst, now: now) else {
+            return verdict(clients.limited(c))
         }
-        return limit.slip > 0 && count % limit.slip == 0 ? .slip : .drop
+        var hn = Hasher()
+        hn.combine(net)
+        hn.combine(name)            // DNSName hashes case-insensitively
+        let n = names.slot(hn.finalize(), burst: limit.nameBurst, now: now)
+        guard names.take(n, rate: limit.nameRate, burst: limit.nameBurst, now: now) else {
+            return verdict(names.limited(n))
+        }
+        return .answer
     }
 
-    /// Refills `bucket` and takes one token; false when it is empty.
-    private static func take(_ bucket: inout Bucket, rate: Double, burst: Double, now: TimeInterval) -> Bool {
-        bucket.tokens = min(burst, bucket.tokens + max(0, now - bucket.last) * rate)
-        bucket.last = now
-        guard bucket.tokens >= 1 else { return false }
-        bucket.tokens -= 1
-        return true
+    private func verdict(_ count: Int) -> Verdict {
+        limit.slip > 0 && count % limit.slip == 0 ? .slip : .drop
     }
 }

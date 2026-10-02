@@ -95,6 +95,12 @@ public enum IssuanceError: Error, Sendable, Equatable, CustomStringConvertible {
     case overrideNotApplicable(String)
     case invalidValidity(requested: Int, maximum: Int)
     case caExpired(String)
+    /// The CA is retired (no longer trusted): it does not issue.
+    case caRetired(String)
+    /// The RSA compatibility root while RSA-only devices are not allowed.
+    case caNotTrusted(String)
+    /// The request asks for another CA than the one that issues the template.
+    case wrongCA(template: String, issuer: String, requested: String)
     case notProvisioned
     case unknownSerial(String)
     case alreadyRevoked(serial: String, reason: String)
@@ -122,6 +128,10 @@ public enum IssuanceError: Error, Sendable, Equatable, CustomStringConvertible {
         case .overrideNotApplicable(let s): "\(s)"
         case .invalidValidity(let requested, let maximum): "validity of \(requested) days is not allowed (1...\(maximum))"
         case .caExpired(let s): "CA '\(s)' has expired"
+        case .caRetired(let s): "CA '\(s)' is retired: it no longer issues"
+        case .caNotTrusted(let s): "CA '\(s)' is not trusted (RSA-only devices are not allowed): it does not issue"
+        case .wrongCA(let t, let issuer, let requested):
+            "template '\(t)' is issued by CA '\(issuer)', not '\(requested)'"
         case .notProvisioned: "the store is not provisioned (the DC name is needed for the CRL/AIA URLs)"
         case .unknownSerial(let s): "no issued certificate with serial \(s)"
         case .alreadyRevoked(let s, let reason): "certificate \(s) is already revoked (\(reason))"
@@ -152,6 +162,8 @@ public actor CAService {
     public let pki: LabPKI
     public let store: DirectoryStore
     let clock: @Sendable () -> Date
+    /// The last CRL signing queued per CA (lower-case name): `generateCRL` waits for it.
+    private var crlQueue: [String: Task<Void, Never>] = [:]
     let logger = Logger(subsystem: "dev.labdc.app", category: "pki")
     /// `domain` table key holding the HTTP port the CRL and CA certificate are served on (audit
     /// 27 Sep 2026: the CDP/AIA URLs ignored `--ports http=N`, so members could not fetch the CRL).
@@ -350,7 +362,7 @@ public actor CAService {
         }
         guard let certificate else { throw PKIKitError.encoding("could not find an unused serial number") }
         try await recordIssued(certificate, caName: ca.name, templateName: template.name, requester: requester,
-                               issuedAt: plan.now)
+                               issuedAt: plan.now, sanPolicy: template.sanPolicy)
         logger.info("issued \(template.name, privacy: .public) certificate \(LabPKI.hex(certificate.serialNumber), privacy: .public) from CA \(ca.name, privacy: .public) to \(requester.description, privacy: .public)")
         return certificate
     }
@@ -398,8 +410,7 @@ public actor CAService {
             guard (1...maximum).contains(d) else { throw IssuanceError.invalidValidity(requested: d, maximum: maximum) }
             days = d
         }
-        let ca: CertificateAuthority
-        if let name = overrides.caName ?? template.issuingCA { ca = try await pki.issuingAuthority(named: name) } else { ca = try await pki.currentAuthority() }
+        let ca = try await issuingAuthority(for: template, requested: overrides.caName, requester: requester)
         let now = clock()
         guard ca.certificate.notValidAfter > now else { throw IssuanceError.caExpired(ca.name) }
         let notBefore = now.addingTimeInterval(-Self.backdate)
@@ -411,6 +422,32 @@ public actor CAService {
                             caIssuersURL: try await caIssuersURL(caName: ca.name))
     }
 
+    /// The CA that issues `template`: its `issuingCA` (the 802.1X 192-bit CA, the RSA
+    /// compatibility root) or else the current CA. The template wins over the CA a request names
+    /// (a CES URL, `--ca`): a different one is refused — except that an administrator may pick
+    /// any CA for a template without its own issuer. Never a retired root, never the RSA root
+    /// while RSA-only devices are not allowed, and the 192-bit templates only from a P-384 root.
+    public func issuingAuthority(for template: CertificateTemplate, requested: String? = nil,
+                                 requester: RequesterIdentity = .administrator()) async throws -> CertificateAuthority {
+        let own: CertificateAuthority
+        if let name = template.issuingCA { own = try await pki.issuingAuthority(named: name) } else { own = try await pki.currentAuthority() }
+        var ca = own
+        if let requested {
+            let asked = try await pki.issuingAuthority(named: requested)
+            if asked.name.lowercased() != own.name.lowercased() {
+                guard template.issuingCA == nil, requester.isAdmin else {
+                    throw IssuanceError.wrongCA(template: template.name, issuer: own.name, requested: asked.name)
+                }
+                ca = asked
+            }
+        }
+        try await checkMayIssue(from: ca)
+        if template.issuingCA?.lowercased() == LabPKI.suiteBCAName, ca.keyType != .p384 {
+            throw IssuanceError.wrongCA(template: template.name, issuer: LabPKI.suiteBCAName, requested: ca.name)
+        }
+        return ca
+    }
+
     /// Records a certificate issued elsewhere (the DC server certificate). No-op when the serial
     /// is already recorded.
     public func record(_ certificate: Certificate, caName: String, templateName: String,
@@ -420,14 +457,24 @@ public actor CAService {
                                issuedAt: clock())
     }
 
+    /// The account a certificate is bound to (RADIUS maps it to that account only): the
+    /// requester — except when an administrator enrolls for a "names from the request" template,
+    /// i.e. for a device or server, which maps by its names (an admin's printer certificate must
+    /// not sign in as the admin; 2 Oct 2026 review).
+    static func boundSID(templateName: String, sanPolicy: SANPolicy?, requester: RequesterIdentity) -> String? {
+        if sanPolicy == .fromRequest, requester.isAdmin { return nil }
+        return requester.sid
+    }
+
     private func recordIssued(_ certificate: Certificate, caName: String, templateName: String,
-                              requester: RequesterIdentity, issuedAt: Date) async throws {
+                              requester: RequesterIdentity, issuedAt: Date, sanPolicy: SANPolicy? = nil) async throws {
         let sans = (try? certificate.extensions.subjectAlternativeNames).map { $0.map(Self.describe) } ?? []
         try await store.insertIssuedCertificate(PKIIssuedRow(
             serial: LabPKI.hex(certificate.serialNumber), caName: caName, templateName: templateName,
             subject: certificate.subject.description, subjectAltNames: sans,
             notBefore: certificate.notValidBefore, notAfter: certificate.notValidAfter,
-            requesterSID: requester.sid, requesterName: requester.name, der: try LabPKI.der(certificate),
+            requesterSID: Self.boundSID(templateName: templateName, sanPolicy: sanPolicy, requester: requester),
+            requesterName: requester.name, der: try LabPKI.der(certificate),
             issuedAt: issuedAt))
     }
 
@@ -475,6 +522,9 @@ public actor CAService {
             let sans = overrides.subjectAltNames ?? requested
             for name in sans { try Self.validate(name) }
             if !requester.isAdmin {
+                // The certificate is recorded with the requester's SID, and EAP-TLS maps it to
+                // that account only (never by the CN / DNS names the CSR chose).
+                guard requester.sid != nil else { throw IssuanceError.requesterHasNoSID(template: template.name) }
                 // ESC1: a CSR-supplied UPN (or a SID URL, KB5014754) would sign the requester in
                 // as somebody else. Only an administrator may put an identity in the SAN.
                 for name in sans where Self.upn(of: name) != nil || Self.isSIDURL(name) {
@@ -631,8 +681,22 @@ public actor CAService {
 
     /// Signs a fresh CRL for `caName` (number = previous + 1, nextUpdate = now + 7 days) with the
     /// revoked, not yet expired certificates, and stores it.
+    ///
+    /// Calls for one CA run one after the other (the actor is re-entered at every `await`, so
+    /// two at once would both read CRL #n and both sign #n+1): each waits for the one before.
     @discardableResult
     public func generateCRL(caName: String) async throws -> CertificateRevocationList {
+        let key = caName.lowercased()
+        let previous = crlQueue[key]
+        let task = Task { () async throws -> CertificateRevocationList in
+            await previous?.value
+            return try await self.signCRL(caName: caName)
+        }
+        crlQueue[key] = Task { _ = try? await task.value }
+        return try await task.value
+    }
+
+    private func signCRL(caName: String) async throws -> CertificateRevocationList {
         let ca = try await pki.authority(named: caName)
         let now = clock()
         let previous = try await store.pkiCRL(caName: ca.name)

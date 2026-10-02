@@ -68,7 +68,18 @@ enum DHCPSmoke {
         } else {
             print("smoke: no DHCP lease to show")
         }
+        // The sheets: label-above-field layout, pickers under their labels, the Option 43 row.
+        let scopes = await c.dhcpScopes()
+        let sheets = 5
+        await shot("scope-new", width: 640, height: 680, DHCPScopeSheet(onDone: { _ in }))
+        if let s = scopes.first(where: { $0.family == .v4 }) { await shot("scope-edit", width: 640, height: 680, DHCPScopeSheet(scope: s, onDone: { _ in })) }
+        await shot("reservation-new", width: 560, height: 560, DHCPReservationSheet(scopes: scopes, onDone: { _ in }))
+        if var r = await c.dhcpReservations().first {
+            r.option43 = option
+            await shot("reservation-edit", width: 560, height: 560, DHCPReservationSheet(reservation: r, scopes: scopes, onDone: { _ in }))
+        }
+        if let d = await c.deviceProfiles().first { await shot("device", width: 440, height: 300, DHCPDeviceSheet(profile: d) { _, _ in }) }
         print("smoke: DHCP \(leases.count) lease(s), \(await c.deviceProfiles().count) device(s), \(written) screenshot(s)")
-        return written == DHCPView.DHCPTab.allCases.count + 2
+        return written == DHCPView.DHCPTab.allCases.count + 2 + sheets
     }
 }

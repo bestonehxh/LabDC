@@ -3,6 +3,37 @@ import DNSKit
 import Foundation
 import Store
 
+/// Lease changes made while the DHCP server is not running (the app with Services stopped,
+/// `labdc dhcp`): the DNS records a lease registered go with it, as the running server would
+/// remove them.
+public enum DHCPOffline {
+    /// Ends `lease` now: its A/AAAA/DHCID/PTR are removed and it is saved as released.
+    @discardableResult
+    public static func release(_ lease: DHCPLease, store: DirectoryStore, now: Date = Date(),
+                               log: @escaping @Sendable (String) -> Void = { _ in }) async throws -> DHCPLease {
+        var l = await unregister(lease, store: store, log: log)
+        l.state = .released
+        l.expires = now
+        l.updated = now
+        try await store.saveDHCPLeases([l])
+        return l
+    }
+
+    /// Deletes scope `id` with its reservations and leases, removing the leases' DNS records first.
+    public static func deleteScope(id: Int64, store: DirectoryStore, log: @escaping @Sendable (String) -> Void = { _ in }) async throws {
+        for l in try await store.dhcpLeases() where l.scopeID == id && (l.dnsName != nil || l.dnsPTR != nil) {
+            _ = await unregister(l, store: store, log: log)
+        }
+        try await store.deleteDHCPScope(id: id)
+    }
+
+    static func unregister(_ lease: DHCPLease, store: DirectoryStore, log: @escaping @Sendable (String) -> Void) async -> DHCPLease {
+        guard lease.dnsName != nil || lease.dnsPTR != nil else { return lease }
+        let domain = (try? await store.domainInfo().dnsDomain) ?? ""
+        return await DHCPDNSUpdater(store: store, log: log).apply(DHCPv4Engine.unregisterAction(lease), domain: domain)
+    }
+}
+
 /// Dynamic DNS for leases (spec §2 / rev 2): A/AAAA + DHCID in the AD zone, PTR in the scope's
 /// reverse zone, written straight into the store's `dns_records` (the DNS server reads them per
 /// query). A name that holds another client's DHCID — or records with no DHCID at all (AD

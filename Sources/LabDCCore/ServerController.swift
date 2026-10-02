@@ -49,6 +49,19 @@ public final class ServerController {
     @ObservationIgnored private var restartWaiters: [CheckedContinuation<Void, Never>] = []
     /// Set by `retire()`: this controller is being replaced and never starts again.
     @ObservationIgnored public private(set) var isRetired = false
+    /// Services the owner stopped with Services ▸ Stop. Every start of this controller (a
+    /// restart to apply a setting, a domain rename, a CA switch, a backup import) keeps them
+    /// stopped; their row's Start, or Start for the whole server, clears them.
+    ///
+    /// Kept for the life of this controller only, not in `settings.json`: quitting and reopening
+    /// the app (or switching profiles) starts everything, as the Stop confirmation says (owner,
+    /// 1 Oct 2026) — a service stopped for a test must not stay off unnoticed after a relaunch.
+    public private(set) var ownerStopped: Set<ServeService> = []
+    /// The runtime of the start in flight (`performStart`): a stop that cancels that start reads
+    /// the ports it had bound from here.
+    @ObservationIgnored private var startingRuntime: ServeRuntime?
+    /// Ports released by the last stop(s), not yet waited for (`stopAndWaitForPorts`).
+    @ObservationIgnored private var releasedPorts: [ServeHeldPort] = []
 
     /// - Parameters:
     ///   - dataDirectory: the `--data` folder (`~/Library/Application Support/LabDC`).
@@ -89,10 +102,18 @@ public final class ServerController {
 
     /// The options the server runs with (settings + override).
     public func serveOptions(provision: ProvisionSpec? = nil) -> ServeOptions {
+        var ports = configuredPorts()
+        for (l, port) in sessionPins where ports[l] == 0 { ports[l] = port }
+        var options = settings.serveOptions(data: data.url, portOverride: ports, provision: provision)
+        options.ownerStopped = ownerStopped
+        return options
+    }
+
+    /// The ports from the override and the settings, before this session's pins.
+    private func configuredPorts() -> PortSet {
         var ports = portOverride ?? .standard
         for (name, port) in settings.ports { if let l = ServeListener(rawValue: name) { ports[l] = port } }
-        for (l, port) in sessionPins where ports[l] == 0 { ports[l] = port }
-        return settings.serveOptions(data: data.url, portOverride: ports, provision: provision)
+        return ports
     }
 
     // MARK: Start / stop
@@ -103,6 +124,8 @@ public final class ServerController {
     public func start(provision: ProvisionSpec? = nil) async {
         // A restart in progress starts by itself; a retired controller never starts again.
         guard !isRetired, !restartWindow else { return }
+        // Start for the whole server brings every service back, including any the owner stopped.
+        if runtime == nil, startTask == nil { ownerStopped = [] }
         await startNow(provision: provision)
     }
 
@@ -127,6 +150,10 @@ public final class ServerController {
         status.phase = .starting
         status.applyListeners(options: options, bound: nil, failures: [:], starting: true)
         let rt = ServeRuntime(options: options, log: serveLog)
+        startingRuntime = rt
+        // Whoever stopped the previous runtime waited for its ports already (a restart, or
+        // `stopAndWaitForPorts`); they belong to this start now.
+        releasedPorts = []
         do {
             try await rt.start()
         } catch {
@@ -151,6 +178,7 @@ public final class ServerController {
             return
         }
         runtime = rt
+        startingRuntime = nil
         if let why = await rt.radiusStartFailure { failures[.radius] = why }
         await syncDHCPFailures(rt)
         store = await rt.store
@@ -321,47 +349,62 @@ public final class ServerController {
         await stop()
     }
 
-    private func stopRuntime() async {
+    /// `stop()`, then waits until every port the stopped runtime (or a start it cancelled) had
+    /// bound is free again — AppModel calls it before the next profile's controller starts on
+    /// the same ports, so that start never collides with sockets still closing.
+    public func stopAndWaitForPorts() async {
+        await stop()
+        let held = releasedPorts
+        releasedPorts = []
+        await ServeHeldPort.waitUntilFree(held)
+    }
+
+    /// Stops the runtime (or cancels the start in flight) and returns the ports it had actually
+    /// bound — not `status.listeners`, whose ports are nil while a start is still binding.
+    @discardableResult
+    private func stopRuntime() async -> [ServeHeldPort] {
+        var held: [ServeHeldPort] = []
         if let pending = startTask {
             status.phase = .stopping
             pending.cancel()
             await pending.value
             if startTask == pending { startTask = nil }
         }
+        // A start that was cancelled (or failed) stopped its runtime itself: its ports.
+        if let starting = startingRuntime, starting !== runtime {
+            startingRuntime = nil
+            held += await starting.releasedPorts
+        }
         guard let rt = runtime else {
             if [.stopping, .starting, .restarting].contains(status.phase) { settleStopped() }
-            return
+            releasedPorts += held
+            return held
         }
         status.phase = .stopping
         await rt.stop()
+        held += await rt.releasedPorts
         serveLog.event("serve", "stopped")
         runtime = nil
         store = nil
         pki = nil
         settleStopped()
+        releasedPorts += held
+        return held
     }
 
     private func settleStopped() {
         status.startedAt = nil
-        status.dhcpStopped = false
+        status.dhcpStopped = ownerStopped.contains(.dhcp)
         status.phase = restartWindow ? .restarting : data.hasStore ? .stopped : .notSetUp
         if let lastOptions { status.applyListeners(options: lastOptions, bound: nil, failures: [:]) }
     }
 
-    /// A listener's port and protocols, held across a stop so the next start can wait for them.
-    typealias HeldPort = (port: UInt16, protos: [PortProbe.Proto])
-
-    /// Stops, remembering every bound port (ports configured as 0 are pinned for this session,
-    /// so the next start binds the same ones). Pair with `startWhenReleased`.
-    private func stopHoldingPorts() async -> [HeldPort] {
-        var held: [HeldPort] = []
-        for l in status.listeners {
-            guard let p = l.port, p > 0 else { continue }
-            let port = UInt16(truncatingIfNeeded: p)
-            if l.configuredPort == 0 { sessionPins[l.listener] = port }
-            held.append((port, Self.protos(l.listener)))
-        }
-        await stopRuntime()
+    /// Stops, returning every port the runtime had bound (ports configured as 0 are pinned for
+    /// this session, so the next start binds the same ones). Pair with `startWhenReleased`.
+    private func stopHoldingPorts() async -> [ServeHeldPort] {
+        let held = await stopRuntime()
+        let configured = configuredPorts()
+        for h in held where configured[h.listener] == 0 { sessionPins[h.listener] = h.port }
         return held
     }
 
@@ -386,7 +429,7 @@ public final class ServerController {
     /// Waits until the stopped listeners have released their ports (Network.framework frees
     /// UDP/TCP a moment after `cancel()`), then starts, so nothing collides with itself.
     /// A `stop()` or `retire()` during the wait cancels the start.
-    private func startWhenReleased(_ held: [HeldPort]) async {
+    private func startWhenReleased(_ held: [ServeHeldPort]) async {
         for h in held where !restartCancelled && !isRetired {
             await ServeRuntime.waitUntilFree(h.port, h.protos)
         }
@@ -442,13 +485,7 @@ public final class ServerController {
         return result
     }
 
-    static func protos(_ l: ServeListener) -> [PortProbe.Proto] {
-        switch l.transport {
-        case "udp+tcp": [.udp, .tcp]
-        case "udp": [.udp]
-        default: [.tcp]
-        }
-    }
+    nonisolated static func protos(_ l: ServeListener) -> [PortProbe.Proto] { ServeHeldPort.protos(l) }
 
     /// UI-1b, Domain ▸ Restart All Services / ⌘R on Overview: every service stops and starts again
     /// (the same as quitting and relaunching, without leaving the app).
@@ -480,7 +517,12 @@ public final class ServerController {
         }
         if let rt = runtime {
             do {
-                try await rt.restartInPlace(service.listeners, name: service.title)
+                if ownerStopped.remove(service) != nil {
+                    // Start on a row the owner stopped: the stop is forgotten.
+                    try await rt.startInPlace(service.listeners, name: service.title)
+                } else {
+                    try await rt.restartInPlace(service.listeners, name: service.title)
+                }
                 for l in service.listeners { failures[l] = nil }
                 for other in service.restartAlsoAffects { for l in other.listeners { failures[l] = nil } }
                 if let e = status.lastError, service.listeners.contains(where: { ServeListener.named(inError: e) == $0 }) {
@@ -525,6 +567,20 @@ public final class ServerController {
         failures[.dhcpv6] = await rt.dhcpv6StartFailure
     }
 
+    /// The runtime restarted listeners by itself (LDAP/EST/HTTPS after a certificate reissue):
+    /// a listener that did not come back is a problem on its row, one that did is clear again.
+    func listenersChangedByRuntime(_ messages: [String]) async {
+        guard runtime != nil, !status.isBusy else { return }
+        let restarted: [ServeListener] = [.ldap, .ldaps, .gc, .gcs, .est, .https]
+        for l in restarted { failures[l] = nil }
+        if let e = status.lastError, let l = ServeListener.named(inError: e), restarted.contains(l) { status.lastError = nil }
+        for message in messages {
+            failures[ServeListener.named(inError: message) ?? .ldap] = message
+        }
+        if let message = messages.first { status.lastError = message }
+        await refreshListeners()
+    }
+
     /// The runtime's background retry bound a DHCP port that was busy.
     private func dhcpChangedByRuntime() async {
         guard let rt = runtime, !status.isBusy, !status.restarting.contains(.dhcp) else { return }
@@ -536,6 +592,7 @@ public final class ServerController {
     /// (shown as Start on a stopped row) brings it back; quitting and reopening starts everything.
     public func stopService(_ service: ServeService) async {
         guard let rt = runtime, !status.isBusy, !status.restarting.contains(service) else { return }
+        ownerStopped.insert(service)
         await rt.stopInPlace(service.listeners, name: service.title)
         for l in service.listeners { failures[l] = nil }
         if let e = status.lastError, service.listeners.contains(where: { ServeListener.named(inError: e) == $0 }) {
@@ -594,7 +651,8 @@ public final class ServerController {
         settings = s
         try saveSettings()
         status.advertisePinned = s.advertise != nil
-        if runtime != nil, serveOptions() != before {
+        // Also while a start (or a restart) is in flight: it read the old settings.
+        if serveOptions() != before, runtime != nil || startTask != nil || restartWindow {
             serveLog.event("serve", "settings changed; restarting the services")
             await restartToApply()
         }
@@ -730,10 +788,10 @@ public final class ServerController {
 
     // MARK: RADIUS sessions, CoA, registered devices (phase 4c / 5)
 
-    /// RADIUS ▸ Sessions: newest first; `activeOnly` = no Stop yet.
+    /// RADIUS ▸ Sessions: newest first; `activeOnly` = no Stop and updated within a day (`radiusSessionStaleAfter`).
     public func radiusSessions(activeOnly: Bool) async -> [DirectoryStore.RadiusSession] {
         guard let store else { return [] }
-        return (try? await store.radiusSessions(activeOnly: activeOnly)) ?? []
+        return (try? await store.radiusSessions(activeOnly: activeOnly, now: Date())) ?? []
     }
 
     /// Reauthenticate / Disconnect a session through its NAS (RFC 5176); the Activity line is
@@ -1102,15 +1160,20 @@ public final class ServerController {
 
     // MARK: Backup
 
-    /// Settings ▸ Backup ▸ Export: `<folder>/LabDC backup <date>/` with `store.json` (the
-    /// store's JSON export, key material included), `pki/`, `sysvol/` and `settings.json`.
+    /// The files of the data folder a backup carries besides the store, `pki/` and `sysvol/`:
+    /// the settings and the Group Policy ▸ Wi-Fi / Wired list being edited (its unpublished draft).
+    nonisolated static let backupFiles = ["settings.json", "group-policy-8021x.json"]
+
+    /// Settings ▸ Backup ▸ Export: `<folder>/LabDC backup <date>/` (`… <date> 2/`, `3/`… when
+    /// that folder exists already, e.g. two exports in the same second) with `store.json` (the
+    /// store's JSON export: every table, key material included — see `StoreExportV2`), `pki/`,
+    /// `sysvol/`, `settings.json` and the 802.1X draft `group-policy-8021x.json`.
     @discardableResult
     public func exportBackup(into folder: URL, now: Date = Date()) async throws -> URL {
         let fm = FileManager.default
         let stamp = now.formatted(Date.ISO8601FormatStyle().year().month().day().time(includingFractionalSeconds: false)
             .dateTimeSeparator(.space).timeSeparator(.omitted))
-        let target = folder.appendingPathComponent("LabDC backup \(stamp)", isDirectory: true)
-        try fm.createDirectory(at: target, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let target = try Self.makeUniqueFolder(in: folder, named: "LabDC backup \(stamp)")
         let store: DirectoryStore
         if let s = self.store { store = s } else { store = try data.openExistingStore() }
         let json = try await store.exportJSON()
@@ -1119,11 +1182,28 @@ public final class ServerController {
         for sub in ["pki", "sysvol"] where fm.fileExists(atPath: data.url.appendingPathComponent(sub).path) {
             try fm.copyItem(at: data.url.appendingPathComponent(sub), to: target.appendingPathComponent(sub))
         }
-        if fm.fileExists(atPath: data.settingsURL.path) {
-            try fm.copyItem(at: data.settingsURL, to: target.appendingPathComponent("settings.json"))
+        for name in Self.backupFiles where fm.fileExists(atPath: data.url.appendingPathComponent(name).path) {
+            try fm.copyItem(at: data.url.appendingPathComponent(name), to: target.appendingPathComponent(name))
         }
         serveLog.event("serve", "backup exported to \(target.path)")
         return target
+    }
+
+    /// Creates `<folder>/<name>` (0700), or `<name> 2`, `<name> 3`… when it exists: never an
+    /// existing folder (an export into it would fail half-way or mix two backups).
+    nonisolated static func makeUniqueFolder(in folder: URL, named name: String) throws -> URL {
+        let fm = FileManager.default
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        for n in 1...1000 {
+            let candidate = folder.appendingPathComponent(n == 1 ? name : "\(name) \(n)", isDirectory: true)
+            // mkdir fails when the name exists: the check and the create are one step.
+            if mkdir(candidate.path, 0o700) == 0 { return candidate }
+            guard errno == EEXIST else {
+                throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: candidate.path,
+                                                               NSLocalizedDescriptionKey: "cannot create \(candidate.path): \(String(cString: strerror(errno)))"])
+            }
+        }
+        throw CocoaError(.fileWriteFileExists, userInfo: [NSFilePathErrorKey: folder.appendingPathComponent(name).path])
     }
 
     /// Settings ▸ Backup ▸ Import: stops the server, moves the current data folder aside
@@ -1163,8 +1243,8 @@ public final class ServerController {
             for sub in ["pki", "sysvol"] where fm.fileExists(atPath: backup.appendingPathComponent(sub).path) {
                 try fm.copyItem(at: backup.appendingPathComponent(sub), to: data.url.appendingPathComponent(sub))
             }
-            if fm.fileExists(atPath: backup.appendingPathComponent("settings.json").path) {
-                try fm.copyItem(at: backup.appendingPathComponent("settings.json"), to: data.settingsURL)
+            for name in backupFiles where fm.fileExists(atPath: backup.appendingPathComponent(name).path) {
+                try fm.copyItem(at: backup.appendingPathComponent(name), to: data.url.appendingPathComponent(name))
             }
         } catch {
             // The half-built folder always goes, so a failed import into a fresh install is
@@ -1187,6 +1267,8 @@ public final class ServerController {
             status.interfaces = NetworkInterfaces.current()
         case .dhcpChanged:
             Task { await dhcpChangedByRuntime() }
+        case .listenersChanged(let failures):
+            Task { await listenersChangedByRuntime(failures) }
         }
     }
 

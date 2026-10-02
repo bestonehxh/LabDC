@@ -84,7 +84,7 @@ struct CertificatesCAView: View {
         .confirmationDialog("Use “\(confirmUse?.title ?? "")” as the current CA?",
                             isPresented: Binding(get: { confirmUse != nil }, set: { if !$0 { confirmUse = nil } }),
                             presenting: confirmUse) { ca in
-            Button("Use as Current") {
+            Button("Use as current") {
                 Task { await model.perform("Use as current") { try await $0.useCA(name: ca.name) } }
             }
             Button("Cancel", role: .cancel) {}
@@ -357,51 +357,33 @@ struct CreateCASheet: View {
     @State private var working = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Form {
-                Section {
-                    TextField("Name", text: $form.name, prompt: Text("Prod"))
-                        .accessibilityHint("A short name; it is part of the CRL address")
-                    TextField("Common name", text: $form.commonName, prompt: Text(form.effectiveCommonName))
-                    Picker("Key type", selection: $form.keyType) {
-                        ForEach(CAKeyType.allCases, id: \.self) { Text($0.displayName).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    Stepper("Valid for \(form.years) year\(form.years == 1 ? "" : "s")", value: $form.years, in: 1...50)
-                } header: {
-                    Text("Create CA")
-                } footer: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(form.keyTypeHint)
-                        if let problem = form.problem, !form.name.isEmpty {
-                            Text(problem).foregroundStyle(Theme.attention)
-                        }
-                    }
-                    .font(Theme.caption)
+        QuietSheet(title: "New CA", width: 480,
+                   failure: form.name.isEmpty ? nil : form.problem) {
+            SheetField("Name", note: "A short name; it is part of the CRL address.") {
+                QuietTextField("Name", text: $form.name, prompt: "Prod").textFieldStyle(.quiet)
+                    .accessibilityHint("A short name; it is part of the CRL address")
+            }
+            SheetField("Common name") {
+                QuietTextField("Common name", text: $form.commonName, prompt: form.name.trimmingCharacters(in: .whitespaces).isEmpty ? "Prod CA" : form.effectiveCommonName).textFieldStyle(.quiet)
+            }
+            SheetField("Key type", note: form.keyTypeHint) {
+                SheetPicker("Key type", selection: $form.keyType) {
+                    ForEach(CAKeyType.allCases, id: \.self) { Text($0.displayName).tag($0) }
                 }
             }
-            .formStyle(.grouped)
-            .scrollContentBackground(.hidden)
-            HStack(spacing: 24) {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }
-                    .buttonStyle(.quietLink)
-                    .keyboardShortcut(.cancelAction)
-                Button("Create") {
-                    working = true
-                    Task {
-                        if await onCreate(form) { dismiss() }
-                        working = false
-                    }
-                }
-                .buttonStyle(.quietPrimary)
-                .keyboardShortcut(.defaultAction)
-                .disabled(form.problem != nil || working)
+            SheetField("Valid for") {
+                Stepper("\(form.years) year\(form.years == 1 ? "" : "s")", value: $form.years, in: 1...50)
+                    .font(Theme.body).foregroundStyle(Theme.ink).fixedSize()
             }
-            .padding([.horizontal, .bottom], 20)
+        } actions: {
+            SheetButtons("Create", disabled: form.problem != nil || working) {
+                working = true
+                Task {
+                    if await onCreate(form) { dismiss() }
+                    working = false
+                }
+            }
         }
-        .frame(width: 460)
-        .background(Theme.background)
     }
 }
 
@@ -426,46 +408,26 @@ struct ChangeKeySheet: View {
     @State private var working = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Form {
-                Section {
-                    Picker("New key", selection: $form.keyType) {
-                        ForEach([CAKeyType.p384, .p256], id: \.self) { k in
-                            Text(k.signatureDescription + (k == form.current ? " (current)" : "")).tag(k)
-                                .selectionDisabled(k == form.current)
-                        }
-                    }
-                    Toggle("Keep the old root trusted for a while", isOn: $form.keepOldTrusted)
-                } header: {
-                    Text("Change the lab CA key")
-                } footer: {
-                    Text(Self.explanation(form))
-                        .font(Theme.caption)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .formStyle(.grouped)
-            .scrollContentBackground(.hidden)
-            HStack(spacing: 24) {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }
-                    .buttonStyle(.quietLink)
-                    .keyboardShortcut(.cancelAction)
-                Button(working ? "Changing…" : "Change") {
-                    working = true
-                    Task {
-                        if await onChange(form) { dismiss() }
-                        working = false
+        QuietSheet(title: "Change the lab CA key", width: 520) {
+            SheetField("New key") {
+                SheetPicker("New key", selection: $form.keyType) {
+                    ForEach([CAKeyType.p384, .p256], id: \.self) { k in
+                        Text(k.signatureDescription + (k == form.current ? " (current)" : "")).tag(k)
+                            .selectionDisabled(k == form.current)
                     }
                 }
-                .buttonStyle(.quietPrimary)
-                .keyboardShortcut(.defaultAction)
-                .disabled(working || form.keyType == form.current)
             }
-            .padding([.horizontal, .bottom], 20)
+            SheetToggle("Keep the old root trusted for a while", isOn: $form.keepOldTrusted)
+            QuietNote(Self.explanation(form))
+        } actions: {
+            SheetButtons(working ? "Changing…" : "Change", disabled: working || form.keyType == form.current) {
+                working = true
+                Task {
+                    if await onChange(form) { dismiss() }
+                    working = false
+                }
+            }
         }
-        .frame(width: 520)
-        .background(Theme.background)
     }
 
     static func explanation(_ form: ChangeKeyForm) -> String {

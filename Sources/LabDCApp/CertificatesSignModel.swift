@@ -266,6 +266,8 @@ struct TemplateDraft: Equatable {
     /// Why Save is disabled (empty = OK).
     var errors: [String] {
         var e: [String] = []
+        // A new template's name is typed in the sheet (an edit keeps its name): empty enabled Save.
+        if isNew && name.trimmingCharacters(in: .whitespaces).isEmpty { e.append("The name is empty.") }
         if displayName.trimmingCharacters(in: .whitespaces).isEmpty { e.append("The display name is empty.") }
         if !(1...36500).contains(validityDays) { e.append("Validity is 1 to 36500 days.") }
         if renewalDays < 0 || renewalDays >= validityDays { e.append("The renewal window must be shorter than the validity.") }

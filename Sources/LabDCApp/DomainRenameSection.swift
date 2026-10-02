@@ -26,7 +26,7 @@ struct DomainRenameSection: View {
                         .font(Theme.body)
                         .foregroundStyle(Theme.ink)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    TextField("New domain name", text: $newDomainName, prompt: Text("corp.example"))
+                    QuietTextField("New domain name", text: $newDomainName, prompt: "corp.example")
                         .textFieldStyle(.quiet)
                         .frame(width: 200)
                         .autocorrectionDisabled()

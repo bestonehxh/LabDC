@@ -1,7 +1,7 @@
 import Foundation
 
-/// The JSON export format (version 1). Every table is dumped row for row, ids preserved, binary
-/// values base64. It contains key material: treat the file like the database itself.
+/// The legacy JSON export format (version 1): domain, objects, links, secrets and DNS records
+/// only. Still imported (`importJSON`); new exports are `StoreExportV2`.
 public struct StoreExport: Codable, Sendable {
     public struct Object: Codable, Sendable {
         public var id: Int64
@@ -63,9 +63,196 @@ public struct StoreExport: Codable, Sendable {
     public var dnsRecords: [DNSRecord]
 }
 
+/// The JSON export format, version 2 (2 Oct 2026). Every table of the database is dumped row
+/// for row — found by walking `sqlite_master`, so a table added later is carried without touching
+/// this file — with ids preserved. Version 1 carried only five tables, and a restore silently lost
+/// RADIUS clients/policies, DHCP, PKI issuance records, LSA secrets (DPAPI backup keys) and more.
+///
+/// Values: an integer is a JSON number, text a JSON string, NULL `null`, a blob `{"b": base64}`.
+/// A config secret sealed with the store's key (`StoreSecretBox`: RADIUS shared secrets, LSA
+/// secrets) is written **opened**, as `{"sealed": plaintext}`, and sealed again with the target
+/// store's own key on import. A restore builds a new `lab.sqlite` beside a fresh
+/// `lab.sqlite.secret-key`, so carrying the ciphertext would leave secrets no key opens; carrying
+/// the key file instead would make the backup two coupled files. The export already holds NT
+/// hashes and Kerberos keys: treat the file like the database plus its key (it is written 0600).
+///
+/// Why not `VACUUM INTO` (a file-level copy): the import loads into an existing, empty store the
+/// caller opened, keeps reading version-1 exports, and checks every table and column as it goes
+/// (refusing a newer build's backup instead of dropping what it cannot place); a raw database copy
+/// would also have to carry and re-pair the secret-key file.
+public struct StoreExportV2: Codable, Sendable {
+    public enum Value: Codable, Sendable, Equatable {
+        case null
+        case int(Int64)
+        case text(String)
+        case blob(Data)
+        /// A `StoreSecretBox`-sealed text value, opened.
+        case sealed(String)
+
+        private enum Keys: String, CodingKey { case b, sealed }
+
+        public init(from decoder: Decoder) throws {
+            let single = try decoder.singleValueContainer()
+            if single.decodeNil() { self = .null; return }
+            if let i = try? single.decode(Int64.self) { self = .int(i); return }
+            if let s = try? single.decode(String.self) { self = .text(s); return }
+            let keyed = try decoder.container(keyedBy: Keys.self)
+            if let b = try keyed.decodeIfPresent(Data.self, forKey: .b) { self = .blob(b); return }
+            if let s = try keyed.decodeIfPresent(String.self, forKey: .sealed) { self = .sealed(s); return }
+            throw DecodingError.dataCorruptedError(in: single, debugDescription: "unknown value")
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            switch self {
+            case .null: var c = encoder.singleValueContainer(); try c.encodeNil()
+            case .int(let i): var c = encoder.singleValueContainer(); try c.encode(i)
+            case .text(let s): var c = encoder.singleValueContainer(); try c.encode(s)
+            case .blob(let b): var c = encoder.container(keyedBy: Keys.self); try c.encode(b, forKey: .b)
+            case .sealed(let s): var c = encoder.container(keyedBy: Keys.self); try c.encode(s, forKey: .sealed)
+            }
+        }
+    }
+
+    public struct Table: Codable, Sendable {
+        public var columns: [String]
+        public var rows: [[Value]]
+    }
+
+    public var version: Int
+    /// Table name → rows.
+    public var tables: [String: Table]
+}
+
 extension DirectoryStore {
-    /// Dumps the whole store as JSON (pretty, sorted keys).
+    /// The current export version.
+    public static let exportVersion = 2
+
+    /// The user tables of this database (everything in `sqlite_master` but SQLite's own).
+    func exportableTables() throws -> [String] {
+        try db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .compactMap { $0[0].text }
+    }
+
+    func tableColumns(_ table: String) throws -> [String] {
+        try db.query("SELECT name FROM pragma_table_info(?) ORDER BY cid", [.text(table)]).compactMap { $0[0].text }
+    }
+
+    static func quoted(_ identifier: String) -> String {
+        "\"" + identifier.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    }
+
+    /// Dumps the whole store as JSON (pretty, sorted keys): every table, version 2.
     public func exportJSON() throws -> Data {
+        // One savepoint: a consistent snapshot even with the CLI writing beside the app (WAL).
+        let export = try transaction { () throws -> StoreExportV2 in
+            var tables: [String: StoreExportV2.Table] = [:]
+            for name in try exportableTables() {
+                let columns = try tableColumns(name)
+                let list = columns.map(Self.quoted).joined(separator: ", ")
+                // Every table here has a rowid (none is WITHOUT ROWID): insertion order, stable.
+                let rows = try db.query("SELECT \(list) FROM \(Self.quoted(name)) ORDER BY rowid").map { row in
+                    row.map { value -> StoreExportV2.Value in
+                        switch value {
+                        case .null: return .null
+                        case .int(let i): return .int(i)
+                        case .blob(let b): return .blob(Data(b))
+                        case .text(let s):
+                            // A value that does not open with this store's key stays as stored
+                            // (it was already unreadable; the backup keeps it byte for byte).
+                            if StoreSecretBox.isSealed(s), let plain = try? secretBox.open(s) { return .sealed(plain) }
+                            return .text(s)
+                        }
+                    }
+                }
+                tables[name] = .init(columns: columns, rows: rows)
+            }
+            return StoreExportV2(version: Self.exportVersion, tables: tables)
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        do { return try encoder.encode(export) } catch { throw StoreError.invalidExport("\(error)") }
+    }
+
+    /// Loads an export (version 2, or version 1 from an older LabDC) into this store, which must
+    /// be empty. Ids, GUIDs, SIDs, USNs and keys are kept as they were; sealed config secrets are
+    /// sealed again with this store's key.
+    public func importJSON(_ data: Data) throws {
+        struct Header: Decodable { var version: Int }
+        let version: Int
+        do { version = try JSONDecoder().decode(Header.self, from: data).version } catch {
+            throw StoreError.invalidExport("\(error)")
+        }
+        guard version == 1 || version == Self.exportVersion else {
+            throw StoreError.invalidExport("unsupported version \(version)")
+        }
+        guard (try db.scalar("SELECT COUNT(*) FROM objects")?.int ?? 0) == 0 else {
+            throw StoreError.unwillingToPerform("import needs an empty store")
+        }
+        if version == 1 { return try importLegacyJSON(data) }
+        let export: StoreExportV2
+        do { export = try JSONDecoder().decode(StoreExportV2.self, from: data) } catch {
+            throw StoreError.invalidExport("\(error)")
+        }
+        let known = Set(try exportableTables())
+        // Refuse rather than drop data this build has no table or column for (a newer LabDC's export).
+        for (name, table) in export.tables {
+            guard known.contains(name) else { throw StoreError.invalidExport("unknown table \(name) (a newer LabDC's backup?)") }
+            let columns = Set(try tableColumns(name))
+            if let extra = table.columns.first(where: { !columns.contains($0) }) {
+                throw StoreError.invalidExport("unknown column \(name).\(extra) (a newer LabDC's backup?)")
+            }
+            if let bad = table.rows.first(where: { $0.count != table.columns.count }) {
+                throw StoreError.invalidExport("\(name): a row has \(bad.count) values for \(table.columns.count) columns")
+            }
+        }
+        do {
+            try transaction {
+                // Rows reference each other (objects.parent_id, links, dhcp_reservations): the
+                // foreign keys are checked once, at the end, not row by row.
+                try db.exec("PRAGMA defer_foreign_keys = ON")
+                for name in export.tables.keys.sorted() {
+                    let table = export.tables[name]!
+                    // A fresh store may hold defaults; the backup's rows replace them.
+                    try db.run("DELETE FROM \(Self.quoted(name))")
+                    guard !table.columns.isEmpty else { continue }
+                    let sql = "INSERT INTO \(Self.quoted(name))(\(table.columns.map(Self.quoted).joined(separator: ", "))) VALUES("
+                        + Array(repeating: "?", count: table.columns.count).joined(separator: ", ") + ")"
+                    for row in table.rows {
+                        try db.run(sql, try row.map { value -> SQLValue in
+                            switch value {
+                            case .null: .null
+                            case .int(let i): .int(i)
+                            case .text(let s): .text(s)
+                            case .blob(let b): .blob([UInt8](b))
+                            case .sealed(let plain): .text(try secretBox.seal(plain))
+                            }
+                        })
+                    }
+                }
+                // sqlite_sequence is not exported: never hand out a scope id a lease still names
+                // (a deleted scope's leftover leases must not join the next new scope).
+                try db.exec("""
+                    INSERT INTO sqlite_sequence(name, seq)
+                      SELECT 'dhcp_scopes', 0 WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name='dhcp_scopes');
+                    UPDATE sqlite_sequence SET seq = MAX(seq, COALESCE((SELECT MAX(id) FROM dhcp_scopes), 0),
+                      COALESCE((SELECT MAX(scope_id) FROM dhcp_leases), 0)) WHERE name='dhcp_scopes';
+                    """)
+                if let violation = try db.query("PRAGMA foreign_key_check").first {
+                    throw StoreError.invalidExport("dangling reference in \(violation[0].text ?? "?") row \(violation[1].text ?? "?")")
+                }
+                sdCache = [:]
+                try reloadInfo()
+            }
+        } catch {
+            try? reloadInfo()
+            throw error
+        }
+    }
+}
+
+extension DirectoryStore {
+    /// The version-1 export (kept so tests can check old backups still import).
+    func exportLegacyJSON() throws -> Data {
         var domain: [String: String] = [:]
         for r in try db.query("SELECT key, value FROM domain") { domain[r[0].text ?? ""] = r[1].text ?? "" }
         var objects: [StoreExport.Object] = []
@@ -100,16 +287,11 @@ extension DirectoryStore {
         do { return try encoder.encode(export) } catch { throw StoreError.invalidExport("\(error)") }
     }
 
-    /// Loads an export into this store, which must be empty. Ids, GUIDs, SIDs, USNs and keys are
-    /// kept as they were.
-    public func importJSON(_ data: Data) throws {
+    /// Loads a version-1 export (the caller checked the store is empty).
+    private func importLegacyJSON(_ data: Data) throws {
         let export: StoreExport
         do { export = try JSONDecoder().decode(StoreExport.self, from: data) } catch {
             throw StoreError.invalidExport("\(error)")
-        }
-        guard export.version == 1 else { throw StoreError.invalidExport("unsupported version \(export.version)") }
-        guard (try db.scalar("SELECT COUNT(*) FROM objects")?.int ?? 0) == 0 else {
-            throw StoreError.unwillingToPerform("import needs an empty store")
         }
         do {
             try transaction {

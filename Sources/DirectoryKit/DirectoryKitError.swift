@@ -82,6 +82,9 @@ enum ADDiagnostic {
     static let attributeOrValueExists = "00002083: AtrErr: DSID-03151946, problem 1006 (ATT_OR_VALUE_EXISTS), data 0\n"
     static let noSuchAttribute = "00002080: AtrErr: DSID-03152D2C, problem 1001 (NO_ATTRIBUTE_OR_VAL), data 0\n"
     static let constraintViolation = "000020B5: AtrErr: DSID-03152D2C, problem 1005 (CONSTRAINT_ATT_TYPE), data 0\n"
+    /// A value that does not convert to the attribute's syntax (LDAP 21), e.g. a 32-bit INTEGER
+    /// out of range.
+    static let invalidAttributeSyntax = "00000057: LdapErr: DSID-0C090D8A, comment: Error in attribute conversion operation, data 0\n"
     /// A value refused by a validated write or a uniqueness rule: `0000202F` constraint
     /// violation, `000021C7` duplicate SPN, `000021C8` duplicate UPN; `attribute` is
     /// `<ATTRTYP hex> (<name>)`.
@@ -102,6 +105,7 @@ enum ADDiagnostic {
         case .attributeOrValueExists: LDAPFailure(.attributeOrValueExists, attributeOrValueExists)
         case .noSuchAttribute: LDAPFailure(.noSuchAttribute, noSuchAttribute)
         case .constraintViolation: LDAPFailure(.constraintViolation, constraintViolation)
+        case .invalidAttributeSyntax: LDAPFailure(.invalidAttributeSyntax, invalidAttributeSyntax)
         case .notAllowedOnRDN: LDAPFailure(.notAllowedOnRDN, notAllowedOnRDN)
         case .notAllowedOnNonLeaf: LDAPFailure(.notAllowedOnNonLeaf, notAllowedOnNonLeaf)
         case .objectClassViolation: LDAPFailure(.objectClassViolation, objectClassViolation)

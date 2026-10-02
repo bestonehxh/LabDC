@@ -502,11 +502,15 @@ extension GroupPolicyEditor {
         let gpoDN = DefaultGPO.defaultDomainPolicy.dn(domainDN: try await store.domainInfo().domainDN)
         for container in ["IEEE80211", "IEEE8023"] {
             try await removeLegacyDot1X(container, gpoDN: gpoDN)
-            guard let window = try await store.read(dn: try await dot1XContainerDN(container)) else { continue }
-            for child in try await store.children(of: window.id) {
-                try? await store.delete(id: child.id)
+            // Only LabDC's own objects (current and former default names): a policy another admin
+            // made with GPMC stays, and so does its CSE.
+            for name in [Dot1XPolicy.defaultName] + Dot1XPolicy.formerDefaultNames {
+                try await deletePolicyObject(name, container: container)
             }
         }
-        try await bumpMachineVersion(.defaultDomainPolicy, removing: [GPOExtensionNames.wirelessCSE, GPOExtensionNames.wiredCSE])
+        var removing: [String] = []
+        if try await containerIsEmpty("IEEE80211") { removing.append(GPOExtensionNames.wirelessCSE) }
+        if try await containerIsEmpty("IEEE8023") { removing.append(GPOExtensionNames.wiredCSE) }
+        try await bumpMachineVersion(.defaultDomainPolicy, removing: removing)
     }
 }

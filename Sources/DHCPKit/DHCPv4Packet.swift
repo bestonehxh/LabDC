@@ -396,7 +396,7 @@ public struct ClientFQDN: Sendable, Equatable {
         // RFC 4702 §4: a server sets RCODE1/RCODE2 to 255.
         var out: [UInt8] = [flags, 255, 255]
         if e {
-            out += (try? DHCPDNSWire.encode(name, terminate: fullyQualified)) ?? []
+            out += Self.echoWire(name, terminate: fullyQualified)
         } else {
             out += Array((name + (fullyQualified ? "." : "")).utf8)
         }
@@ -408,6 +408,23 @@ public struct ClientFQDN: Sendable, Equatable {
         if s { flags |= 0x01 }
         if o { flags |= 0x02 }
         if n { flags |= 0x04 }
-        return [flags] + ((try? DHCPDNSWire.encode(name, terminate: fullyQualified)) ?? [])
+        return [flags] + Self.echoWire(name, terminate: fullyQualified)
+    }
+
+    /// The name in DNS wire form for a reply. A name echoed from the client may hold bytes the
+    /// strict encoder refuses (it guards what LabDC registers in DNS): echo its labels as they
+    /// came rather than an empty name (review, 2 Oct 2026).
+    static func echoWire(_ name: String, terminate: Bool) -> [UInt8] {
+        if let wire = try? DHCPDNSWire.encode(name, terminate: terminate) { return wire }
+        var out: [UInt8] = []
+        for label in name.split(separator: ".", omittingEmptySubsequences: true) {
+            let bytes = Array(label.utf8.prefix(63))
+            // A wire name is at most 255 bytes, terminator included: stop before a label would
+            // pass it (RFC 1035 §3.1).
+            guard out.count + 1 + bytes.count + (terminate ? 1 : 0) <= 255 else { break }
+            out.append(UInt8(bytes.count)); out += bytes
+        }
+        if terminate { out.append(0) }
+        return out
     }
 }

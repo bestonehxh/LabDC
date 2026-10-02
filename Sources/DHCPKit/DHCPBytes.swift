@@ -126,7 +126,8 @@ public enum DHCPMAC {
 
 /// DNS names in RFC 1035 wire form (no compression) for options 81, 119, 24 and 39.
 public enum DHCPDNSWire {
-    /// `lab.sheep` → 03 6c 61 62 05 73 68 65 65 70 00. Fails on an empty label or one over 63.
+    /// `lab.sheep` → 03 6c 61 62 05 73 68 65 65 70 00. Fails on an empty label, one over 63, or
+    /// one with anything but letters, digits, `-` and `_` (a space, `a.lab b.lab`, is two names).
     public static func encode(_ name: String, terminate: Bool = true) throws -> [UInt8] {
         var out: [UInt8] = []
         let trimmed = name.hasSuffix(".") ? String(name.dropLast()) : name
@@ -134,6 +135,9 @@ public enum DHCPDNSWire {
             for label in trimmed.split(separator: ".", omittingEmptySubsequences: false) {
                 let bytes = Array(label.utf8)
                 guard !bytes.isEmpty, bytes.count <= 63 else { throw DHCPError.invalid("bad DNS name \(name)") }
+                guard bytes.allSatisfy(isLabelByte) else {
+                    throw DHCPError.invalid("bad DNS name “\(name)”: only letters, digits, - and _ (separate several names with commas)")
+                }
                 out.append(UInt8(bytes.count))
                 out += bytes
             }
@@ -141,6 +145,10 @@ public enum DHCPDNSWire {
         if terminate { out.append(0) }
         guard out.count <= 255 else { throw DHCPError.invalid("DNS name too long: \(name)") }
         return out
+    }
+
+    static func isLabelByte(_ b: UInt8) -> Bool {
+        (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x2D || b == 0x5F
     }
 
     /// Several names one after another (option 119 / 24).

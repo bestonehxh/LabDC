@@ -147,14 +147,13 @@ struct TestLoginContent: View {
     var body: some View {
         let status = model.controller.status
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 0) {
+            SheetScroll { VStack(alignment: .leading, spacing: 0) {
                 Text("Test a sign-in")
-                    .font(Theme.subtitle)
-                    .tracking(-0.4)
+                    .font(Theme.emphasis)
                     .foregroundStyle(Theme.ink)
                     .accessibilityAddTraits(.isHeader)
                 QuietTabs(items: LoginTestRequest.Preset.allCases.map { ($0, $0.title) }, selection: $test.preset)
-                    .padding(.top, 22)
+                    .padding(.top, 16)
                     .accessibilityElement(children: .contain)
                     .accessibilityLabel("Kind of sign-in to test")
                 Text(TestLoginModel.presetDescription(test.preset))
@@ -163,26 +162,21 @@ struct TestLoginContent: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 10)
 
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 14) {
                     labeled("Username") {
-                        TextField("Username", text: $test.user, prompt: Text("alice"))
+                        QuietTextField("Username", text: $test.user, prompt: "alice")
                             .textFieldStyle(.quiet)
                             .textContentType(.username)
                             .accessibilityLabel("Username")
                     }
                     labeled("Password") {
-                        VStack(spacing: 4) {
-                            SecureField("Password", text: $test.password)
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 14))
-                                .foregroundStyle(Theme.ink)
-                                .accessibilityLabel("Password")
-                                .onSubmit { test.run(model.controller) }
-                            Rectangle().fill(Theme.control).frame(height: 1)
-                        }
+                        QuietTextField("Password", text: $test.password, prompt: "Password", secure: true)
+                            .textFieldStyle(.quiet)
+                            .accessibilityLabel("Password")
+                            .onSubmit { test.run(model.controller) }
                     }
                 }
-                .padding(.top, 26)
+                .padding(.top, 22)
 
                 Button(test.showAdvanced ? "Hide advanced" : "Advanced") { test.showAdvanced.toggle() }
                     .buttonStyle(.quietLink)
@@ -202,9 +196,9 @@ struct TestLoginContent: View {
                         .padding(.top, 18)
                 }
             }
-            .padding(.horizontal, 32)
-            .padding(.top, 30)
-            .padding(.bottom, 24)
+            .padding(.horizontal, 24)
+            .padding(.top, 22)
+            .padding(.bottom, 24) }
             .onChange(of: test.preset) { test.inputsChanged() }
             .onChange(of: test.user) { test.inputsChanged() }
             .onChange(of: test.password) { test.inputsChanged() }
@@ -229,41 +223,27 @@ struct TestLoginContent: View {
                     .keyboardShortcut(.defaultAction)
                     .disabled(!test.canRun)
             }
-            .padding(.horizontal, 32)
+            .padding(.horizontal, 24)
             .padding(.vertical, 16)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.background)
     }
 
-    /// A muted label in a fixed column, then the control.
+    /// The label above the control, as in every sheet.
     private func labeled<Control: View>(_ label: String, @ViewBuilder control: () -> Control) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 16) {
-            Text(label)
-                .font(Theme.detail)
-                .foregroundStyle(Theme.muted)
-                .frame(width: 130, alignment: .leading)
-            control()
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
+        SheetField(label, control: control)
     }
 
     /// One choice as a text menu: the label, then the current value in ink (click for the others).
     private func choice<Value: Hashable>(_ label: String, selection: Binding<Value>, options: [Value],
                                          title: @escaping (Value) -> String) -> some View {
         labeled(label) {
-            Menu {
+            SheetPicker(label, selection: selection) {
                 ForEach(options, id: \.self) { option in
-                    Button(title(option)) { selection.wrappedValue = option }
+                    Text(title(option)).tag(option)
                 }
-            } label: {
-                Text(title(selection.wrappedValue))
-                    .font(Theme.body)
-                    .foregroundStyle(Theme.ink)
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
             .accessibilityLabel(label)
             .accessibilityValue(title(selection.wrappedValue))
         }
@@ -278,7 +258,7 @@ struct TestLoginContent: View {
             }
         case .ntlm:
             labeled("Workstation") {
-                TextField("Workstation", text: $test.workstation, prompt: Text("LABDC-TEST"))
+                QuietTextField("Workstation", text: $test.workstation, prompt: "LABDC-TEST")
                     .textFieldStyle(.quiet)
                     .help("The Workstation field of the logon: the NAC's name")
                     .accessibilityLabel("Workstation")
@@ -286,15 +266,9 @@ struct TestLoginContent: View {
             choice("Name form", selection: $test.ntlmNameForm, options: test.nameForms) {
                 test.nameFormLabel($0, status: status)
             }
-            Toggle(isOn: $test.msCHAPv2Style) {
-                Text("MS-CHAPv2 style (NTLMv1)").font(Theme.body).foregroundStyle(Theme.ink)
-            }
-            .toggleStyle(.quiet)
+            SheetToggle("MS-CHAPv2 style (NTLMv1)", isOn: $test.msCHAPv2Style)
             .help("A 24-byte response over the RFC 2759 challenge hash with MSV1_0_ALLOW_MSVCHAPV2, as PEAP-MSCHAPv2 pass-through sends")
-            Toggle(isOn: $test.allowComputerAccounts) {
-                Text("Allow computer accounts").font(Theme.body).foregroundStyle(Theme.ink)
-            }
-            .toggleStyle(.quiet)
+            SheetToggle("Allow computer accounts", isOn: $test.allowComputerAccounts)
             .help("MSV1_0_ALLOW_WORKSTATION_TRUST_ACCOUNT and …SERVER…: ntlm_auth and NACs set them")
         case .ldap:
             choice("Name form", selection: $test.ldapNameForm, options: test.nameForms) {

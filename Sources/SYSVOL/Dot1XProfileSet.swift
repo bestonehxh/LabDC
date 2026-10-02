@@ -255,6 +255,9 @@ public struct Dot1XProfileSet: Codable, Equatable, Sendable {
         var profile = profile
         profile.name = profile.name.trimmingCharacters(in: .whitespaces)
         profile.ssids = profile.ssids.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        // What the XML can say (autoSwitch only with connectionMode auto): otherwise the draft
+        // never equals what reads back from Group Policy and stays "changed" after Publish.
+        profile.autoSwitch = profile.autoSwitch && profile.connectAutomatically
         try profile.validate()
         let key = old ?? profile.name
         if wireless.contains(where: { $0.name == profile.name && $0.name != key }) {

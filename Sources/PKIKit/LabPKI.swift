@@ -109,6 +109,8 @@ public actor LabPKI {
 
     /// Makes sure the lab CA with subject `CN=<name>` exists and is not about to expire.
     ///
+    /// A lab CA that is not the current CA is left as it is (no re-key, no rename).
+    ///
     /// A new lab CA (different name, missing, expiring within 30 days) invalidates the server
     /// certificate when the lab CA is current: it is removed and must be reissued with
     /// `ensureServerCertificate`.
@@ -129,6 +131,9 @@ public actor LabPKI {
            lab.certificate.notValidAfter > now.addingTimeInterval(Self.renewBefore) {
             return .unchanged
         }
+        // A lab CA that no longer issues (a root migration made another CA current, and retired
+        // it or will) is never re-keyed or renamed: it only keeps publishing its CRL.
+        if lab != nil, currentCAName.lowercased() != Self.labCAName { return .unchanged }
 
         let key = try CASigningKey.generate(lab?.keyType ?? keyType)
         let certificate = try Self.makeCACertificate(subject: subject, key: key, years: Self.caLifetimeYears,

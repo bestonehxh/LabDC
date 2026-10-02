@@ -326,6 +326,31 @@ public enum DirectorySchema {
         linkPairs.values.first { $0.caseInsensitiveCompare(name) == .orderedSame }
     }
 
+    // MARK: - 32-bit integers
+
+    /// An INTEGER-syntax (2.5.5.9) value as AD stores it: 32 bits. AD accepts the decimal text of
+    /// a signed or unsigned 32-bit number (`-2147483646` and `2147483650` are the same
+    /// `groupType`), nothing wider. nil for anything else — no spaces, no out-of-range value,
+    /// so a value like `4295491584` (2^32 + TRUSTED_FOR_DELEGATION) can never pass one reader as
+    /// harmless and another, truncating to 32 bits, as privileged. Every check and every store
+    /// of these attributes uses this one parser.
+    public static func int32Bits(_ value: [UInt8]) -> UInt32? {
+        guard let s = String(validating: value, as: UTF8.self) else { return nil }
+        return int32Bits(s)
+    }
+
+    /// `int32Bits` of decimal text.
+    public static func int32Bits(_ text: String) -> UInt32? {
+        guard let v = Int64(text) else { return nil }
+        return int32Bits(v)
+    }
+
+    /// `int32Bits` of an already-parsed number (an increment's result).
+    public static func int32Bits(_ v: Int64) -> UInt32? {
+        guard v >= Int64(Int32.min), v <= Int64(UInt32.max) else { return nil }
+        return UInt32(truncatingIfNeeded: v)
+    }
+
     // MARK: - Matching keys
 
     /// The comparison key of a value under `syntax`: lower-cased text for strings, the

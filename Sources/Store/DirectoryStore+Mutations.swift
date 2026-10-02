@@ -113,13 +113,14 @@ extension DirectoryStore {
             if isUser {
                 setDefault("userAccountControl", String(Self.defaultUAC(computer: isComputer)))
                 let uacText = merged.first { $0.0.caseInsensitiveCompare("userAccountControl") == .orderedSame }?.1.first
-                let uac = UInt32(truncatingIfNeeded: Int64(String(decoding: uacText ?? [], as: UTF8.self)) ?? 0)
+                let uac = DirectorySchema.int32Bits(uacText ?? []) ?? 0    // invalid → refused below
                 setDefault("primaryGroupID", String(Self.defaultPrimaryGroup(uac: uac, computer: isComputer)))
             }
             if isGroup { setDefault("groupType", String(GroupType.globalSecurity)) }
             for (name, values) in merged where DirectorySchema.isSingleValued(name) && values.count > 1 {
                 throw StoreError.constraintViolation("\(name) is single-valued")
             }
+            for (name, values) in merged { try Self.validateInt32(name, values) }
 
             var sid = forcedSID
             if sid == nil, isUser || isGroup {
@@ -208,6 +209,18 @@ extension DirectoryStore {
         }
     }
 
+    /// INTEGER-syntax (2.5.5.9) attributes hold 32 bits (`userAccountControl`, `primaryGroupID`,
+    /// `groupType`, `sAMAccountType`, `msDS-SupportedEncryptionTypes`, ...): every value must be
+    /// the decimal text of a signed or unsigned 32-bit number (`DirectorySchema.int32Bits`).
+    /// A wider value would read as one thing to a range-checking parser and another to the
+    /// readers that truncate to 32 bits, so no caller may store one.
+    static func validateInt32(_ name: String, _ values: [[UInt8]]) throws {
+        guard DirectorySchema.syntax(of: name) == .integer else { return }
+        if let bad = values.first(where: { DirectorySchema.int32Bits($0) == nil }) {
+            throw StoreError.invalidAttributeSyntax("\(name): '\(String(decoding: bad, as: UTF8.self))' is not a 32-bit integer")
+        }
+    }
+
     private func matchKey(_ name: String, _ v: [UInt8]) -> [UInt8] {
         DirectorySchema.matchKey(v, syntax: DirectorySchema.syntax(of: name)) ?? v
     }
@@ -248,6 +261,7 @@ extension DirectoryStore {
         if DirectorySchema.isSingleValued(name) && current.count > 1 {
             throw StoreError.constraintViolation("\(name) is single-valued")
         }
+        try Self.validateInt32(name, current)
         let syntax = DirectorySchema.syntax(of: name)
         if syntax.isInteger || syntax == .boolean, current.contains(where: { DirectorySchema.matchKey($0, syntax: syntax) == nil }) {
             throw StoreError.constraintViolation("\(name): invalid \(syntax) value")

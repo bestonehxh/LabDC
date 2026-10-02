@@ -133,13 +133,15 @@ struct SettingsFact: View {
     var body: some View {
         QuietRow(first: first) {
             HStack(alignment: .firstTextBaseline, spacing: 24) {
+                // The label in ink like every other settings row's; the value is what is muted
+                // (a label in muted beside "NetBIOS name" in ink read as two kinds of row).
                 Text(title)
                     .font(Theme.body)
-                    .foregroundStyle(Theme.muted)
+                    .foregroundStyle(Theme.ink)
                 Spacer(minLength: 16)
                 Text(value)
                     .font(Theme.body)
-                    .foregroundStyle(Theme.ink)
+                    .foregroundStyle(Theme.muted)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
@@ -165,7 +167,6 @@ struct GeneralSettings: View {
     @State private var newDomainName = ""
     @State private var domainMessage: String?
     @State private var showNewProfile = false
-    @State private var newProfileName = ""
     @State private var profileError: String?
     @State private var renaming: AppProfile?
     @State private var renameTo = ""
@@ -225,7 +226,7 @@ struct GeneralSettings: View {
                 SettingsFact(title: "Kerberos realm", value: status.realm ?? "—")
                 SettingsRow(title: "NetBIOS name") {
                     HStack(alignment: .center, spacing: 14) {
-                        TextField("NetBIOS name", text: $netbiosName)
+                        QuietTextField("NetBIOS name", text: $netbiosName, prompt: "LAB")
                             .textFieldStyle(.quiet)
                             .frame(width: 160)
                             .autocorrectionDisabled()
@@ -343,7 +344,7 @@ struct GeneralSettings: View {
                         HStack(alignment: .firstTextBaseline, spacing: 24) {
                             QuietNote("A profile is one domain with its own directory, CA and settings. The active profile's folder opens at launch; switching stops the services first.", attention: false)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                            Button("New profile…") { newProfileName = ""; showNewProfile = true }
+                            Button("New profile…") { showNewProfile = true }
                                 .buttonStyle(.quietLink)
                                 .disabled(settling)
                         }
@@ -376,32 +377,10 @@ struct GeneralSettings: View {
                 Text(Self.trashMessage(profile))
             }
             .sheet(isPresented: $showNewProfile) {
-                // Checked as the name is typed; the reason stays in the sheet, not behind it.
-                let problem = Self.nameProblem(newProfileName, existing: profileList.map(\.name))
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("New profile").font(Theme.emphasis).foregroundStyle(Theme.ink)
-                    TextField("Profile name", text: $newProfileName).textFieldStyle(.quiet)
-                        .autocorrectionDisabled()
-                    if let problem {
-                        QuietNote(problem, attention: !newProfileName.trimmingCharacters(in: .whitespaces).isEmpty)
-                    }
-                    QuietNote("An empty folder is created in Application Support/LabDC Profiles; the Setup wizard opens for the new domain.", attention: false)
-                    HStack {
-                        Spacer()
-                        Button("Cancel", role: .cancel) { showNewProfile = false }.buttonStyle(.quietLink)
-                        Button("Create and switch…") {
-                            guard problem == nil else { return }
-                            createTarget = newProfileName.trimmingCharacters(in: .whitespacesAndNewlines)
-                            showNewProfile = false
-                        }
-                        .buttonStyle(.quietPrimary)
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(problem != nil || settling)
-                    }
+                NewProfileSheet(existing: profileList.map(\.name), settling: settling) { name in
+                    createTarget = name
+                    showNewProfile = false
                 }
-                .padding(24).frame(width: 440)
-                .background(Theme.background)
-                .onAppear { newProfileName = "" }
             }
             // Creating switches, and switching stops every service: the same question as Switch….
             .alert("Create \(createTarget ?? "") and switch to it?", isPresented: Binding(
@@ -423,42 +402,21 @@ struct GeneralSettings: View {
                 Text("Every service of \(AppProfile.activeName) stops and the Setup wizard opens for the new domain; devices using \(AppProfile.activeName) cannot sign in until you switch back.")
             }
             .sheet(item: $renaming) { profile in
-                let isActive = profile.name == AppProfile.activeName
-                let trimmed = renameTo.trimmingCharacters(in: .whitespacesAndNewlines)
-                let problem = trimmed == profile.name ? "That is its name already."
-                    : Self.nameProblem(renameTo, existing: profileList.map(\.name).filter { $0 != profile.name })
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("Rename profile \(profile.name)").font(Theme.emphasis).foregroundStyle(Theme.ink)
-                    TextField("New name", text: $renameTo).textFieldStyle(.quiet)
-                        .autocorrectionDisabled()
-                    if let problem { QuietNote(problem, attention: !trimmed.isEmpty) }
-                    if isActive {
-                        QuietNote("This is the active profile: the services stop, the folder is renamed, and LabDC reopens it under the new name.", attention: false)
-                    }
-                    if let renameError { QuietNote(renameError, attention: true) }
-                    HStack {
-                        Spacer()
-                        Button("Cancel", role: .cancel) { renaming = nil }.buttonStyle(.quietLink)
-                        Button(renameBusy ? "Renaming…" : "Rename") {
-                            let from = profile.name, to = renameTo
-                            renameBusy = true
-                            renameError = nil
-                            Task {
-                                do {
-                                    try await model.renameProfile(from, to: to)
-                                    renaming = nil; profileError = nil
-                                } catch { renameError = error.localizedDescription }
-                                renameBusy = false
-                                profilesRevision += 1
-                            }
-                        }
-                        .buttonStyle(.quietPrimary)
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(problem != nil || renameBusy || (isActive && settling))
+                RenameProfileSheet(name: profile.name, isActive: profile.name == AppProfile.activeName,
+                                   existing: profileList.map(\.name), settling: settling,
+                                   renameTo: $renameTo, failure: $renameError, busy: $renameBusy) {
+                    let from = profile.name, to = renameTo
+                    renameBusy = true
+                    renameError = nil
+                    Task {
+                        do {
+                            try await model.renameProfile(from, to: to)
+                            renaming = nil; profileError = nil
+                        } catch { renameError = error.localizedDescription }
+                        renameBusy = false
+                        profilesRevision += 1
                     }
                 }
-                .padding(24).frame(width: 440)
-                .background(Theme.background)
             }
 
             QuietSection("Administrator") {
@@ -504,6 +462,58 @@ struct GeneralSettings: View {
                 failed = true
             }
             netbiosBusy = false
+        }
+    }
+}
+
+/// Settings ▸ General ▸ Data profiles ▸ New profile…: the name, checked as it is typed (the
+/// reason stays in the sheet, not behind it).
+struct NewProfileSheet: View {
+    let existing: [String]
+    let settling: Bool
+    let create: (String) -> Void
+    @State private var name = ""
+
+    var body: some View {
+        let problem = GeneralSettings.nameProblem(name, existing: existing)
+        let typed = !name.trimmingCharacters(in: .whitespaces).isEmpty
+        QuietSheet(title: "New profile", width: 460, failure: typed ? problem : nil) {
+            SheetField("Name", note: "An empty folder is created in Application Support/LabDC Profiles; the Setup wizard opens for the new domain.") {
+                QuietTextField("Name", text: $name, prompt: "Branch lab").textFieldStyle(.quiet)
+                    .autocorrectionDisabled()
+            }
+        } actions: {
+            SheetButtons("Create and switch…", disabled: problem != nil || settling) {
+                guard problem == nil else { return }
+                create(name.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+    }
+}
+
+/// Settings ▸ General ▸ Data profiles ▸ Edit ▸ Rename….
+struct RenameProfileSheet: View {
+    let name: String
+    let isActive: Bool
+    let existing: [String]
+    let settling: Bool
+    @Binding var renameTo: String
+    @Binding var failure: String?
+    @Binding var busy: Bool
+    let rename: () -> Void
+
+    var body: some View {
+        let trimmed = renameTo.trimmingCharacters(in: .whitespacesAndNewlines)
+        let problem = trimmed == name ? "That is its name already."
+            : GeneralSettings.nameProblem(renameTo, existing: existing.filter { $0 != name })
+        QuietSheet(title: "Rename the profile \(name)", width: 460, failure: failure ?? (trimmed.isEmpty ? nil : problem)) {
+            SheetField("New name",
+                       note: isActive ? "This is the active profile: the services stop, the folder is renamed, and LabDC reopens it under the new name." : nil) {
+                QuietTextField("New name", text: $renameTo, prompt: name).textFieldStyle(.quiet)
+                    .autocorrectionDisabled()
+            }
+        } actions: {
+            SheetButtons(busy ? "Renaming…" : "Rename", disabled: problem != nil || busy || (isActive && settling), action: rename)
         }
     }
 }
@@ -697,8 +707,8 @@ struct DNSAllowedClientsSetting: View {
             SettingsLabel(title: "Other names for",
                           detail: "Names outside the domain are looked up only for devices on this Mac's networks and the DHCP scopes. Add other networks (routed subnets, VPNs) here.")
             HStack(alignment: .firstTextBaseline, spacing: 16) {
-                TextField("Networks", text: $text, prompt: Text("10.8.0.0/16, fd00::/64"))
-                    .textFieldStyle(.quiet)
+                QuietTextField("Networks", text: $text, prompt: "10.8.0.0/16, fd00::/64")
+                    .textFieldStyle(.quietMonospaced)
                     .labelsHidden()
                     .onSubmit { save() }
                     .accessibilityLabel("Networks allowed to resolve other names")
@@ -750,8 +760,8 @@ struct DNSForwardingSetting: View {
             }
             if custom {
                 HStack(alignment: .firstTextBaseline, spacing: 16) {
-                    TextField("DNS servers", text: $text, prompt: Text("10.0.0.53, 8.8.8.8"))
-                        .textFieldStyle(.quiet)
+                    QuietTextField("DNS servers", text: $text, prompt: "10.0.0.53, 8.8.8.8")
+                        .textFieldStyle(.quietMonospaced)
                         .labelsHidden()
                         .onSubmit { save(text) }
                         .accessibilityLabel("DNS servers")
@@ -811,14 +821,14 @@ struct PasswordPolicySection: View {
     var body: some View {
         QuietSection("Password policy") {
             SettingsRow(title: "Minimum length") {
-                TextField("7", text: $minLength)
+                QuietTextField("Minimum password length", text: $minLength, prompt: "7")
                     .textFieldStyle(.quiet)
                     .frame(width: 60)
                     .autocorrectionDisabled()
                     .accessibilityLabel("Minimum password length")
             }
             SettingsRow(title: "Remember old passwords") {
-                TextField("24", text: $history)
+                QuietTextField("Password history length", text: $history, prompt: "24")
                     .textFieldStyle(.quiet)
                     .frame(width: 60)
                     .autocorrectionDisabled()
@@ -923,7 +933,7 @@ struct PortRow: View {
                             .font(Theme.caption)
                             .foregroundStyle(Theme.faint)
                     }
-                    TextField("Port", text: $text, prompt: Text(current == 0 ? "auto" : String(current)))
+                    QuietTextField("Port", text: $text, prompt: current == 0 ? "auto" : String(current))
                         .textFieldStyle(.quiet)
                         .labelsHidden()
                         .frame(width: 70)

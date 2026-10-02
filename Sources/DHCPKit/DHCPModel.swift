@@ -161,7 +161,8 @@ public struct DHCPScope: Codable, Sendable, Equatable, Identifiable {
                   dnsServers: try c.decodeIfPresent([String].self, forKey: .dnsServers) ?? [],
                   domainName: try c.decodeIfPresent(String.self, forKey: .domainName),
                   ntpServers: try c.decodeIfPresent([String].self, forKey: .ntpServers) ?? [],
-                  searchList: try c.decodeIfPresent([String].self, forKey: .searchList) ?? [],
+                  // Rows saved before 2 Oct 2026 may hold `a.lab b.lab` as one entry.
+                  searchList: DHCPScope.splitSearchList(try c.decodeIfPresent([String].self, forKey: .searchList) ?? []),
                   mtu: try c.decodeIfPresent(Int.self, forKey: .mtu),
                   staticRoutes: try c.decodeIfPresent([DHCPOptionBuilder.StaticRoute].self, forKey: .staticRoutes) ?? [],
                   capwap: try c.decodeIfPresent([String].self, forKey: .capwap) ?? [],
@@ -260,13 +261,19 @@ public struct DHCPScope: Codable, Sendable, Equatable, Identifiable {
             for r in exclusions { if let v = r.v4 { total -= min(total, UInt64(v.upperBound.value - v.lowerBound.value) + 1) } }
             return total
         case .v6:
+            // Saturating: a /64 range alone is 2^64 addresses.
+            func count(_ v: ClosedRange<IPv6Address>) -> UInt64 {
+                let span = v.upperBound.value - v.lowerBound.value
+                return span >= UInt128(UInt64.max) ? .max : UInt64(span) + 1
+            }
             var total: UInt64 = 0
             for r in ranges {
-                if let v = r.v6 {
-                    let span = v.upperBound.value - v.lowerBound.value
-                    total = span >= UInt128(UInt64.max) ? UInt64.max : total &+ UInt64(span) &+ 1
-                }
+                guard let v = r.v6 else { continue }
+                let (sum, overflow) = total.addingReportingOverflow(count(v))
+                total = overflow ? .max : sum
             }
+            guard total < .max else { return total }
+            for r in exclusions { if let v = r.v6 { total -= min(total, count(v)) } }
             return total
         }
     }

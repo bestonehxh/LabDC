@@ -194,6 +194,9 @@ public enum GroupPolicyDot1X {
         public var suiteBThumbprint: String?
         /// During a root migration that keeps the old root: its thumbprint (trusted as well).
         public var previousRootThumbprint: String?
+        /// During a migration away from a P-384 root that served 192-bit itself: its thumbprint,
+        /// still trusted by the 192-bit profiles (their client certificates came from it).
+        public var previousSuiteBThumbprint: String?
     }
 
     public static func trust(store: DirectoryStore, pki: LabPKI) async throws -> Trust {
@@ -210,6 +213,7 @@ public enum GroupPolicyDot1X {
            let old = try? await pki.authority(named: state.from), let oldDER = try? old.der() {
             let t = CertificateBlob.thumbprint(oldDER)
             if t != trust.caThumbprint { trust.previousRootThumbprint = t }
+            if old.keyType == .p384, t != trust.suiteBThumbprint { trust.previousSuiteBThumbprint = t }
         }
         return trust
     }
@@ -328,10 +332,11 @@ public enum GroupPolicyDot1X {
             for t in server.alsoTrusted where !known.contains(t) {
                 throw CLIError.failure("\(label) trusts certificate \(t), which is not in the Default Domain Policy's trusted roots (Certificates ▸ Trusted Roots)")
             }
-            guard let root = roots.first(where: { $0.thumbprint == server.trustedRoot }) else {
+            guard known.contains(server.trustedRoot),
+                  let rootDER = pool.first(where: { CertificateBlob.thumbprint($0) == server.trustedRoot }) else {
                 throw CLIError.failure("\(label) trusts certificate \(server.trustedRoot), which is not in the Default Domain Policy's trusted roots (Certificates ▸ Trusted Roots)")
             }
-            if p384, (try? Dot1XTrustCertificate(der: root.der))?.p384 != true {
+            if p384, (try? Dot1XTrustCertificate(der: rootDER))?.p384 != true {
                 throw CLIError.failure("\(label) is WPA3-Enterprise 192-bit: its RADIUS server certificate must be ECDSA P-384")
             }
         }
@@ -344,10 +349,14 @@ public enum GroupPolicyDot1X {
         let previous = trust.previousRootThumbprint.map { [$0] } ?? []
         func policy(ssid: String, method: Dot1XPolicy.Method, authMode: Dot1XPolicy.AuthMode,
                     security: Dot1XPolicy.Security = .wpa2, auto: Bool = true) -> Dot1XPolicy {
-            Dot1XPolicy(name: Dot1XPolicy.defaultName, ssid: ssid, authMode: authMode, caThumbprint: trust.caThumbprint,
+            var p = Dot1XPolicy(name: Dot1XPolicy.defaultName, ssid: ssid, authMode: authMode, caThumbprint: trust.caThumbprint,
                         method: method, security: security, serverNames: [trust.serverName],
                         clientIssuerThumbprint: method == .tls ? trust.caThumbprint : nil,
                         additionalTrustedRoots: previous, connectAutomatically: auto)
+            // The client-certificate filter keeps both lab roots even when `otherServer`
+            // replaces the server trust.
+            p.additionalClientIssuers = previous
+            return p
         }
         var suiteB: String?
         if set.wireless.contains(where: { $0.security == .wpa3Suite192 }) {
@@ -382,7 +391,8 @@ public enum GroupPolicyDot1X {
             if w.security == .wpa3Suite192, let suiteB {
                 p.caThumbprint = suiteB
                 p.clientIssuerThumbprint = suiteB
-                p.additionalTrustedRoots = []
+                p.additionalTrustedRoots = trust.previousSuiteBThumbprint.map { [$0] } ?? []
+                p.additionalClientIssuers = p.additionalTrustedRoots
             }
             otherServer(w.server, &p, pool: pool)
             w.validation.apply(to: &p)

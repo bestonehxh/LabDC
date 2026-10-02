@@ -159,11 +159,11 @@ struct SetupWizardContent: View {
                 if wizard.hasTypedData { confirmCancel = true } else { Task { await cancel() } }
             } label: {
                 Text("Cancel")
-                    .font(Theme.body)
-                    .foregroundStyle(Theme.muted)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            // The same underlined Cancel as every sheet (it was plain muted text here only).
+            .buttonStyle(.quietLink)
+            // No Esc shortcut: Esc on an untouched wizard quit LabDC (or dropped back to the
+            // previous domain) without a word. Cancel is a click only.
             .disabled(wizard.creating)
             .padding(.trailing, 24)
             .accessibilityHint("Return to the previous domain, or quit")
@@ -176,20 +176,14 @@ struct SetupWizardContent: View {
             if wizard.step == .domain {
                 Button { wizard.useDefaults() } label: {
                     Text("Skip, use lab.sheep")
-                        .font(Theme.body)
-                        .foregroundStyle(Theme.muted)
-                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.quietLink)
                 .accessibilityHint("Uses the domain lab.sheep and goes to the password step")
             } else {
                 Button { wizard.back() } label: {
                     Text("Back")
-                        .font(Theme.body)
-                        .foregroundStyle(Theme.muted)
-                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.quietLink)
                 .disabled(wizard.creating)
             }
             Spacer(minLength: 16)
@@ -317,11 +311,11 @@ struct DomainStep: View {
             FieldBox {
                 VStack(alignment: .leading, spacing: 4) {
                     WizardFieldLabel(text: "Domain")
-                    TextField("Domain", text: $wizard.domain, prompt: Text(DomainSetup.suggested))
+                    QuietTextField("Domain", text: $wizard.domain, prompt: DomainSetup.suggested)
                         .textFieldStyle(.quiet)
                         .accessibilityLabel("Domain name")
                     WizardFieldLabel(text: "NetBIOS name")
-                    TextField("NetBIOS name", text: $wizard.netbios, prompt: Text((try? wizard.derivation.get())?.netbios ?? "LAB"))
+                    QuietTextField("NetBIOS name", text: $wizard.netbios, prompt: (try? wizard.derivation.get())?.netbios ?? "LAB")
                         .textFieldStyle(.quiet)
                         .autocorrectionDisabled()
                         .accessibilityLabel("NetBIOS domain name")
@@ -353,13 +347,13 @@ struct AdministratorStep: View {
             FieldBox {
                 VStack(alignment: .leading, spacing: 4) {
                     WizardFieldLabel(text: "Password")
-                    SecureField("Password", text: $wizard.password)
+                    QuietTextField("Password", text: $wizard.password, prompt: "Password", secure: true)
                         .textFieldStyle(.quiet)
                         .accessibilityLabel("Administrator password")
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     WizardFieldLabel(text: "Confirm")
-                    SecureField("Confirm", text: $wizard.confirm)
+                    QuietTextField("Confirm", text: $wizard.confirm, prompt: "Confirm", secure: true)
                         .textFieldStyle(.quiet)
                         .accessibilityLabel("Confirm the Administrator password")
                 }

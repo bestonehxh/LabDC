@@ -231,7 +231,6 @@ public enum DHCPv4Engine {
     /// address → the longest-free one. Nil (with a quiet line) when nothing fits.
     static func allocate(_ c: Context, _ leases: inout DHCPLeaseTable, out: inout DHCPv4Outcome)
         -> (IPv4Address, DHCPScope, DHCPReservation?, String)? {
-        let settings = c.config.settings
         if let r = c.reservation(), let a = IPv4Address(r.address), let scope = c.config.scope(id: r.scopeID) {
             if leases.heldByOther(.v4, r.address, client: c.clientKey, now: c.now) {
                 let other = leases.lease(.v4, r.address)
@@ -257,69 +256,138 @@ public enum DHCPv4Engine {
             return (a, s, nil, "own lease")
         }
 
-        // New allocations are capped per relay and per circuit.
-        if settings.maxLeasesPerRelay > 0, c.relayed {
-            let n = leases.all.filter { $0.family == .v4 && $0.relay == c.arrival.source.description && $0.holds(at: c.now) && $0.state != .foreign }.count
-            if n >= settings.maxLeasesPerRelay {
-                out.common.counters.append(.capped)
-                out.common.quiet = ("cap relay \(c.arrival.source)", "DHCP: relay \(c.arrival.source) has \(n) leases (cap \(settings.maxLeasesPerRelay)); no offer to \(c.who)")
-                return nil
-            }
-        }
-        if settings.maxLeasesPerCircuit > 0, let circuit = c.p.relayAgentInformation?.circuit {
-            let hex = DHCPHex.string(circuit)
-            let n = leases.all.filter { $0.family == .v4 && $0.circuitID == hex && $0.holds(at: c.now) && $0.state != .foreign }.count
-            if n >= settings.maxLeasesPerCircuit {
-                out.common.counters.append(.capped)
-                out.common.quiet = ("cap circuit \(hex)", "DHCP: circuit \(CircuitIDDecoder.describe(circuit)) has \(n) leases (cap \(settings.maxLeasesPerCircuit)); no offer to \(c.who)")
-                return nil
-            }
-        }
-        if settings.clientIDChurnLimit > 0, let mac = c.p.mac {
-            let hourAgo = c.now.addingTimeInterval(-3600)
-            let keys = Set(leases.all.filter { $0.family == .v4 && $0.mac == mac && $0.updated > hourAgo }.map(\.clientKey) + [c.clientKey])
-            if keys.count > settings.clientIDChurnLimit {
-                out.common.counters.append(.capped)
-                out.common.quiet = ("churn \(mac)", "DHCP: \(mac) used \(keys.count) client identifiers in an hour (cap \(settings.clientIDChurnLimit)); no offer")
-                return nil
-            }
+        // New allocations are capped per relay and per circuit, and client-id churn per MAC.
+        if let why = capReason(c, leases, includeForeign: false) {
+            out.common.counters.append(.capped)
+            out.common.quiet = (why.key, "\(why.text); no offer to \(c.who)")
+            return nil
         }
 
-        func free(_ a: IPv4Address, _ s: DHCPScope) -> Bool {
-            s.isAssignable(a.description) && !reserved.contains(a.description)
-                && !leases.heldByOther(.v4, a.description, client: c.clientKey, now: c.now)
-                && !(leases.lease(.v4, a.description).map { $0.holds(at: c.now) } ?? false)
+        // Each open scope parsed once: subnet, ranges (policy ranges where they apply),
+        // exclusions and routers as integers.
+        let pools = open.compactMap { Pool($0, policy: c.policy(in: $0)) }
+        let reservedV4 = Set(reserved.compactMap { IPv4Address($0)?.value })
+        func free(_ v: UInt32, _ pool: Pool) -> Bool {
+            pool.allows(v) && !reservedV4.contains(v)
+                && !(leases.lease(.v4, IPv4Address(v).description).map { $0.holds(at: c.now) } ?? false)
         }
 
         // Option 50, when it is free in one of our ranges.
-        if let req = c.p.requestedAddress, let s = open.first(where: { $0.subnetV4?.contains(req) == true }), free(req, s) {
-            if let pol = c.policy(in: s), !pol.ranges.isEmpty {
-                if pol.ranges.contains(where: { $0.v4?.contains(req) ?? false }) { return (req, s, nil, "requested") }
-            } else {
-                return (req, s, nil, "requested")
+        if let req = c.p.requestedAddress, let pool = pools.first(where: { $0.subnet.contains(req) }), free(req.value, pool) {
+            return (req, pool.scope, nil, "requested")
+        }
+
+        // Never-used first: a binary search per range for the first address without a row,
+        // skipping exclusions, routers, reservations and network/broadcast.
+        for pool in pools {
+            for span in pool.search {
+                var v = span.lowerBound
+                var probes = 0
+                while probes < Self.maxProbes, let u = leases.firstUnusedV4(from: v, through: span.upperBound) {
+                    if pool.allows(u), !reservedV4.contains(u) { return (IPv4Address(u), pool.scope, nil, "new") }
+                    probes += 1
+                    guard let next = pool.next(after: u), next <= span.upperBound else { break }
+                    v = next
+                }
             }
         }
 
-        // Scan: never-used first, else the address free the longest.
+        // Else the address free the longest: the head of each scope's free-age order (orphan
+        // rows of deleted scopes too), a bounded number of candidates per scope.
         var oldest: (IPv4Address, DHCPScope, Date)?
-        for s in open {
-            let ranges = c.policy(in: s).flatMap { $0.ranges.isEmpty ? nil : $0.ranges } ?? s.ranges
-            for r in ranges {
-                guard let span = r.v4 else { continue }
-                var v = span.lowerBound.value
-                while v <= span.upperBound.value {
-                    let a = IPv4Address(v)
-                    if free(a, s) {
-                        guard let history = leases.lease(.v4, a.description) else { return (a, s, nil, "new") }
-                        if oldest == nil || history.updated < oldest!.2 { oldest = (a, s, history.updated) }
+        let known = Set(c.config.scopes.map(\.id))
+        let orphans = leases.v4ScopeIDs.filter { !known.contains($0) }
+        for pool in pools {
+            for sid in [pool.scope.id] + orphans {
+                for (v, since) in leases.freeV4ByAge(scope: sid, now: c.now, limit: Self.maxProbes) {
+                    if let o = oldest, o.2 <= since { break }
+                    if pool.subnet.contains(IPv4Address(v)), free(v, pool) {
+                        oldest = (IPv4Address(v), pool.scope, since)
+                        break
                     }
-                    if v == UInt32.max { break }
-                    v += 1
                 }
             }
         }
         if let oldest { return (oldest.0, oldest.1, nil, "reused") }
         out.common.quiet = ("full \(c.scopes.first?.id ?? 0)", "DHCP: no free address in \(c.scopes.map(\.name).joined(separator: ", ")) for \(c.who)")
+        return nil
+    }
+
+    /// Candidates the allocator looks at per range / scope before giving up.
+    static let maxProbes = 1024
+
+    /// A scope's pool as integers, parsed once per message.
+    struct Pool {
+        let scope: DHCPScope
+        let subnet: IPv4Subnet
+        /// The scope's ranges.
+        let ranges: [ClosedRange<UInt32>]
+        /// Where to look: the class policy's ranges when it has any, else the scope's.
+        let search: [ClosedRange<UInt32>]
+        let exclusions: [ClosedRange<UInt32>]
+        let routers: Set<UInt32>
+
+        init?(_ scope: DHCPScope, policy: DHCPClassPolicy?) {
+            guard let subnet = scope.subnetV4 else { return nil }
+            self.scope = scope
+            self.subnet = subnet
+            func ints(_ r: [DHCPRange]) -> [ClosedRange<UInt32>] {
+                r.compactMap { $0.v4.map { $0.lowerBound.value...$0.upperBound.value } }.sorted { $0.lowerBound < $1.lowerBound }
+            }
+            ranges = ints(scope.ranges)
+            let pr = ints(policy?.ranges ?? [])
+            search = pr.isEmpty ? ranges : pr
+            exclusions = ints(scope.exclusions)
+            routers = Set(scope.routers.compactMap { IPv4Address($0)?.value })
+        }
+
+        /// `DHCPScope.isAssignable` plus the policy's ranges, without parsing strings.
+        func allows(_ v: UInt32) -> Bool {
+            let a = IPv4Address(v)
+            guard subnet.isHost(a), !routers.contains(v) else { return false }
+            guard ranges.contains(where: { $0.contains(v) }), search.contains(where: { $0.contains(v) }) else { return false }
+            return !exclusions.contains { $0.contains(v) }
+        }
+
+        /// The next address worth trying after `v`: past an exclusion that holds it, else into
+        /// the next scope range when `v` is outside them, else `v + 1`.
+        func next(after v: UInt32) -> UInt32? {
+            if let ex = exclusions.first(where: { $0.contains(v) }) {
+                return ex.upperBound == .max ? nil : ex.upperBound + 1
+            }
+            if !ranges.contains(where: { $0.contains(v) }) {
+                return ranges.first(where: { $0.lowerBound > v })?.lowerBound
+            }
+            return v == .max ? nil : v + 1
+        }
+    }
+
+    /// The per-relay / per-circuit / client-id churn caps, nil when none is reached. Offers and
+    /// leases count; `includeForeign` counts rows marked from other servers' REQUESTs too.
+    static func capReason(_ c: Context, _ leases: DHCPLeaseTable, includeForeign: Bool) -> (key: String, text: String)? {
+        let settings = c.config.settings
+        if settings.maxLeasesPerRelay > 0, c.relayed {
+            let rows = leases.leases(relay: c.arrival.source.description, family: .v4)
+            let n = DHCPLeaseTable.holding(rows, now: c.now, limit: settings.maxLeasesPerRelay, includeForeign: includeForeign)
+            if n >= settings.maxLeasesPerRelay {
+                return ("cap relay \(c.arrival.source)", "DHCP: relay \(c.arrival.source) has \(n) leases (cap \(settings.maxLeasesPerRelay))")
+            }
+        }
+        if settings.maxLeasesPerCircuit > 0, let circuit = c.p.relayAgentInformation?.circuit {
+            let hex = DHCPHex.string(circuit)
+            let n = DHCPLeaseTable.holding(leases.leases(circuit: hex, family: .v4), now: c.now, limit: settings.maxLeasesPerCircuit,
+                                           includeForeign: includeForeign)
+            if n >= settings.maxLeasesPerCircuit {
+                return ("cap circuit \(hex)", "DHCP: circuit \(CircuitIDDecoder.describe(circuit)) has \(n) leases (cap \(settings.maxLeasesPerCircuit))")
+            }
+        }
+        if settings.clientIDChurnLimit > 0, let mac = c.p.mac {
+            let hourAgo = c.now.addingTimeInterval(-3600)
+            let keys = Set(leases.leases(mac: mac, family: .v4).filter { $0.updated > hourAgo }.map(\.clientKey) + [c.clientKey])
+            if keys.count > settings.clientIDChurnLimit {
+                return ("churn \(mac)", "DHCP: \(mac) used \(keys.count) client identifiers in an hour (cap \(settings.clientIDChurnLimit))")
+            }
+        }
         return nil
     }
 
@@ -367,12 +435,17 @@ public enum DHCPv4Engine {
             out.common.quiet = ("reboot-unknown \(c.clientKey)", "DHCP REQUEST (init-reboot) from \(c.who) for \(req): no lease here, silent")
             return
         }
-        // RENEWING / REBINDING.
+        // RENEWING / REBINDING: only for an address on the client's link (an enabled scope
+        // there); a REBINDING broadcast from another link must not extend it.
         let addr = p.ciaddr
         out.common.counters.append(.renew)
+        guard c.scope(containing: addr) != nil else {
+            if c.scopes.contains(where: \.authoritative) { nak(c, "\(addr) is not on this link", &out) }
+            else { out.common.quiet = ("renew-wrong \(c.clientKey)", "DHCP REQUEST (renew) from \(c.who) for \(addr) (not on \(c.linkText)), not ours to answer") }
+            return
+        }
         if var l = leases.lease(.v4, addr.description), l.clientKey == c.clientKey,
-           l.state == .active || ((l.state == .expired || l.state == .released) && !leases.heldByOther(.v4, addr.description, client: c.clientKey, now: c.now)),
-           c.scope(containing: addr) != nil || c.config.scope(id: l.scopeID)?.contains(addr.description) == true {
+           l.state == .active || ((l.state == .expired || l.state == .released) && !leases.heldByOther(.v4, addr.description, client: c.clientKey, now: c.now)) {
             ack(c, &l, &leases, &out)
             return
         }
@@ -394,13 +467,42 @@ public enum DHCPv4Engine {
             out.common.quiet = ("foreign \(other)", "DHCP REQUEST from \(c.who) to server \(other) (not us)")
             return
         }
-        if let l = leases.lease(.v4, req.description), l.state == .active, l.expires > c.now, l.clientKey != c.clientKey {
+        let existing = leases.lease(.v4, req.description)
+        if let l = existing, l.state == .active, l.expires > c.now, l.clientKey != c.clientKey {
             out.common.quiet = ("foreign-conflict \(req)", "DHCP: server \(other) handed \(req) to \(c.who) while it is leased here to \(l.whoText)")
             return
         }
-        var f = leases.lease(.v4, req.description) ?? DHCPLease(family: .v4, address: req.description, scopeID: scope.id, state: .foreign,
-                                                                  clientKey: c.clientKey, start: c.now, expires: c.now)
-        if f.state == .active, f.clientKey == c.clientKey, f.expires > c.now {
+        // An offer to another client, a DECLINE quarantine or an abandoned address stays as it
+        // is: a forged REQUEST must not turn them into something else.
+        if let l = existing, l.holds(at: c.now), [.offered, .declined, .abandoned].contains(l.state) {
+            out.common.quiet = ("foreign-kept \(req)", "DHCP REQUEST from \(c.who) to server \(other) for \(req), which is \(l.state.title.lowercased()) here: not marked")
+            return
+        }
+        let ownActive = existing.map { $0.state == .active && $0.clientKey == c.clientKey && $0.expires > c.now } ?? false
+        let refresh = existing.map { $0.state == .foreign && $0.clientKey == c.clientKey && $0.holds(at: c.now) } ?? false
+        if !ownActive, !refresh {
+            // A new foreign hold: the relay / circuit / churn caps apply (foreign rows count), and
+            // foreign rows may take at most half of a scope's pool, so forged REQUESTs naming
+            // another server cannot mark the whole pool taken.
+            let share = max(1, Int(min(scope.poolSize / 2, UInt64(Int.max))))
+            var why = capReason(c, leases, includeForeign: true)
+            if why == nil, leases.foreignCount(scope: scope.id) >= share {
+                why = ("cap foreign \(scope.id)", "DHCP: \(leases.foreignCount(scope: scope.id)) addresses of \(scope.name) are already marked as other servers' (cap \(share))")
+            }
+            if let why {
+                out.common.counters.append(.capped)
+                out.common.quiet = (why.key, "\(why.text); \(req) from \(c.who)'s REQUEST to server \(other) not marked")
+                return
+            }
+            // One foreign hold per client: the address it asked another server for before lapses.
+            for var old in leases.leases(client: c.clientKey) where old.family == .v4 && old.state == .foreign && old.address != req.description {
+                old.state = .expired; old.expires = c.now; old.updated = c.now
+                leases.put(old)
+            }
+        }
+        var f = existing ?? DHCPLease(family: .v4, address: req.description, scopeID: scope.id, state: .foreign,
+                                      clientKey: c.clientKey, start: c.now, expires: c.now)
+        if ownActive {
             // Our own client moving to the other server: our lease ends.
             out.common.dns.append(unregister(f))
         }
@@ -411,8 +513,9 @@ public enum DHCPv4Engine {
         f.mac = c.p.mac
         f.hostname = c.p.hostName ?? f.hostname
         f.start = c.now; f.updated = c.now
-        f.expires = c.now.addingTimeInterval(TimeInterval(scope.leaseSeconds))
+        f.expires = c.now.addingTimeInterval(TimeInterval(min(scope.leaseSeconds, Self.foreignHoldSeconds)))
         f.relay = c.relayed ? c.arrival.source.description : nil
+        f.circuitID = c.p.relayAgentInformation?.circuit.map(DHCPHex.string)
         leases.put(f)
         out.common.counters.append(.foreignSeen)
         out.common.events.append(DHCPEvent(date: c.now, family: .v4, address: req.description, mac: c.p.mac, clientKey: c.clientKey,
@@ -420,9 +523,16 @@ public enum DHCPv4Engine {
         out.common.quiet = ("foreign \(req)", "DHCP: \(req) is leased by server \(other) to \(c.who) (seen in its REQUEST)")
     }
 
+    /// How long an address seen in a REQUEST to another server stays marked (at most the
+    /// scope's lease time): short, since forged REQUESTs can create such rows.
+    static let foreignHoldSeconds = 1800
+
     static func ack(_ c: Context, _ l: inout DHCPLease, _ leases: inout DHCPLeaseTable, _ out: inout DHCPv4Outcome) {
-        guard let a = IPv4Address(l.address), let scope = c.config.scope(id: l.scopeID) ?? c.scope(containing: a) else {
-            nak(c, "no scope for \(l.address)", &out)
+        // The lease's scope must be one of this link's enabled scopes and hold the address.
+        guard let a = IPv4Address(l.address),
+              let scope = c.scopes.first(where: { $0.id == l.scopeID && $0.contains(l.address) }) ?? c.scope(containing: a) else {
+            if c.scopes.contains(where: \.authoritative) { nak(c, "\(l.address) is not on this link", &out) }
+            else { out.common.quiet = ("ack-wrong \(c.clientKey)", "DHCP REQUEST from \(c.who) for \(l.address): not in an enabled scope on \(c.linkText), silent") }
             return
         }
         let reservation = c.reservation().flatMap { $0.address == l.address ? $0 : nil }
@@ -593,7 +703,9 @@ public enum DHCPv4Engine {
                 break
             }
         }
-        for o in scope.customOptions + (policy?.options ?? []) + (reservation?.options ?? []) where o.code <= 254 {
+        // Options the server sets itself are never overridden (rows saved before validation refused them).
+        for o in scope.customOptions + (policy?.options ?? []) + (reservation?.options ?? [])
+        where o.code <= 254 && DHCPCustomOption.serverManagedV4[o.code] == nil {
             let code = UInt8(o.code)
             guard wanted(code), let b = try? o.encode() else { continue }
             r[code] = b

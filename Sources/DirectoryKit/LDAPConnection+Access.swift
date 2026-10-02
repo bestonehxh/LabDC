@@ -68,6 +68,8 @@ enum SelfWriteRights {
     static let privilegedUAC: UInt32 = UserAccountControl.serverTrustAccount | UserAccountControl.partialSecretsAccount
         | UserAccountControl.trustedForDelegation | UserAccountControl.trustedToAuthForDelegation
         | UserAccountControl.interdomainTrustAccount
+    /// 32-bit INTEGER attributes whose value an Account Operator write is checked against.
+    static let checkedIntegerAttributes: Set<String> = ["useraccountcontrol", "primarygroupid"]
     /// Attributes Account Operators may not write even on objects they manage.
     static let operatorDenied: Set<String> = [
         "admincount", "msds-allowedtodelegateto", "msds-allowedtoactonbehalfofotheridentity", "ntsecuritydescriptor",
@@ -252,7 +254,7 @@ extension LDAPConnection {
         }
         // The account must be a plain workstation trust account. Absent an explicit
         // userAccountControl the store defaults a computer to WORKSTATION_TRUST_ACCOUNT.
-        let uac = machineUAC(attributes)
+        let uac = try machineUAC(attributes)
         guard uac & UserAccountControl.workstationTrustAccount != 0,
               uac & SelfWriteRights.privilegedUAC == 0 else {
             throw LDAPFailure(.insufficientAccessRights, ADDiagnostic.insufficientAccess)
@@ -327,12 +329,48 @@ extension LDAPConnection {
     }
 
     /// The effective `userAccountControl` of an add: the value supplied, else the store's computer
-    /// default (WORKSTATION_TRUST_ACCOUNT).
-    func machineUAC(_ attributes: [String: [[UInt8]]]) -> UInt32 {
+    /// default (WORKSTATION_TRUST_ACCOUNT). Parsed exactly as the store parses and keeps it
+    /// (`DirectorySchema.int32Bits`); a value that is not a 32-bit integer is
+    /// `invalidAttributeSyntax`, never a harmless default.
+    func machineUAC(_ attributes: [String: [[UInt8]]]) throws -> UInt32 {
+        var result: UInt32?
         for (name, values) in attributes where name.caseInsensitiveCompare("userAccountControl") == .orderedSame {
-            if let text = values.first.map({ String(decoding: $0, as: UTF8.self) }), let v = UInt32(text) { return v }
+            for value in values {
+                let v = try Self.int32Value(value)
+                if result == nil { result = v }
+            }
         }
-        return UserAccountControl.workstationTrustAccount
+        return result ?? UserAccountControl.workstationTrustAccount
+    }
+
+    /// A 32-bit INTEGER attribute value (`userAccountControl`, `primaryGroupID`, ...) as the store
+    /// keeps it, or `invalidAttributeSyntax` (21).
+    static func int32Value(_ value: [UInt8]) throws -> UInt32 {
+        guard let v = DirectorySchema.int32Bits(value) else {
+            throw LDAPFailure(.invalidAttributeSyntax, ADDiagnostic.invalidAttributeSyntax)
+        }
+        return v
+    }
+
+    /// The attributes an Account Operator's modify writes, as the access checks must see them.
+    /// An increment of `userAccountControl` or `primaryGroupID` becomes a replace with the
+    /// resulting value (current + delta, a 32-bit integer or `invalidAttributeSyntax`): the
+    /// value checked is the value stored, so neither a crafted delta nor a concurrent change of
+    /// the current value can turn on a bit the check did not see.
+    static func operatorModifyOps(_ ops: [ModifyOp], entry: DirectoryEntry) throws -> [ModifyOp] {
+        try ops.map { op in
+            guard case .increment(let name, let delta) = op,
+                  SelfWriteRights.checkedIntegerAttributes.contains(name.lowercased()) else { return op }
+            let current = entry.values(name)
+            guard current.count == 1, let base = Int64(String(decoding: current[0], as: UTF8.self)) else {
+                throw LDAPFailure(.constraintViolation, ADDiagnostic.constraintViolation)
+            }
+            let (sum, overflow) = base.addingReportingOverflow(delta)
+            guard !overflow, DirectorySchema.int32Bits(sum) != nil else {
+                throw LDAPFailure(.invalidAttributeSyntax, ADDiagnostic.invalidAttributeSyntax)
+            }
+            return .replace(name, [Array(String(sum).utf8)])
+        }
     }
 
     /// `ms-DS-MachineAccountQuota` from the domain head (provisioned 10). Absent → 0 (no quota).
@@ -388,13 +426,17 @@ extension LDAPConnection {
             if SelfWriteRights.operatorDenied.contains(l) {
                 throw LDAPFailure(.insufficientAccessRights, ADDiagnostic.insufficientAccess)
             }
-            if l == "useraccountcontrol",
-               values.contains(where: { (UInt32(String(decoding: $0, as: UTF8.self)) ?? 0) & SelfWriteRights.privilegedUAC != 0 }) {
-                throw LDAPFailure(.insufficientAccessRights, ADDiagnostic.insufficientAccess)
+            // The same strict 32-bit parse the store applies (no unparseable value is read as 0,
+            // no wider value is checked as one number and stored as another).
+            if l == "useraccountcontrol" {
+                for value in values where try Self.int32Value(value) & SelfWriteRights.privilegedUAC != 0 {
+                    throw LDAPFailure(.insufficientAccessRights, ADDiagnostic.insufficientAccess)
+                }
             }
-            if l == "primarygroupid",
-               values.contains(where: { SelfWriteRights.protectedRIDs.contains(UInt32(String(decoding: $0, as: UTF8.self)) ?? 0) }) {
-                throw LDAPFailure(.insufficientAccessRights, ADDiagnostic.insufficientAccess)
+            if l == "primarygroupid" {
+                for value in values where SelfWriteRights.protectedRIDs.contains(try Self.int32Value(value)) {
+                    throw LDAPFailure(.insufficientAccessRights, ADDiagnostic.insufficientAccess)
+                }
             }
         }
     }

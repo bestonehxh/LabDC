@@ -15,6 +15,8 @@ public enum StoreError: Error, CustomStringConvertible, Sendable, Equatable {
     case noSuchAttribute(String)
     /// Read-only, single-valued or malformed values (19).
     case constraintViolation(String)
+    /// A value that is not valid for the attribute's syntax, e.g. a 32-bit INTEGER out of range (21).
+    case invalidAttributeSyntax(String)
     /// Modifying the naming attribute through modify instead of rename (67).
     case notAllowedOnRDN(String)
     /// Deleting an object that has children (66).
@@ -44,6 +46,7 @@ public enum StoreError: Error, CustomStringConvertible, Sendable, Equatable {
         case .attributeOrValueExists: 20
         case .noSuchAttribute: 16
         case .constraintViolation, .upnExists, .passwordPolicy: 19
+        case .invalidAttributeSyntax: 21
         case .notAllowedOnRDN: 67
         case .notAllowedOnNonLeaf: 66
         case .objectClassViolation: 65
@@ -62,6 +65,7 @@ public enum StoreError: Error, CustomStringConvertible, Sendable, Equatable {
         case .attributeOrValueExists(let s): "attribute or value exists: \(s)"
         case .noSuchAttribute(let s): "no such attribute: \(s)"
         case .constraintViolation(let s): "constraint violation: \(s)"
+        case .invalidAttributeSyntax(let s): "invalid attribute syntax: \(s)"
         case .notAllowedOnRDN(let s): "not allowed on RDN: \(s)"
         case .notAllowedOnNonLeaf(let s): "not allowed on non-leaf: \(s)"
         case .objectClassViolation(let s): "object class violation: \(s)"

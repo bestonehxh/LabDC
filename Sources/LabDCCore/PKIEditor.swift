@@ -242,7 +242,7 @@ public final class PKIEditor {
     /// `ca use`: makes `name` issue from now on, syncs the Configuration NC, then asks the running
     /// server to reissue the DC certificate (`reissueDCCertificate`).
     public func useCA(name: String) async throws {
-        try await pki.useCA(name: name)
+        try await service.useCA(name: name)
         let ca = try await pki.currentAuthority()
         log?.event("PKI", "current CA is now \(ca.name) (\(ca.certificate.subject)) (app)")
         await publishToDirectory()

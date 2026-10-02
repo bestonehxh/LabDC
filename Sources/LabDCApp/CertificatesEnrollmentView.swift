@@ -185,11 +185,8 @@ struct NewChallengeSheet: View {
     @State private var working = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if let made = challenges.revealed {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Challenge \(made.row.id) created")
-                        .font(Theme.emphasis).foregroundStyle(Theme.ink)
+        if let made = challenges.revealed {
+            QuietSheet(title: "Challenge \(made.row.id) created", width: 480) {
                     HStack {
                         Text(made.secret)
                             .font(.system(size: 22, design: .monospaced))
@@ -206,58 +203,47 @@ struct NewChallengeSheet: View {
                     if let hint = challenges.usageHint {
                         QuietNote(hint)
                     }
-                    HStack {
-                        Spacer()
-                        Button("Done") {
-                            challenges.dismiss()
-                            dismiss()
-                        }
-                        .buttonStyle(.quietPrimary)
-                        .keyboardShortcut(.defaultAction)
-                    }
+            } actions: {
+                Button("Done") {
+                    challenges.dismiss()
+                    dismiss()
                 }
-                .padding(20)
-            } else {
-                Form {
-                    Section("New challenge") {
-                        TextField("Device name", text: $challenges.device, prompt: Text("Any device"))
-                            .accessibilityHint("The switch or AP host name; empty for any device")
-                        Picker("Template", selection: $challenges.template) {
+                .buttonStyle(.quietPrimary)
+                .keyboardShortcut(.defaultAction)
+            }
+        } else {
+            QuietSheet(title: "New challenge", width: 480) {
+                SheetField("Device name", note: "The switch or AP host name; empty for any device.") {
+                    QuietTextField("Device name", text: $challenges.device, prompt: "Any device").textFieldStyle(.quiet)
+                        .accessibilityHint("The switch or AP host name; empty for any device")
+                }
+                HStack(alignment: .top, spacing: 24) {
+                    SheetField("Template") {
+                        SheetPicker("Template", selection: $challenges.template) {
                             ForEach(editor.challengeTemplates, id: \.self) { Text($0).tag($0) }
                         }
-                        Picker("Valid for", selection: $challenges.ttl) {
+                    }
+                    .fixedSize()
+                    SheetField("Valid for") {
+                        SheetPicker("Valid for", selection: $challenges.ttl) {
                             ForEach(ChallengeRevealModel.TTL.allCases) { Text($0.title).tag($0) }
                         }
-                        Toggle("Reusable (for ClearPass Onboard and similar)", isOn: $challenges.reusable)
                     }
                 }
-                .formStyle(.grouped)
-                .toggleStyle(.quiet)
-                .scrollContentBackground(.hidden)
-                HStack(spacing: 24) {
-                    Spacer()
-                    Button("Cancel", role: .cancel) { dismiss() }
-                        .buttonStyle(.quietLink)
-                        .keyboardShortcut(.cancelAction)
-                    Button("Create") {
-                        working = true
-                        Task {
-                            await model.perform("New challenge") { try await challenges.create(using: $0) }
-                            working = false
-                        }
+                SheetToggle("Reusable (for ClearPass Onboard and similar)", isOn: $challenges.reusable)
+            } actions: {
+                SheetButtons("Create", disabled: working || editor.challengeTemplates.isEmpty) {
+                    working = true
+                    Task {
+                        await model.perform("New challenge") { try await challenges.create(using: $0) }
+                        working = false
                     }
-                    .buttonStyle(.quietPrimary)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(working || editor.challengeTemplates.isEmpty)
                 }
-                .padding([.horizontal, .bottom], 20)
             }
-        }
-        .frame(width: 460)
-        .background(Theme.background)
-        .onAppear {
-            if !editor.challengeTemplates.contains(challenges.template), let first = editor.challengeTemplates.first {
-                challenges.template = first
+            .onAppear {
+                if !editor.challengeTemplates.contains(challenges.template), let first = editor.challengeTemplates.first {
+                    challenges.template = first
+                }
             }
         }
     }

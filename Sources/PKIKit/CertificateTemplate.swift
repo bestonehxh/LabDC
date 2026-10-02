@@ -242,8 +242,9 @@ public struct CertificateTemplate: Sendable, Equatable {
                                 issuingCA: LabPKI.suiteBCAName),
             // RSA-only devices (1 Oct 2026): RSA-2048+ client certificates from the RSA
             // compatibility root, for EAP-TLS on printers, phones and old supplicants. Enrolled
-            // over SCEP / EST (a challenge is the authorisation, the names come from the CSR) or
-            // signed by an administrator; switched on with "Allow RSA-only devices".
+            // over SCEP (a challenge is the authorisation, the names come from the CSR) or signed
+            // by an administrator; EST only from a device that does ECDSA TLS (its listener has
+            // the DC's EC certificate only); switched on with "Allow RSA-only devices".
             CertificateTemplate(name: "Computer-RSA", displayName: "Computer (RSA-only devices)", oid: oid("Computer-RSA"),
                                 validityDays: 365, renewalDays: 42, keyUsage: signAndEncrypt, ekus: [PKIOID.clientAuth],
                                 sanPolicy: .fromRequest, enrolAllowedGroupSIDs: [sid(512), sid(519)],

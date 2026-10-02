@@ -8,6 +8,16 @@ extension DirectoryStore {
     /// Sessions whose last word (Stop, or the last Start/Interim) is older than this are purged.
     public static let radiusSessionRetention: TimeInterval = 30 * 86400
 
+    /// An open session (no Stop) counts as active only while its last Start/Interim-Update is
+    /// at most this old (review fix, 2 Oct 2026). A lost Stop would otherwise keep a departed
+    /// device "active" for the whole 30-day retention, and automatic CoA would keep aiming at
+    /// it. 24 hours, fixed: LabDC does not learn the NAS's Acct-Interim-Interval (it is the NAS's
+    /// own setting unless a policy sends one), and 24 h is many times any interval in use
+    /// (typically 5 to 60 minutes), so a live session that sends Interim-Updates never goes
+    /// stale. A NAS that sends no Interim-Updates at all has its sessions go stale after a day;
+    /// they still show (as "no recent updates") and can still be acted on by hand.
+    public static let radiusSessionStaleAfter: TimeInterval = 24 * 3600
+
     static func createRadiusSessionSchema(_ db: SQLiteConnection) throws {
         try db.exec("""
             CREATE TABLE IF NOT EXISTS radius_sessions(
@@ -84,7 +94,17 @@ extension DirectoryStore {
         public var outputPackets: UInt64
         public var terminateCause: UInt32?
 
-        public var active: Bool { stoppedAt == nil }
+        /// No Stop recorded (it may still be stale: see `isActive(at:)`).
+        public var open: Bool { stoppedAt == nil }
+
+        /// Open and updated within `radiusSessionStaleAfter` of `now`.
+        public func isActive(at now: Date) -> Bool {
+            open && now.timeIntervalSince(updatedAt) <= DirectoryStore.radiusSessionStaleAfter
+        }
+
+        /// Open, but no Start/Interim-Update within `radiusSessionStaleAfter` (the Stop was
+        /// probably lost).
+        public func isStale(at now: Date) -> Bool { open && !isActive(at: now) }
 
         /// The session as a CoA/Disconnect names it.
         public var coaSession: CoASession {
@@ -113,7 +133,7 @@ extension DirectoryStore {
     }
 
     /// Stores one Accounting-Request. Start opens (or reopens — a NAS that reuses an
-    /// Acct-Session-Id after a reboot) the session; Interim-Update refreshes it (creating it when
+    /// Acct-Session-Id after a reboot — when it was sent after the Stop) the session; Interim-Update refreshes it (creating it when
     /// the Start was lost); Stop closes it with the counters and Terminate-Cause.
     /// Accounting-On/Off closes every open session of that NAS (Terminate-Cause NAS-Reboot).
     /// Returns the session written (nil for On/Off) and how many sessions On/Off closed.
@@ -133,9 +153,19 @@ extension DirectoryStore {
             let existing = try db.query("SELECT \(Self.sessionColumns) FROM radius_sessions WHERE nas_source=? AND session_id=?",
                                         [.text(record.nasSource), .text(record.sessionId)]).first.map(Self.session)
             // A late Interim-Update (or a repeated Stop) never reopens a session that ended.
-            if let existing, !existing.active, record.status != .start { return (existing, 0) }
-            // A Start for a session that already ended is a new session under a reused id.
-            let fresh = existing == nil || (record.status == .start && existing?.active == false)
+            if let existing, !existing.open, record.status != .start { return (existing, 0) }
+            // A Start sent no later than the Stop of the ended session is that session's own
+            // Start arriving late (reordered, or retransmitted after the Stop): ignoring it keeps
+            // the session ended instead of reopening it as a ghost (review fix, 2 Oct 2026).
+            if let existing, let stopped = existing.stoppedAt, record.status == .start,
+               sent < Int64(stopped.timeIntervalSince1970) || sent == Int64(existing.startedAt.timeIntervalSince1970) {
+                // Strictly earlier: a quick reconnect reusing the id in the Stop's own second
+                // (whole-second resolution) is a new session, not a late Start — unless it was
+                // sent when the ended session started (its own Start, for a sub-second session).
+                return (existing, 0)
+            }
+            // A Start sent after the Stop is a new session under a reused id.
+            let fresh = existing == nil || (record.status == .start && existing?.open == false)
             let startedAt: Int64
             if fresh {
                 startedAt = record.status == .start ? sent : sent - Int64(record.sessionTime ?? 0)
@@ -182,21 +212,28 @@ extension DirectoryStore {
         }
     }
 
-    /// Newest first. `activeOnly`: sessions without a Stop.
-    public func radiusSessions(activeOnly: Bool, limit: Int = 500) throws -> [RadiusSession] {
-        try db.query("SELECT \(Self.sessionColumns) FROM radius_sessions " + (activeOnly ? "WHERE stopped_at IS NULL " : "")
-                     + "ORDER BY updated_at DESC, id DESC LIMIT ?", [.int(Int64(max(1, limit)))]).map(Self.session)
+    /// Newest first. `activeOnly`: sessions active at `now` — no Stop, and updated within
+    /// `radiusSessionStaleAfter`; otherwise every kept session (stale and ended ones too).
+    public func radiusSessions(activeOnly: Bool, now: Date, limit: Int = 500) throws -> [RadiusSession] {
+        let cutoff = Int64(now.addingTimeInterval(-Self.radiusSessionStaleAfter).timeIntervalSince1970)
+        return try db.query("SELECT \(Self.sessionColumns) FROM radius_sessions "
+                            + (activeOnly ? "WHERE stopped_at IS NULL AND updated_at >= ? " : "")
+                            + "ORDER BY updated_at DESC, id DESC LIMIT ?",
+                            (activeOnly ? [.int(cutoff)] : []) + [.int(Int64(max(1, limit)))]).map(Self.session)
     }
 
     public func radiusSession(id: Int64) throws -> RadiusSession? {
         try db.query("SELECT \(Self.sessionColumns) FROM radius_sessions WHERE id=?", [.int(id)]).first.map(Self.session)
     }
 
-    /// Open sessions of `mac` (any spelling), newest first.
-    public func activeRadiusSessions(mac: String) throws -> [RadiusSession] {
+    /// Sessions of `mac` (any spelling) active at `now` (no Stop, updated within
+    /// `radiusSessionStaleAfter`), newest first. Stale ones are left out: automatic CoA and the
+    /// DHCP profile guard must not act on a device that left without a Stop.
+    public func activeRadiusSessions(mac: String, now: Date) throws -> [RadiusSession] {
         guard let key = RADIUSMAC.normalize(mac) else { return [] }
+        let cutoff = Int64(now.addingTimeInterval(-Self.radiusSessionStaleAfter).timeIntervalSince1970)
         return try db.query("SELECT \(Self.sessionColumns) FROM radius_sessions WHERE mac=? AND stopped_at IS NULL " +
-                            "ORDER BY updated_at DESC", [.text(key)]).map(Self.session)
+                            "AND updated_at >= ? ORDER BY updated_at DESC", [.text(key), .int(cutoff)]).map(Self.session)
     }
 
     /// Drops sessions whose last record is older than `cutoff`; returns how many.

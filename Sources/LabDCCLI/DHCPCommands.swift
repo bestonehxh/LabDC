@@ -187,12 +187,14 @@ public enum DHCPCommands {
             out("added scope \(name) (\(scope.subnet), \(scope.ranges.map(\.text).joined(separator: ", ")))")
         case .scopeRemove(let name):
             let s = try await scope(named: name, store)
-            try await store.deleteDHCPScope(id: s.id)
+            try await DHCPOffline.deleteScope(id: s.id, store: store)
             out("removed scope \(s.name) with its reservations and leases")
         case let .scopeEnable(name, on):
             var s = try await scope(named: name, store)
             s.enabled = on
-            try await store.updateDHCPScope(s)
+            let notes: [String]
+            do { notes = try await store.updateDHCPScope(s) } catch { throw CLIError.failure("\(error)") }
+            notes.forEach(out)
             out("scope \(s.name) \(on ? "enabled" : "disabled")")
         case .reservations(let scopeName):
             let scopes = try await store.dhcpScopes()
@@ -220,13 +222,11 @@ public enum DHCPCommands {
             try await leases(store, search: search, format: format, all: all, watch: watch, out: out)
         case .leaseRelease(let address):
             let family: DHCPFamily = IPv6Address(address) != nil ? .v6 : .v4
-            guard var l = try await store.dhcpLease(family: family, address: address) else { throw CLIError.failure("no lease for \(address)") }
-            l.state = .released
-            l.expires = Date(); l.updated = Date()
-            try await store.saveDHCPLeases([l])
+            guard let lease = try await store.dhcpLease(family: family, address: address) else { throw CLIError.failure("no lease for \(address)") }
+            let l = try await DHCPOffline.release(lease, store: store)
             try await store.addDHCPEvents([DHCPEvent(date: Date(), family: family, address: address, mac: l.mac, clientKey: l.clientKey,
                                                      kind: "RELEASE", detail: "released with labdc dhcp")])
-            out("released \(address) (\(l.whoText)); DNS records go when the server next sees the lease end")
+            out("released \(address) (\(l.whoText))" + (lease.dnsName != nil || lease.dnsPTR != nil ? "; its DNS records are removed" : ""))
         case .history(let key):
             let events: [DHCPEvent]
             if DirectoryStore.canonicalMAC(key) != nil, IPv4Address(key) == nil, IPv6Address(key) == nil {
@@ -324,8 +324,12 @@ public enum DHCPCommands {
             + "use `labdc dhcp direct <interface>` (it probes for another server first)"
     }
 
-    static func list(_ text: String?) -> [String] {
-        (text ?? "").split(whereSeparator: { $0 == "," || $0 == " " }).map(String.init).filter { !$0.isEmpty }
+    /// Comma-separated (spaces around entries are fine: `a - b` stays one range).
+    static func list(_ text: String?) -> [String] { DHCPInput.list(text) }
+
+    /// A whole-number flag; anything else is a usage error rather than a silent default.
+    static func number(_ f: [String: String], _ key: String, in range: ClosedRange<Int>) throws -> Int? {
+        do { return try DHCPInput.integer(f[key], field: key, in: range) } catch { throw CLIError.usage("\(error)") }
     }
 
     /// `8h`, `30m`, `2d`, `3600`.
@@ -353,28 +357,27 @@ public enum DHCPCommands {
     static func scopeFrom(name: String, _ f: [String: String]) throws -> DHCPScope {
         let subnet = f["--subnet"] ?? ""
         let v6 = IPv6Subnet(subnet) != nil
-        let ranges = try list(f["--range"]).map { t -> DHCPRange in
-            guard let r = DHCPRange(text: t) else { throw CLIError.usage("bad range \(t)") }
-            return r
-        }
-        let exclusions = list(f["--exclude"]).compactMap { DHCPRange(text: $0) }
-        let routes = try list(f["--route"]).map { t -> DHCPOptionBuilder.StaticRoute in
-            let p = t.split(separator: "@").map(String.init)
-            guard p.count == 2 else { throw CLIError.usage("--route takes <cidr>@<gateway>") }
-            return .init(destination: p[0], gateway: p[1])
-        }
-        var s = DHCPScope(name: name, family: v6 ? .v6 : .v4, enabled: f["--disabled"] == nil, vlan: f["--vlan"].flatMap { Int($0) },
+        let family: DHCPFamily = v6 ? .v6 : .v4
+        let ranges: [DHCPRange], exclusions: [DHCPRange], routes: [DHCPOptionBuilder.StaticRoute]
+        do {
+            ranges = try DHCPInput.ranges(f["--range"], family: family, field: "--range")
+            exclusions = try DHCPInput.ranges(f["--exclude"], family: family, field: "--exclude")
+            routes = try DHCPInput.routes(f["--route"], field: "--route")
+        } catch { throw CLIError.usage("\(error)") }
+        let vlan = try number(f, "--vlan", in: 1...4094)
+        let mtu = try number(f, "--mtu", in: 68...65535)
+        let offerDelay = try number(f, "--offer-delay", in: 0...5000)
+        var s = DHCPScope(name: name, family: family, enabled: f["--disabled"] == nil, vlan: vlan,
                           subnet: subnet, ranges: ranges, exclusions: exclusions, sharedNetwork: f["--shared"],
                           routers: list(f["--router"]), leaseSeconds: try f["--lease"].map(seconds),
                           preferredSeconds: try f["--preferred"].map(seconds) ?? 0, dnsServers: list(f["--dns"]),
-                          domainName: f["--domain"], ntpServers: list(f["--ntp"]), searchList: list(f["--search"]),
-                          mtu: f["--mtu"].flatMap { Int($0) }, staticRoutes: routes, capwap: list(f["--capwap"]),
+                          domainName: f["--domain"], ntpServers: list(f["--ntp"]), searchList: DHCPInput.domains(f["--search"]),
+                          mtu: mtu, staticRoutes: routes, capwap: list(f["--capwap"]),
                           tftpServer: f["--tftp"], bootfile: f["--bootfile"], tftpServers150: list(f["--tftp150"]),
                           option43: try f["--option43"].map(option43),
                           authoritative: f["--authoritative"] != nil, knownClientsOnly: f["--known-only"] != nil,
-                          offerDelayMs: f["--offer-delay"].flatMap { Int($0) } ?? 0, pingBeforeOffer: f["--ping"] != nil,
+                          offerDelayMs: offerDelay ?? 0, pingBeforeOffer: f["--ping"] != nil,
                           dnsUpdates: f["--no-dns-update"] == nil, rapidCommit: f["--no-rapid-commit"] == nil)
-        if let vlan = f["--vlan"], Int(vlan) == nil { throw CLIError.usage("--vlan \(vlan) is not a number") }
         s.id = 0
         do { try s.validate() } catch { throw CLIError.usage("\(error)") }
         return s
@@ -404,9 +407,9 @@ public enum DHCPCommands {
         }
         if let v = f["--quarantine"] { s.declineQuarantineSeconds = try seconds(v) }
         if let v = f["--server-address"] { s.serverAddress = v == "auto" ? nil : v }
-        if let v = f["--cap-relay"] { s.maxLeasesPerRelay = Int(v) ?? -1 }
-        if let v = f["--cap-circuit"] { s.maxLeasesPerCircuit = Int(v) ?? -1 }
-        if let v = f["--churn"] { s.clientIDChurnLimit = Int(v) ?? -1 }
+        if let v = try number(f, "--cap-relay", in: 0...1_000_000) { s.maxLeasesPerRelay = v }
+        if let v = try number(f, "--cap-circuit", in: 0...1_000_000) { s.maxLeasesPerCircuit = v }
+        if let v = try number(f, "--churn", in: 0...1_000_000) { s.clientIDChurnLimit = v }
     }
 
     static func timestamp(_ d: Date) -> String {

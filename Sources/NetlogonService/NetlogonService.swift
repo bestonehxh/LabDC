@@ -99,8 +99,9 @@ public final class NetlogonService: RPCInterface, @unchecked Sendable {
     /// Shared with SAMR's password-change path (`DomainControllerServices`) so both count towards
     /// one lockout per account.
     public let badPasswords = BadPasswordTracker()
-    /// Failed `NetrServerAuthenticate3` credential checks per computer account (`acct:`) and per
-    /// source address (`ip:`), throttled with the same thresholds as the logon lockout.
+    /// Failed `NetrServerAuthenticate3` credential checks per source address (`ip:`), throttled
+    /// with the same thresholds as the logon lockout. Never keyed by the (unauthenticated) account
+    /// name alone, which would let any caller lock a computer's secure channel out.
     let authenticateFailures = BadPasswordTracker()
 
     public init(store: DirectoryStore, state: NetlogonStateStore, dcInfo: NetlogonDCInfoProvider,

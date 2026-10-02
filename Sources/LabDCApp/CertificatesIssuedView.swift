@@ -13,7 +13,7 @@ struct CertificatesIssuedView: View {
         let rows = filter.rows(editor.issued)
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 28) {
-                TextField("Search", text: $filter.search, prompt: Text("Serial, subject, name or requester"))
+                QuietTextField("Search", text: $filter.search, prompt: "Serial, subject, name or requester")
                     .textFieldStyle(.quiet)
                     .frame(maxWidth: 260)
                     .accessibilityLabel("Search issued certificates")
@@ -122,38 +122,24 @@ struct RevokeSheet: View {
     static let reasons = RevocationReason.allCases.filter { $0 != .removeFromCRL && $0 != .aaCompromise }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Revoke \(row.subject)?").font(Theme.emphasis).foregroundStyle(Theme.ink)
-            Text("Serial \(row.serial.uppercased()), template \(row.template), CA \(row.caName). The certificate goes into the CRL at once; devices that check the CRL refuse it from their next download.")
-                .font(Theme.detail).foregroundStyle(Theme.muted)
-                .fixedSize(horizontal: false, vertical: true)
-            Picker("Reason", selection: $reason) {
-                ForEach(Self.reasons, id: \.self) { Text(PKIText.reason($0)).tag($0) }
-            }
-            if reason == .certificateHold {
-                Text("A hold can later be made final with another reason; it cannot be lifted.")
-                    .font(Theme.caption).foregroundStyle(Theme.faint)
-            }
-            HStack(spacing: 24) {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }
-                    .buttonStyle(.quietLink)
-                    .keyboardShortcut(.cancelAction)
-                Button("Revoke", role: .destructive) {
-                    working = true
-                    Task {
-                        if await onRevoke(reason) { dismiss() }
-                        working = false
-                    }
+        QuietSheet(title: "Revoke \(row.subject)?",
+                   subtitle: "Serial \(row.serial.uppercased()), template \(row.template), CA \(row.caName). The certificate goes into the CRL at once; devices that check the CRL refuse it from their next download.",
+                   width: 480) {
+            SheetField("Reason",
+                       note: reason == .certificateHold ? "A hold can later be made final with another reason; it cannot be lifted." : nil) {
+                SheetPicker("Reason", selection: $reason) {
+                    ForEach(Self.reasons, id: \.self) { Text(PKIText.reason($0)).tag($0) }
                 }
-                .buttonStyle(.quietDestructive)
-                .keyboardShortcut(.defaultAction)
-                .disabled(working)
+            }
+        } actions: {
+            SheetButtons("Revoke", role: .destructive, disabled: working) {
+                working = true
+                Task {
+                    if await onRevoke(reason) { dismiss() }
+                    working = false
+                }
             }
         }
-        .padding(20)
-        .frame(width: 440)
-        .background(Theme.background)
     }
 }
 

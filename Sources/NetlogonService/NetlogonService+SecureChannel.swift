@@ -57,11 +57,13 @@ extension NetlogonService {
         }
 
         // Throttle (security audit, 1 Oct 2026): every failed credential check counts against the
-        // computer account and the source address; past `lockoutThreshold` failures within
-        // `lockoutWindow` both are refused for `lockoutDuration` — an online guess of the machine
-        // password (or a Zerologon-style credential search) cannot run unbounded.
+        // source address; past `lockoutThreshold` failures within `lockoutWindow` that address is
+        // refused for `lockoutDuration` — an online guess of the machine password (or a
+        // Zerologon-style credential search) cannot run unbounded. The account name is the
+        // unauthenticated caller's claim, so it is never a throttle key on its own: one address
+        // must not be able to lock a computer's secure channel out for every other caller.
         let now = clock()
-        let throttleKeys = ["acct:" + accountName, "ip:" + (NetlogonCallInfo.current?.address ?? "-")]
+        let throttleKeys = ["ip:" + (NetlogonCallInfo.current?.address ?? "-")]
         if let until = throttleKeys.lazy.compactMap({ self.authenticateFailures.lockedUntil($0, now: now) }).first {
             return fail(NLStatus.accessDenied, "too many failed Authenticate3 attempts; refused until "
                         + until.formatted(.dateTime.hour().minute()))

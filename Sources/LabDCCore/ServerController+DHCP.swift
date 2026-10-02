@@ -15,28 +15,39 @@ extension ServerController {
 
     public func dhcpScopes() async -> [DHCPScope] { (try? await store?.dhcpScopes()) ?? [] }
 
-    public func saveDHCPScope(_ scope: DHCPScope) async throws {
+    /// Returns notes on what the save changed by itself (server-set custom options saved by an
+    /// earlier build, dropped: `DirectoryStore.updateDHCPScope`); they are logged as well.
+    @discardableResult
+    public func saveDHCPScope(_ scope: DHCPScope) async throws -> [String] {
         let store = try dhcpStore()
+        var notes: [String] = []
         if scope.id == 0 {
             try await store.addDHCPScope(scope)
             serveLog.event("DHCP", "scope \(scope.name) (\(scope.subnet)\(scope.vlan.map { ", VLAN \($0)" } ?? "")) added (app)")
         } else {
-            try await store.updateDHCPScope(scope)
+            notes = try await store.updateDHCPScope(scope)
+            for note in notes { serveLog.event("DHCP", note + " (app)") }
             serveLog.event("DHCP", "scope \(scope.name) (\(scope.subnet)) updated (app)")
         }
         await dhcpChanged()
+        return notes
     }
 
     public func deleteDHCPScope(_ scope: DHCPScope) async throws {
         let store = try dhcpStore()
-        // Leases of the scope lose their DNS records first.
+        // Leases of the scope lose their DNS records first; the running server forgets them
+        // (its sweeper would otherwise write them back under the dead scope id).
         if let server = await runtime?.dhcp {
             for l in await server.leases() where l.scopeID == scope.id && l.state == .active {
                 try? await server.release(family: l.family, address: l.address)
             }
             await server.flush()
+            try await DHCPOffline.deleteScope(id: scope.id, store: store)
+            await server.scopeDeleted(id: scope.id)
+            await server.flush()
+        } else {
+            try await DHCPOffline.deleteScope(id: scope.id, store: store)
         }
-        try await store.deleteDHCPScope(id: scope.id)
         serveLog.event("DHCP", "scope \(scope.name) (\(scope.subnet)) deleted with its reservations and leases (app)")
         await dhcpChanged()
     }
@@ -45,11 +56,16 @@ extension ServerController {
 
     public func dhcpReservations() async -> [DHCPReservation] { (try? await store?.dhcpReservations()) ?? [] }
 
-    public func saveDHCPReservation(_ r: DHCPReservation) async throws {
+    /// Returns notes as `saveDHCPScope`.
+    @discardableResult
+    public func saveDHCPReservation(_ r: DHCPReservation) async throws -> [String] {
         let store = try dhcpStore()
-        if r.id == 0 { try await store.addDHCPReservation(r) } else { try await store.updateDHCPReservation(r) }
+        var notes: [String] = []
+        if r.id == 0 { try await store.addDHCPReservation(r) } else { notes = try await store.updateDHCPReservation(r) }
+        for note in notes { serveLog.event("DHCP", note + " (app)") }
         serveLog.event("DHCP", "reservation \(r.name) → \(r.address) (\(r.identifierText)) saved (app)")
         await dhcpChanged()
+        return notes
     }
 
     public func deleteDHCPReservation(_ r: DHCPReservation) async throws {
@@ -70,12 +86,10 @@ extension ServerController {
         if let server = await runtime?.dhcp {
             try await server.release(family: lease.family, address: lease.address)
         } else {
+            // Not running: the lease's DNS records go now (no sweeper would remove them later).
             let store = try dhcpStore()
-            var l = lease
-            l.state = .released
-            l.expires = Date()
-            l.updated = Date()
-            try await store.saveDHCPLeases([l])
+            let current = try await store.dhcpLease(family: lease.family, address: lease.address) ?? lease
+            try await DHCPOffline.release(current, store: store)
         }
         await dhcpChanged()
     }

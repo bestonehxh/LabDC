@@ -49,6 +49,7 @@ private struct PersonInspector: View {
     @Binding var confirmDelete: Bool
     @State private var showMore = false
     @State private var showAdvanced = false
+    @Environment(\.smokeExpandInspector) private var expand
 
     var body: some View {
         let model = app.usersModel
@@ -167,6 +168,7 @@ private struct PersonInspector: View {
                 .help(person.isCritical ? "Built-in accounts cannot be deleted" : "Delete (⌘⌫)")
                 .padding(.top, 32)
         }
+        .onAppear { if expand { showMore = true; showAdvanced = true } }
     }
 
     /// `Last signed in 26 Sep 14:24` / `Never signed in` (the Folder row below says where).
@@ -678,7 +680,7 @@ struct CommitField: View {
     private var row: some View {
         InspectorRow(label: title, first: first) {
             if editing {
-                TextField(title, text: $text)
+                QuietTextField(title, text: $text, prompt: title)
                     .textFieldStyle(.quiet)
                     .focused($focused)
                     .onSubmit(finish)
@@ -723,7 +725,7 @@ struct CommitField: View {
 }
 
 /// One choice in a picker popover.
-private struct PickerItem: Identifiable {
+struct PickerItem: Identifiable {
     let id: ObjectID
     let name: String
     var detail = ""
@@ -733,7 +735,7 @@ private struct PickerItem: Identifiable {
 }
 
 /// A searchable list of words in a popover (groups, members, folders).
-private struct PickerList: View {
+struct PickerList: View {
     let title: String
     var query: Binding<String>?
     let items: [PickerItem]
@@ -744,7 +746,7 @@ private struct PickerList: View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title).font(Theme.emphasis).foregroundStyle(Theme.ink).lineLimit(1)
             if let query {
-                TextField("Search", text: query).textFieldStyle(.quiet)
+                QuietTextField("Search", text: query, prompt: "Search").textFieldStyle(.quiet)
             }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
@@ -756,7 +758,7 @@ private struct PickerList: View {
                                 if index > 0 { Rectangle().fill(Theme.line).frame(height: 1) }
                                 HStack(alignment: .firstTextBaseline, spacing: 12) {
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(item.name).font(Theme.body).foregroundStyle(Theme.ink).lineLimit(1)
+                                        Text(item.name).font(Theme.body).foregroundStyle(Theme.ink).lineLimit(1).truncationMode(.middle).help(item.name)
                                         if !item.detail.isEmpty {
                                             Text(item.detail).font(Theme.caption).foregroundStyle(Theme.muted).lineLimit(1)
                                         }
@@ -779,7 +781,7 @@ private struct PickerList: View {
             if items.isEmpty { QuietNote(empty) }
         }
         .padding(16)
-        .frame(width: 300)
+        .frame(width: 360)
         .background(Theme.background)
     }
 }
@@ -814,57 +816,53 @@ struct PasswordSheet: View {
         let model = app.usersModel
         let person = model.snapshot.person(personID)
         let strength = PasswordStrength.evaluate(password, account: person?.username ?? "")
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Set password for \(person?.displayName ?? "user")").font(Theme.emphasis).foregroundStyle(Theme.ink)
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .firstTextBaseline, spacing: 16) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Password").font(Theme.caption).foregroundStyle(Theme.muted)
-                        TextField("Password", text: $password)
-                            .font(.body.monospaced())
-                            .textFieldStyle(.quiet)
-                            .accessibilityLabel("New password")
-                    }
-                    Button("Suggest") { password = UsersModel.suggestPassword() }.buttonStyle(.quietLink)
-                        .help("Generate a strong password")
-                }
-                PasswordHint(strength: strength)
-                Toggle("Must change password at next sign-in", isOn: $mustChange)
-                    .toggleStyle(.quiet)
-                    .disabled(person?.isCritical == true && person?.username.caseInsensitiveCompare("Administrator") == .orderedSame)
-                if mustChange, person?.passwordNeverExpires == true {
-                    Text("This also turns off Password never expires.").font(Theme.detail).foregroundStyle(Theme.muted)
-                }
+        QuietSheet(title: "Set the password of \(person?.displayName ?? "user")", width: 460, failure: failure) {
+            PasswordField(password: $password, label: "New password")
+            PasswordHint(strength: strength)
+            SheetToggle("Must change password at next sign-in", isOn: $mustChange)
+                .disabled(person?.isCritical == true && person?.username.caseInsensitiveCompare("Administrator") == .orderedSame)
+            if mustChange, person?.passwordNeverExpires == true {
+                QuietNote("This also turns off Password never expires.")
             }
-            if let failure { Text(failure).foregroundStyle(Theme.attention).font(Theme.detail) }
-            HStack {
-                CopyButton(value: password, label: "Copy")
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button("Set password") {
-                    busy = true
-                    let pw = password, must = mustChange
-                    Task {
-                        let before = model.error
-                        let ok = await model.perform { try await $0.setPassword(personID, pw, mustChange: must) }
-                        busy = false
-                        if ok { dismiss() } else { failure = model.error; model.error = before }
-                    }
+        } actions: {
+            SheetButtons("Set password", disabled: busy || !strength.isAcceptable) {
+                busy = true
+                let pw = password, must = mustChange
+                Task {
+                    let before = model.error
+                    let ok = await model.perform { try await $0.setPassword(personID, pw, mustChange: must) }
+                    busy = false
+                    if ok { dismiss() } else { failure = model.error; model.error = before }
                 }
-                .buttonStyle(.quietPrimary)
-                .keyboardShortcut(.defaultAction)
-                .disabled(busy || !strength.isAcceptable)
             }
         }
-        .padding(24)
-        .frame(width: 440)
-        .background(Theme.background)
     }
 }
 
 /// "Must change at next sign-in" and "Password never expires" exclude each other, as in ADUC.
 enum PasswordOptions {
     static let note = "A password that never expires is never asked to change, so ticking one clears the other."
+}
+
+/// A password typed in the clear (it is handed over, not kept), with Suggest and Copy beside it.
+struct PasswordField: View {
+    @Binding var password: String
+    var label = "Password"
+
+    var body: some View {
+        SheetField(label) {
+            HStack(alignment: .firstTextBaseline, spacing: 16) {
+                QuietTextField(label, text: $password, prompt: label)
+                    .textFieldStyle(.quietMonospaced)
+                    .autocorrectionDisabled()
+                    .accessibilityLabel(label)
+                Button("Suggest") { password = UsersModel.suggestPassword() }
+                    .buttonStyle(.quietLink)
+                    .help("Generate a strong password")
+                CopyButton(value: password)
+            }
+        }
+    }
 }
 
 /// UI-1's 3-segment meter with the one-sentence hint under it.
@@ -898,54 +896,34 @@ private struct NewUserSheet: View {
     var body: some View {
         let model = app.usersModel
         let strength = PasswordStrength.evaluate(password, account: username)
-        VStack(alignment: .leading, spacing: 14) {
-            Text("New User").font(Theme.emphasis).foregroundStyle(Theme.ink)
-            VStack(alignment: .leading, spacing: 14) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Display name").font(Theme.caption).foregroundStyle(Theme.muted)
-                    TextField("Display name", text: $displayName)
-                        .textFieldStyle(.quiet)
-                        .onChange(of: displayName) { _, v in if !usernameEdited { username = UsersModel.suggestUsername(v) } }
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Username").font(Theme.caption).foregroundStyle(Theme.muted)
-                    TextField("Username", text: Binding(get: { username }, set: { username = $0; usernameEdited = true }))
-                        .textFieldStyle(.quiet)
-                }
-                HStack(alignment: .firstTextBaseline, spacing: 16) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Password").font(Theme.caption).foregroundStyle(Theme.muted)
-                        TextField("Password", text: $password).font(.body.monospaced())
-                            .textFieldStyle(.quiet)
-                            .accessibilityLabel("Password")
-                    }
-                    Button("Suggest") { password = UsersModel.suggestPassword() }.buttonStyle(.quietLink)
-                }
-                PasswordHint(strength: strength)
-                Picker("Folder", selection: $folderID) {
+        QuietSheet(title: "New person", width: 460, failure: failure) {
+            SheetField("Display name") {
+                QuietTextField("Display name", text: $displayName, prompt: "Alice Anderson")
+                    .textFieldStyle(.quiet)
+                    .onChange(of: displayName) { _, v in if !usernameEdited { username = UsersModel.suggestUsername(v) } }
+            }
+            SheetField("Username",
+                       note: "Signs in as \(username.isEmpty ? "username" : username)@\(model.snapshot.dnsDomain) or \(app.controller.status.netbiosDomain ?? "DOMAIN")\\\(username.isEmpty ? "username" : username).") {
+                QuietTextField("Username", text: Binding(get: { username }, set: { username = $0; usernameEdited = true }), prompt: "alice")
+                    .textFieldStyle(.quiet)
+                    .autocorrectionDisabled()
+            }
+            PasswordField(password: $password)
+            PasswordHint(strength: strength)
+            SheetField("Folder") {
+                SheetPicker("Folder", selection: $folderID) {
                     Text("Users (default)").tag(ObjectID(-1))
                     ForEach(model.snapshot.folderList.filter { $0.folder.kind == .organizationalUnit || ($0.folder.kind == .container && $0.folder.name != "Users") }, id: \.folder.id) {
                         Text($0.folder.path).tag($0.folder.id)
                     }
                 }
-                .labelsHidden()
-                Toggle("Must change password at next sign-in", isOn: $mustChange)
-                    .toggleStyle(.quiet)
-                    .onChange(of: mustChange) { _, on in if on { neverExpires = false } }
-                Toggle("Password never expires", isOn: $neverExpires)
-                    .toggleStyle(.quiet)
-                    .onChange(of: neverExpires) { _, on in if on { mustChange = false } }
-                Text(PasswordOptions.note).font(Theme.detail).foregroundStyle(Theme.muted)
             }
-            Text("Signs in as \(username.isEmpty ? "username" : username)@\(model.snapshot.dnsDomain) or \(app.controller.status.netbiosDomain ?? "DOMAIN")\\\(username.isEmpty ? "username" : username).")
-                .font(Theme.detail).foregroundStyle(Theme.muted)
-            if let failure { Text(failure).foregroundStyle(Theme.attention).font(Theme.detail) }
-            if !username.isEmpty, !strength.isAcceptable {
-                Text(strength.hint).foregroundStyle(Theme.attention).font(Theme.detail)
-            }
-            HStack {
-                CopyButton(value: password, label: "Copy Password")
-                Spacer()
+            SheetToggle("Must change password at next sign-in", isOn: $mustChange)
+                .onChange(of: mustChange) { _, on in if on { neverExpires = false } }
+            SheetToggle("Password never expires", isOn: $neverExpires)
+                .onChange(of: neverExpires) { _, on in if on { mustChange = false } }
+            QuietNote(PasswordOptions.note)
+        } actions: {
                 Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
                 Button("Create") {
                     busy = true
@@ -968,11 +946,7 @@ private struct NewUserSheet: View {
                 .buttonStyle(.quietPrimary)
                 .keyboardShortcut(.defaultAction)
                 .disabled(busy || username.isEmpty || !strength.isAcceptable)
-            }
         }
-        .padding(24)
-        .frame(width: 460)
-        .background(Theme.background)
         .onAppear { folderID = folder ?? -1 }
     }
 }
@@ -989,29 +963,19 @@ private struct NewGroupSheet: View {
 
     var body: some View {
         let model = app.usersModel
-        VStack(alignment: .leading, spacing: 14) {
-            Text("New Group").font(Theme.emphasis).foregroundStyle(Theme.ink)
-            VStack(alignment: .leading, spacing: 14) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Name").font(Theme.caption).foregroundStyle(Theme.muted)
-                    TextField("Name", text: $name).textFieldStyle(.quiet)
-                }
-                HStack(alignment: .center, spacing: 16) {
-                    Text("Scope").font(Theme.caption).foregroundStyle(Theme.muted)
-                    Picker("Scope", selection: $scope) {
-                        ForEach(GroupScope.editable, id: \.self) { Text($0.title).tag($0) }
-                    }
-                    .labelsHidden()
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Description").font(Theme.caption).foregroundStyle(Theme.muted)
-                    TextField("Description", text: $description).textFieldStyle(.quiet)
+        QuietSheet(title: "New group", subtitle: "In \(model.snapshot.folder(folder)?.path ?? "Users")", width: 460, failure: failure) {
+            SheetField("Name") {
+                QuietTextField("Name", text: $name, prompt: "NetAdmins").textFieldStyle(.quiet)
+            }
+            SheetField("Scope") {
+                SheetPicker("Scope", selection: $scope) {
+                    ForEach(GroupScope.editable, id: \.self) { Text($0.title).tag($0) }
                 }
             }
-            Text("Folder: \(model.snapshot.folder(folder)?.path ?? "Users")").font(Theme.detail).foregroundStyle(Theme.muted)
-            if let failure { Text(failure).foregroundStyle(Theme.attention).font(Theme.detail) }
-            HStack {
-                Spacer()
+            SheetField("Description") {
+                QuietTextField("Description", text: $description, prompt: "Optional").textFieldStyle(.quiet)
+            }
+        } actions: {
                 Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
                 Button("Create") {
                     busy = true
@@ -1032,11 +996,7 @@ private struct NewGroupSheet: View {
                 .buttonStyle(.quietPrimary)
                 .keyboardShortcut(.defaultAction)
                 .disabled(busy || name.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
         }
-        .padding(24)
-        .frame(width: 400)
-        .background(Theme.background)
     }
 }
 
@@ -1050,32 +1010,29 @@ private struct FolderNameSheet: View {
 
     var body: some View {
         let model = app.usersModel
-        VStack(alignment: .leading, spacing: 14) {
-            switch mode {
-            case .create(let parent):
-                Text("New Folder").font(Theme.emphasis).foregroundStyle(Theme.ink)
-                Text("In \(model.snapshot.folder(parent)?.path ?? model.snapshot.dnsDomain)").font(Theme.detail).foregroundStyle(Theme.muted)
-            case .rename(let id):
-                Text("Rename \(model.snapshot.folder(id)?.name ?? "folder")").font(Theme.emphasis).foregroundStyle(Theme.ink)
+        QuietSheet(title: title(model), subtitle: subtitle(model), width: 420, failure: failure) {
+            SheetField("Name") {
+                QuietTextField("Name", text: $name, prompt: "Folder name").textFieldStyle(.quiet).onSubmit(save)
             }
-            TextField("Folder name", text: $name).textFieldStyle(.quiet).onSubmit(save)
-            if let failure { Text(failure).foregroundStyle(Theme.attention).font(Theme.detail) }
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button(isCreate ? "Create" : "Rename", action: save)
-                    .buttonStyle(.quietPrimary)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
-            }
+        } actions: {
+            SheetButtons(isCreate ? "Create" : "Rename", disabled: name.trimmingCharacters(in: .whitespaces).isEmpty, action: save)
         }
-        .padding(24)
-        .frame(width: 360)
-        .background(Theme.background)
         .onAppear { if case .rename(let id) = mode { name = model.snapshot.folder(id)?.name ?? "" } }
     }
 
     private var isCreate: Bool { if case .create = mode { true } else { false } }
+
+    private func title(_ model: UsersModel) -> String {
+        switch mode {
+        case .create: "New folder"
+        case .rename(let id): "Rename \(model.snapshot.folder(id)?.name ?? "folder")"
+        }
+    }
+
+    private func subtitle(_ model: UsersModel) -> String? {
+        guard case .create(let parent) = mode else { return nil }
+        return "In \(model.snapshot.folder(parent)?.path ?? model.snapshot.dnsDomain)"
+    }
 
     private func save() {
         let model = app.usersModel

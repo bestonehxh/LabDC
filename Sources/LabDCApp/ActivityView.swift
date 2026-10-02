@@ -100,12 +100,12 @@ struct ActivityView: View {
                     Spacer(minLength: 16)
                     switch auth.tab {
                     case .authentications:
-                        TextField("Search", text: $auth.filter.search, prompt: Text("Search"))
+                        QuietTextField("Search", text: $auth.filter.search, prompt: "Search")
                             .textFieldStyle(.quiet)
                             .frame(width: 220)
                             .accessibilityLabel("Search sign-ins")
                     case .log:
-                        TextField("Search", text: $log.filter.search, prompt: Text("Search the log"))
+                        QuietTextField("Search", text: $log.filter.search, prompt: "Search the log")
                             .textFieldStyle(.quiet)
                             .frame(width: 220)
                             .accessibilityLabel("Search the log")

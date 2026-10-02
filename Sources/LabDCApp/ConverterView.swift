@@ -82,8 +82,7 @@ struct ConverterView: View {
                             }
                             if input.isLocked {
                                 HStack(alignment: .firstTextBaseline, spacing: 16) {
-                                    SecureField("Password", text: Binding(get: { passwords[input.id] ?? "" }, set: { passwords[input.id] = $0 }),
-                                                prompt: Text("Password"))
+                                    QuietTextField("Password", text: Binding(get: { passwords[input.id] ?? "" }, set: { passwords[input.id] = $0 }), prompt: "Password", secure: true)
                                         .textFieldStyle(.quiet)
                                         .frame(maxWidth: 240)
                                         .onSubmit { model.unlock(input.id, password: passwords[input.id] ?? "") }
@@ -228,7 +227,7 @@ struct ConverterView: View {
                 let label = model.needsOutputPassword ? "Password for the file" : "Key password (empty = not encrypted)"
                 VStack(alignment: .leading, spacing: 6) {
                     FieldCaption(label)
-                    SecureField(label, text: $model.outputPassword)
+                    QuietTextField(label, text: $model.outputPassword, prompt: label, secure: true)
                         .textFieldStyle(.quiet)
                         .frame(maxWidth: 320)
                         .accessibilityLabel("Output password")
@@ -251,7 +250,7 @@ struct ConverterView: View {
                         .frame(maxWidth: 520)
                     VStack(alignment: .leading, spacing: 6) {
                         FieldCaption("Friendly name (PKCS#12)")
-                        TextField("Friendly name (PKCS#12)", text: $model.friendlyName, prompt: Text("from the input"))
+                        QuietTextField("Friendly name (PKCS#12)", text: $model.friendlyName, prompt: "from the input")
                             .textFieldStyle(.quiet)
                             .frame(maxWidth: 320)
                     }
@@ -315,31 +314,21 @@ struct InspectSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    ForEach(rows) { r in
-                        Card(title: "\(r.role): \(r.subject)") {
-                            VStack(alignment: .leading, spacing: 0) {
-                                ForEach(Self.fields(r.summary), id: \.0) { label, value in
-                                    InfoRow(label: label, value: value, monospaced: label.contains("SHA") || label.contains("Serial"))
-                                }
-                            }
+        QuietSheet(title: rows.count == 1 ? "Certificate" : "\(rows.count) certificates", width: 640) {
+            ForEach(rows) { r in
+                Card(title: "\(r.role): \(r.subject)") {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Self.fields(r.summary), id: \.0) { label, value in
+                            InfoRow(label: label, value: value, monospaced: label.contains("SHA") || label.contains("Serial"))
                         }
                     }
                 }
-                .padding(24)
             }
-            HStack {
-                Spacer()
-                Button("Done") { dismiss() }
-                    .buttonStyle(.quietLink)
-                    .keyboardShortcut(.defaultAction)
-            }
-            .padding(16)
+        } actions: {
+            Button("Done") { dismiss() }
+                .buttonStyle(.quietPrimary)
+                .keyboardShortcut(.defaultAction)
         }
-        .frame(width: 640, height: 560)
-        .background(Theme.background)
     }
 
     static func fields(_ s: CertificateSummary) -> [(String, String)] {

@@ -41,13 +41,15 @@ extension DNSResponder {
             return fail(.badKey, "no security context \(keyName) (expired or never negotiated)")
         }
         let digest = tsig.digest(message: signed.unsignedMessage, keyName: keyName, priorMAC: nil)
+        var sequence = DNSTSIGReplayWindow.sequence(ofMIC: tsig.mac)
         do {
             try context.verifyMIC(digest, token: tsig.mac)
         } catch let error as AuthKitError {
-            // The MIC verified but its sequence number is out of order (a retransmission or a
-            // reordered UDP update): accepted, as BIND and Samba accept GSS_S_DUPLICATE_TOKEN /
-            // GSS_S_GAP_TOKEN, which are supplementary statuses, not errors.
-            guard case .sequenceError = error else { return fail(.badSig, "\(error)") }
+            // The MIC verified but its sequence number is out of order: a gap (a lost or
+            // reordered UDP update) is accepted, as BIND and Samba accept GSS_S_GAP_TOKEN; a
+            // number already seen is refused below by the replay window, not here.
+            guard case .sequenceError(_, let got) = error else { return fail(.badSig, "\(error)") }
+            sequence = sequence ?? got
         } catch {
             return fail(.badSig, "\(error)")
         }
@@ -57,6 +59,17 @@ extension DNSResponder {
             other.appendU48(nowSec)
             return fail(.badTime, "signed \(Int(skew)) s away from this server's clock (fudge \(DNSTSIG.fudge) s)",
                         context: context, otherData: other)
+        }
+        // Replay (CVE audit 2 Oct 2026): within the time window a message whose MAC or sequence
+        // number this context already accepted is a copy, refused unsigned like a bad signature.
+        let admitted = gssKeys.modify(keyName) {
+            $0.replay.admit(mac: tsig.mac, sequence: sequence, timeSigned: tsig.timeSigned, now: nowSec,
+                            fudge: UInt64(DNSTSIG.fudge))
+        }
+        switch admitted {
+        case .fresh: break
+        case .replayed: return fail(.badSig, "replayed message (MAC or sequence number already accepted)")
+        case .full, nil: return fail(.badSig, "too many signed messages in the time window")
         }
         let plan = SignPlan(keyName: keyName, algorithm: tsig.algorithm, context: context, priorMAC: tsig.mac,
                             timeSigned: nowSec)
@@ -97,21 +110,28 @@ extension DNSResponder {
                                  error: error.rawValue, keyData: token).record(keyName: keyName)]
             return m
         }
+        let origin = DNSAddress.sender(from)
+        // An unsigned TKEY proves nothing: it may abandon only a negotiation it started itself,
+        // never an established context (CVE audit 2 Oct 2026).
         func refuse(_ error: DNSTSIGError, _ reason: String) -> Outcome {
-            gssKeys.remove(keyName)
+            gssKeys.abandon(keyName, origin: origin)
             Self.logger.notice("TKEY \(keyName, privacy: .public) from \(from, privacy: .public): \(error.label, privacy: .public) (\(reason, privacy: .public))")
             onEvent?("TKEY from \(from) refused: \(error.label), \(reason)")
             return Outcome(message: reply(error))
-        }
-        guard offer.mode == DNSTKEY.modeGSSAPI else { return refuse(.badMode, "mode \(offer.mode) is not GSS-API (3)") }
-        guard offer.algorithm == DNSTSIG.gssTSIG || offer.algorithm == DNSTSIG.gssMicrosoft else {
-            return refuse(.badAlg, "algorithm \(offer.algorithm)")
         }
         let existing = gssKeys.get(keyName, now: now)
         if existing?.isEstablished == true {
             // RFC 3645 §3.1.2: a key name already in use.
             Self.logger.notice("TKEY \(keyName, privacy: .public) from \(from, privacy: .public): BADNAME (context exists)")
             return Outcome(message: reply(.badName))
+        }
+        if let existing, existing.origin != origin {
+            Self.logger.notice("TKEY \(keyName, privacy: .public) from \(from, privacy: .public): BADNAME (another sender's negotiation)")
+            return Outcome(message: reply(.badName))
+        }
+        guard offer.mode == DNSTKEY.modeGSSAPI else { return refuse(.badMode, "mode \(offer.mode) is not GSS-API (3)") }
+        guard offer.algorithm == DNSTSIG.gssTSIG || offer.algorithm == DNSTSIG.gssMicrosoft else {
+            return refuse(.badAlg, "algorithm \(offer.algorithm)")
         }
         let token = offer.keyData
         var acceptor = existing?.pending
@@ -135,7 +155,8 @@ extension DNSResponder {
         switch step {
         case .continue(let out):
             let until = now.addingTimeInterval(secure.pendingLifetime)
-            gssKeys.set(keyName, DNSGSSKey(algorithm: offer.algorithm, created: now, expires: until, pending: acceptor), now: now)
+            gssKeys.set(keyName, DNSGSSKey(algorithm: offer.algorithm, created: now, expires: until, pending: acceptor,
+                                           origin: origin), now: now)
             return Outcome(message: reply(.noError, token: out, until: until))
         case let .complete(out, identity, context):
             guard let context, !identity.isAnonymous else { return refuse(.badKey, "anonymous logon") }

@@ -58,10 +58,11 @@ public enum DHCPDNS {
         }
     }
 
-    /// The v6 reverse zone at /64 (spec rev 2), or at the prefix rounded up to a nibble when
-    /// the scope is longer than /64.
+    /// The v6 reverse zone at /64 (spec rev 2), or at the prefix rounded down to a nibble when
+    /// the scope is longer than /64 (a /66 needs the /64 zone: a /68 zone would miss three
+    /// quarters of its addresses).
     public static func reverseZone(v6 subnet: IPv6Subnet) -> String {
-        let nibbles = max(16, (subnet.prefix + 3) / 4)
+        let nibbles = max(16, subnet.prefix / 4)
         let all = nibbleList(subnet.network)
         return all.prefix(nibbles).reversed().joined(separator: ".") + ".ip6.arpa"
     }

@@ -19,11 +19,9 @@ struct CertificatePickSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("Which certificates of “\(fileName)”?").font(Theme.emphasis).foregroundStyle(Theme.ink)
-            Text("Windows trusts each one you add as it is, as GPMC does — a root CA, or the server's own certificate.")
-                .font(Theme.detail).foregroundStyle(Theme.muted)
-                .fixedSize(horizontal: false, vertical: true)
+        QuietSheet(title: "Which certificates of “\(fileName)”?",
+                   subtitle: "Windows trusts each one you add as it is, as GPMC does — a root CA, or the server's own certificate.",
+                   width: 560) {
             VStack(alignment: .leading, spacing: 12) {
                 ForEach(certificates) { c in
                     Toggle(isOn: Binding(get: { chosen.contains(c.thumbprint) },
@@ -40,20 +38,12 @@ struct CertificatePickSheet: View {
                     .toggleStyle(.checkbox)
                 }
             }
-            HStack(spacing: 20) {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }.buttonStyle(.quietLink).keyboardShortcut(.cancelAction)
-                Button(chosen.count > 1 ? "Add \(chosen.count) certificates" : "Add") {
-                    add(certificates.filter { chosen.contains($0.thumbprint) })
-                    dismiss()
-                }
-                .buttonStyle(.quietPrimary).keyboardShortcut(.defaultAction)
-                .disabled(chosen.isEmpty)
+        } actions: {
+            SheetButtons(chosen.count > 1 ? "Add \(chosen.count) certificates" : "Add", disabled: chosen.isEmpty) {
+                add(certificates.filter { chosen.contains($0.thumbprint) })
+                dismiss()
             }
         }
-        .padding(24)
-        .frame(width: 560)
-        .background(Theme.background)
     }
 }
 

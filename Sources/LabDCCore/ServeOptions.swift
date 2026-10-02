@@ -225,6 +225,10 @@ public struct ServeOptions: Equatable, Sendable {
     /// Dynamic DNS updates (`--dns-updates secure|nonsecure|off`): GSS-TSIG secure updates from
     /// domain accounts plus unsigned own-address updates (default), secure only, or none.
     public var dnsUpdateMode: DNSDynamicUpdateMode = .secureAndNonsecure
+    /// Services the owner stopped with Services ▸ Stop (the app's `ServerController`): a start
+    /// or restart leaves them stopped, and nothing (a new DHCP scope, an address change, a port
+    /// move) brings them back until that row's Start (`ServeRuntime.startInPlace`).
+    public var ownerStopped: Set<ServeService> = []
 
     public init(dataDirectory: URL, provision: ProvisionSpec? = nil, ports: PortSet = .standard, dnsEnabled: Bool = true,
                 smbEnabled: Bool = true, sntpEnabled: Bool = true, rpcTcpEnabled: Bool = true,

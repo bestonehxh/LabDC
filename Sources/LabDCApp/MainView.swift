@@ -139,4 +139,6 @@ struct DetailPage: View {
 extension EnvironmentValues {
     /// True while `--smoke` renders pages off-screen (opaque backgrounds instead of materials).
     @Entry var smokeRendering = false
+    /// `--smoke`: the person inspector opens with More details and Advanced shown.
+    @Entry var smokeExpandInspector = false
 }

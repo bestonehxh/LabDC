@@ -111,6 +111,7 @@ extension LDAPConnection {
             }
             try await checkSelfWrite(entry, ops)
         } else if !me.isAdmin {
+            ops = try Self.operatorModifyOps(ops, entry: entry)
             try checkOperatorWrite(ops.map { ($0.attribute, $0.values) })
         }
 

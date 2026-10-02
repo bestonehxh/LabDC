@@ -60,11 +60,17 @@ public final class DHCPServer: @unchecked Sendable {
 
     let core: DHCPCore
     private let queue = DispatchQueue(label: "dev.labdc.app.dhcp")
-    private var v4: DHCPUDPSocket?
-    private var v6: DHCPUDPSocket?
-    private var loops: [Task<Void, Never>] = []
-    public private(set) var v4Port: UInt16 = 0
-    public private(set) var v6Port: UInt16 = 0
+    /// Sockets, loops and ports: `status()` reads them while `stop()` clears them.
+    private struct Listeners {
+        var v4: DHCPUDPSocket?
+        var v6: DHCPUDPSocket?
+        var loops: [Task<Void, Never>] = []
+        var v4Port: UInt16 = 0
+        var v6Port: UInt16 = 0
+    }
+    private let listeners = Mutex(Listeners())
+    public var v4Port: UInt16 { listeners.withLock { $0.v4Port } }
+    public var v6Port: UInt16 { listeners.withLock { $0.v6Port } }
     let options: Options
     let gate4: DHCPInFlightGate
     let gate6: DHCPInFlightGate
@@ -110,14 +116,15 @@ public final class DHCPServer: @unchecked Sendable {
                 throw CLIError.failure("DHCPv6 udp \(options.v6Port): \(error)")
             }
         }
-        v4 = s4
-        v6 = s6
-        v4Port = s4?.port ?? 0
-        v6Port = s6?.port ?? 0
+        let p4 = s4?.port ?? 0, p6 = s6?.port ?? 0
+        listeners.withLock { l in
+            l.v4 = s4; l.v6 = s6
+            l.v4Port = p4; l.v6Port = p6
+        }
         await core.attach(v4: s4, v6: s6)
         let flush = options.flushInterval, sweep = options.sweepInterval
         let limit = options.maxInFlight
-        loops.append(Task { [core] in
+        let flushLoop = Task { [core] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: flush)
                 await core.flush()
@@ -126,33 +133,41 @@ public final class DHCPServer: @unchecked Sendable {
                     if n > 0 { await core.reportBusy("\(name): \(n) datagram\(n == 1 ? "" : "s") dropped (over \(limit) in flight)") }
                 }
             }
-        })
-        loops.append(Task { [core] in
+        }
+        let sweepLoop = Task { [core] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: sweep)
                 if Task.isCancelled { return }
                 await core.sweep()
             }
-        })
-        await core.logStart(v4Port: v4Port, v6Port: v6Port)
+        }
+        listeners.withLock { $0.loops += [flushLoop, sweepLoop] }
+        await core.logStart(v4Port: p4, v6Port: p6)
     }
 
     /// Stops the listeners and writes every pending lease change.
     public func stop() async {
-        for t in loops { t.cancel() }
-        loops = []
-        v4?.cancel(); v6?.cancel()
-        v4 = nil; v6 = nil
+        let old = listeners.withLock { l -> Listeners in
+            let old = l
+            l = Listeners()
+            return old
+        }
+        for t in old.loops { t.cancel() }
+        old.v4?.cancel(); old.v6?.cancel()
         await core.detach()
         await core.flush()
-        v4Port = 0; v6Port = 0
     }
 
     /// A scope, reservation or setting changed: reload now.
     public func configChanged() async { await core.reload() }
 
+    /// A scope was deleted: its leases' DNS records go and its leases leave memory (the sweeper
+    /// would otherwise write them back under a scope id the store may hand out again).
+    public func scopeDeleted(id: Int64) async { await core.dropLeases(scope: id) }
+
     public func status() async -> DHCPRuntimeStatus {
-        var s = await core.status(running: v4 != nil || v6 != nil)
+        let running = listeners.withLock { $0.v4 != nil || $0.v6 != nil }
+        var s = await core.status(running: running)
         s.droppedBusy = gate4.dropped + gate6.dropped
         return s
     }
@@ -218,6 +233,8 @@ actor DHCPCore {
     var toward: [IPv4Address: (at: Date, address: IPv4Address)] = [:]
     var buckets: [String: (tokens: Double, at: Date)] = [:]
     var joined: Set<UInt32> = []
+    /// Config warnings already given (server-set custom options, undecodable scopes): once each.
+    var warned: Set<String> = []
     weak var v4: DHCPUDPSocket?
     weak var v6: DHCPUDPSocket?
     /// The last profile written per MAC (what it said, when): an unchanged profile is not
@@ -289,6 +306,43 @@ actor DHCPCore {
                             dcIPv6: dc6, serverDUID: duid)
         loadedAt = clock()
         joinDirectInterfaces()
+        warnOnce(scopes: scopes, reservations: reservations)
+        // Leases of a scope deleted elsewhere (labdc dhcp scope remove, an import): gone too.
+        // "Deleted" means no row: a scope whose data does not decode still exists — its leases
+        // and DNS records stay (it serves nobody until fixed, and says so once).
+        let known = try await store.dhcpScopeIDs()
+        for bad in try await store.dhcpUndecodableScopes() where warned.insert("undecodable \(bad.id)").inserted {
+            warn("scope \(bad.name) (id \(bad.id)) cannot be read: not served; its leases and DNS records are kept")
+        }
+        for id in Set(table.all.map(\.scopeID)) where !known.contains(id) { await dropLeases(scope: id) }
+    }
+
+    /// Server-set custom options saved by an earlier build (never sent): one warning per scope /
+    /// reservation and set of codes, not one per reload.
+    private func warnOnce(scopes: [DHCPScope], reservations: [DHCPReservation]) {
+        for s in scopes {
+            let codes = s.serverManagedCustomCodes
+            guard !codes.isEmpty, warned.insert("scope \(s.id) \(codes)").inserted else { continue }
+            warn("scope \(s.name): custom option\(codes.count == 1 ? "" : "s") \(codes.map(String.init).joined(separator: ", ")) ignored — "
+                 + "the server sets \(codes.count == 1 ? "it" : "them") itself (removed at the next save of the scope)")
+        }
+        for r in reservations {
+            let v6 = scopes.first { $0.id == r.scopeID }?.family == .v6
+            let codes = r.serverManagedCustomCodes(v6: v6)
+            guard !codes.isEmpty, warned.insert("reservation \(r.id) \(codes)").inserted else { continue }
+            warn("reservation \(r.name): custom option\(codes.count == 1 ? "" : "s") \(codes.map(String.init).joined(separator: ", ")) ignored — "
+                 + "the server sets \(codes.count == 1 ? "it" : "them") itself (removed at the next save of the reservation)")
+        }
+    }
+
+    /// Unregisters the DNS records of every lease of `scope` and forgets the leases (the store
+    /// deletes its rows with the scope).
+    func dropLeases(scope id: Int64) async {
+        for l in table.all where l.scopeID == id {
+            if l.dnsName != nil || l.dnsPTR != nil { _ = await dns.apply(DHCPv4Engine.unregisterAction(l), domain: config.domain) }
+            // Only if a packet handled during the DNS await did not move it to another scope.
+            if table.lease(l.family, l.address)?.scopeID == id { table.remove(l.id) }
+        }
     }
 
     private func currentConfig() async -> DHCPConfig {
@@ -562,7 +616,7 @@ actor DHCPCore {
     /// NAS address, or the NAS address lies in the packet's scope — and the new guess is
     /// strictly more confident. MAB-only devices are profiled as before.
     private func categoryGuard(mac: String, scopeID: Int64?, relay: [String]) async -> DirectoryStore.CategoryGuard {
-        guard let sessions = try? await store.activeRadiusSessions(mac: mac) else { return .open }
+        guard let sessions = try? await store.activeRadiusSessions(mac: mac, now: clock()) else { return .open }
         let dot1x = sessions.filter { s in
             guard let user = s.userName, !user.isEmpty else { return false }
             return RADIUSMAC.normalize(user) != s.mac
@@ -575,8 +629,20 @@ actor DHCPCore {
         return sameNAS ? .strictlyHigher : .frozen
     }
 
-    private func applyDNS(_ action: DHCPDNSAction) async {
+    func applyDNS(_ action: DHCPDNSAction) async {
         let updated = await dns.apply(action, domain: config.domain)
+        // The DNS writes awaited the store: a RELEASE / DECLINE / admin release (or a new
+        // binding) may have ended this lease meanwhile, and it saw no DNS name to remove yet.
+        // Records written for a lease that is no longer the same active lease go again now —
+        // nothing else would ever remove them.
+        if action.kind == .register, updated.dnsName != nil || updated.dnsPTR != nil {
+            let now = table.lease(updated.family, updated.address)
+            let same = now.map { $0.clientKey == action.lease.clientKey && $0.state == .active && $0.start == action.lease.start } ?? false
+            if !same {
+                _ = await dns.apply(DHCPv4Engine.unregisterAction(updated), domain: config.domain)
+                return
+            }
+        }
         guard var current = table.lease(updated.family, updated.address), current.clientKey == updated.clientKey else { return }
         current.dnsName = updated.dnsName
         current.dnsPTR = updated.dnsPTR
