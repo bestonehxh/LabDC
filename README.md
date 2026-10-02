@@ -34,7 +34,6 @@ LabDC sits next to a few small native macOS apps for network engineers:
 | <img src="https://raw.githubusercontent.com/bestonehxh/SheepTap/main/.github/icon.png?v=3" width="44" alt=""> | [SheepTap](https://github.com/bestonehxh/SheepTap) | Menu-bar viewer for your Mac's network interfaces with click-to-copy |
 | <img src="https://raw.githubusercontent.com/bestonehxh/SheepPing/main/.github/icon.png?v=3" width="44" alt=""> | [SheepPing](https://github.com/bestonehxh/SheepPing) | Continuous multi-host ping monitor with per-host logs and CSV export |
 | <img src="https://raw.githubusercontent.com/bestonehxh/SheepText/main/.github/icon.png?v=3" width="44" alt=""> | [SheepText](https://github.com/bestonehxh/SheepText) | Fast text editor with tree-sitter highlighting and a JavaScript plugin system |
-| <img src="https://raw.githubusercontent.com/bestonehxh/SheepLog/main/.github/icon.png?v=3" width="44" alt=""> | [SheepLog](https://github.com/bestonehxh/SheepLog) | Syslog viewer, SNMP tester and packet capture |
 
 ## Features
 
