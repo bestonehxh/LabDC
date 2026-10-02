@@ -11,14 +11,23 @@ config="${CONFIG:-release}"
 app="${1:-build/LabDC.app}"
 bundle_src="Sources/LabDCApp/Bundle"
 
-echo "make-app: swift build -c $config --product LabDCApp"
-swift build -c "$config" --product LabDCApp
-bin="$(swift build -c "$config" --show-bin-path)/LabDCApp"
+# The compiler embeds source paths (#file, debug info) in the binary: map this checkout to "."
+# so a published build carries no local paths (owner, 2 Oct 2026).
+root="$(pwd)"
+strip_paths="-Xswiftc -file-prefix-map -Xswiftc $root=. -Xcc -ffile-prefix-map=$root=. -Xcxx -ffile-prefix-map=$root=."
+echo "make-app: swift build -c $config --product LabDCApp (local paths mapped to .)"
+# shellcheck disable=SC2086
+swift build -c "$config" --product LabDCApp $strip_paths
+# shellcheck disable=SC2086
+bin="$(swift build -c "$config" --show-bin-path $strip_paths)/LabDCApp"
 [ -x "$bin" ] || { echo "make-app: $bin missing" >&2; exit 1; }
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/LabDC"
+# A release build drops its debug symbol table: it lists every object file and source folder
+# by absolute path (the linker's debug map), which the prefix map above does not reach.
+if [ "$config" = "release" ]; then strip -S -x "$app/Contents/MacOS/LabDC"; fi
 # Info.plist also registers the certificate document types (UI-3): .pem/.crt/.cer/.der
 # (public.x509-certificate), .p12/.pfx (com.rsa.pkcs-12), .p7b/.p7c, .key and .jks (imported
 # dev.labdc.app.* types), so files dropped on the Dock icon open the Certificate Converter.
