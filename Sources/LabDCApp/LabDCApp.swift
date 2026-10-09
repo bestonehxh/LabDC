@@ -79,6 +79,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
+        // In-app updater (from SheepTerm, 9 Oct 2026): checks ~5 s after launch, then daily.
+        AppUpdater.shared.start()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -100,12 +102,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Menu bar: Domain ▸ Open Data Folder, Save CA…; Help ▸ Connect a Device, Server Log.
+/// Menu bar: LabDC ▸ Check for Updates…; Domain ▸ Open Data Folder, Save CA…; Help ▸ Connect a
+/// Device, Server Log.
 struct AppCommands: Commands {
     let model: AppModel
     @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates…") { AppUpdater.shared.checkNow() }
+        }
         CommandMenu("Domain") {
             Button("Open Data Folder") { model.openDataFolder() }
                 .keyboardShortcut("o", modifiers: [.command, .shift])

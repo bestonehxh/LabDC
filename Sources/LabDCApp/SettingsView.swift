@@ -156,6 +156,7 @@ struct SettingsFact: View {
 struct GeneralSettings: View {
     @Environment(AppModel.self) private var model
     @AppStorage(GreetingPicture.storageKey) private var greetingPicture = GreetingPicture.five.rawValue
+    @AppStorage(UpdateCore.autoCheckKey) private var checkForUpdates = true
     @State private var message: String?
     @State private var failed = false
     @State private var netbiosName = ""
@@ -423,7 +424,29 @@ struct GeneralSettings: View {
                 QuietNote("Change the password in Directory ▸ select Administrator ▸ Reset. Devices that sign in as Administrator (an LDAP lookup account, a NAC test) need the new one.",
                           attention: false)
             }
+
+            QuietSection("Updates") {
+                QuietRow(first: true) {
+                    Toggle(isOn: $checkForUpdates) {
+                        SettingsLabel(title: "Check for updates automatically",
+                                      detail: "Looks for a new LabDC on GitHub a few seconds after it opens and once a day while it stays open. Nothing installs without asking.")
+                    }
+                    .toggleStyle(.quiet)
+                    .accessibilityLabel("Check for updates automatically")
+                }
+                SettingsRow(title: "Version",
+                            detail: "LabDC \(Self.appVersion). Updates are signed; one that does not verify is never installed.") {
+                    Button("Check Now") { AppUpdater.shared.checkNow() }
+                        .buttonStyle(.quietLink)
+                }
+            }
         }
+    }
+
+    static var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "—"
+        return (info?["CFBundleVersion"] as? String).map { "\(short) (\($0))" } ?? short
     }
 
     static let settlingHelp = "The services are starting, stopping or restarting; profiles can change once they have settled."
