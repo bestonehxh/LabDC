@@ -22,6 +22,14 @@ extension UpdateConfig {
 @MainActor
 enum AppUpdater {
     /// Install & Relaunch is the only question: Quit then stops the services cleanly
-    /// (AppDelegate.applicationShouldTerminate) and the new copy starts them again.
-    static let shared = Updater(config: .labDC, hooks: UpdateHooks())
+    /// (AppDelegate.applicationShouldTerminate) and the new copy starts them again. The alerts
+    /// are centred (Update/UpdateAlertPanel.swift): a plain NSAlert left-aligns Details.
+    static let shared = Updater(config: .labDC, hooks: UpdateHooks(presenter: CenteredUpdatePresenter()))
+
+    /// Automatic checks are always on (the user, 9 Oct 2026: no option for it), so a stored
+    /// "off" from an earlier build is cleared before the updater reads it.
+    static func start() {
+        UserDefaults.standard.removeObject(forKey: UpdateCore.autoCheckKey)
+        shared.start()
+    }
 }

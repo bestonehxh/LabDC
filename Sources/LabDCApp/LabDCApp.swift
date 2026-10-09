@@ -80,7 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
         // In-app updater (from SheepTerm, 9 Oct 2026): checks ~5 s after launch, then daily.
-        AppUpdater.shared.start()
+        AppUpdater.start()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

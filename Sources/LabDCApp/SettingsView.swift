@@ -156,7 +156,6 @@ struct SettingsFact: View {
 struct GeneralSettings: View {
     @Environment(AppModel.self) private var model
     @AppStorage(GreetingPicture.storageKey) private var greetingPicture = GreetingPicture.five.rawValue
-    @AppStorage(UpdateCore.autoCheckKey) private var checkForUpdates = true
     @State private var message: String?
     @State private var failed = false
     @State private var netbiosName = ""
@@ -426,16 +425,9 @@ struct GeneralSettings: View {
             }
 
             QuietSection("Updates") {
-                QuietRow(first: true) {
-                    Toggle(isOn: $checkForUpdates) {
-                        SettingsLabel(title: "Check for updates automatically",
-                                      detail: "Looks for a new LabDC on GitHub a few seconds after it opens and once a day while it stays open. Nothing installs without asking.")
-                    }
-                    .toggleStyle(.quiet)
-                    .accessibilityLabel("Check for updates automatically")
-                }
                 SettingsRow(title: "Version",
-                            detail: "LabDC \(Self.appVersion). Updates are signed; one that does not verify is never installed.") {
+                            detail: "LabDC \(Self.appVersion). LabDC looks for a new version when it opens and once a day. Updates are signed; one that does not verify is never installed.",
+                            first: true) {
                     Button("Check Now") { AppUpdater.shared.checkNow() }
                         .buttonStyle(.quietLink)
                 }
