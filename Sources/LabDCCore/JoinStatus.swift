@@ -224,7 +224,7 @@ extension DeviceKind {
             return [c]
         }
         switch self {
-        case .switchAP, .other: return []
+        case .switchAP, .other, .fortigate: return []
         default: return all.filter(matches)
         }
     }
@@ -232,7 +232,7 @@ extension DeviceKind {
     /// Whether this kind of device joins the domain (the checklist then offers a computer picker).
     public var joins: Bool {
         switch self {
-        case .switchAP, .other: false
+        case .switchAP, .other, .fortigate: false
         default: true
         }
     }
@@ -286,6 +286,12 @@ public enum DeviceChecklist {
                 deviceCertificate(o),
                 lastEnrollment(o),
                 radiusClient(o),
+            ]
+        case .fortigate:
+            return [
+                lastEvent(id: "ldap", title: "Last LDAP bind", o.events.first { $0.method.hasPrefix("LDAP bind") },
+                          none: "No LDAP bind yet (Test Connectivity binds)"),
+                ChecklistItem(id: "ca", title: "CA", state: .checkOnDevice, detail: "Import it for LDAPS or STARTTLS (step 1)"),
             ]
         case .other:
             return [

@@ -9,7 +9,7 @@ import SYSVOL
 
 /// The device types on the Connect page, in picker order.
 public enum DeviceKind: String, CaseIterable, Identifiable, Sendable, Codable {
-    case windows, clearpass, imaster, linux, apple, switchAP, other
+    case windows, clearpass, imaster, fortigate, linux, apple, switchAP, other
 
     public var id: String { rawValue }
 
@@ -18,6 +18,7 @@ public enum DeviceKind: String, CaseIterable, Identifiable, Sendable, Codable {
         case .windows: "Windows PC"
         case .clearpass: "Aruba ClearPass"
         case .imaster: "Huawei iMaster NCE-Campus"
+        case .fortigate: "Fortinet FortiGate"
         case .linux: "Ubuntu / Linux (SSSD)"
         case .apple: "Apple (Mac / iPhone)"
         case .switchAP: "Switch / AP"
@@ -31,6 +32,7 @@ public enum DeviceKind: String, CaseIterable, Identifiable, Sendable, Codable {
         case .windows: "Windows PC"
         case .clearpass: "ClearPass"
         case .imaster: "iMaster NCE"
+        case .fortigate: "FortiGate"
         case .linux: "Ubuntu / Linux"
         case .apple: "Mac / iPhone"
         case .switchAP: "Switch / AP"
@@ -44,6 +46,7 @@ public enum DeviceKind: String, CaseIterable, Identifiable, Sendable, Codable {
         case .windows: "Join the domain, get the policy and the CA, sign in with a domain account."
         case .clearpass: "Join AD for MS-CHAPv2, add the LDAP source, give RADIUS a certificate from this CA."
         case .imaster: "Every controller node joins; users and computers sync over LDAP."
+        case .fortigate: "An LDAP server for user groups and firewall sign-ins, over LDAPS or StartTLS."
         case .linux: "realmd + SSSD: join with realm join, sign in as a domain user."
         case .apple: "One profile trusts the CA; a Mac can also bind to the domain."
         case .switchAP: "Certificates by SCEP or EST with a challenge; 802.1X through this DC's RADIUS."
@@ -56,10 +59,41 @@ public enum DeviceKind: String, CaseIterable, Identifiable, Sendable, Codable {
         case .windows: "pc"
         case .clearpass: "shield.lefthalf.filled"
         case .imaster: "server.rack"
+        case .fortigate: "network.badge.shield.half.filled"
         case .linux: "terminal"
         case .apple: "laptopcomputer.and.iphone"
         case .switchAP: "wifi.router"
         case .other: "square.grid.2x2"
+        }
+    }
+}
+
+/// How a device's LDAP source talks to this DC (Connect ▸ Connection). The same names devices use:
+/// LDAPS is "LDAP over SSL" on its own port (636); StartTLS is "secure" on the plain port (389).
+public enum LDAPSecurity: String, CaseIterable, Identifiable, Sendable {
+    case ldaps, startTLS, plain
+
+    public var id: String { rawValue }
+
+    public var isEncrypted: Bool { self != .plain }
+
+    public func title(_ v: ConnectValues) -> String {
+        switch self {
+        case .ldaps: "LDAPS — port \(v.ldapsPort) (LDAP over SSL)"
+        case .startTLS: "LDAP + StartTLS — port \(v.ldapPort) (secure)"
+        case .plain: "LDAP — port \(v.ldapPort) (plain)"
+        }
+    }
+
+    public func port(_ v: ConnectValues) -> Int { self == .ldaps ? v.ldapsPort : v.ldapPort }
+}
+
+extension DeviceKind {
+    /// The LDAP connections the device's guide offers (empty: no choice on the page).
+    public var ldapSecurityOptions: [LDAPSecurity] {
+        switch self {
+        case .clearpass, .fortigate, .imaster: [.ldaps, .startTLS, .plain]
+        default: []
         }
     }
 }
@@ -92,6 +126,8 @@ public struct ConnectValues: Equatable, Sendable {
     public var caSHA1: String?
     /// "Allow plain LDAP" (Settings ▸ System): simple binds on 389 work only when on.
     public var allowPlainLDAP: Bool
+    /// The LDAP connection the guides fill in (the Connection choice on the page).
+    public var ldapSecurity: LDAPSecurity = .plain
 
     public init(address: String, dnsDomain: String, realm: String, netbios: String, dcFQDN: String, baseDN: String,
                 ldapPort: Int = 389, ldapsPort: Int = 636, kerberosPort: Int = 88, httpPort: Int = 80, estPort: Int = 8443,
@@ -261,6 +297,7 @@ public enum DeviceGuide {
         case .windows: raw = windows(v)
         case .clearpass: raw = clearPass(v)
         case .imaster: raw = iMaster(v)
+        case .fortigate: raw = fortiGate(v)
         case .linux: raw = linux(v)
         case .apple: raw = apple(v)
         case .switchAP: raw = switchAP(v)
@@ -349,8 +386,9 @@ public enum DeviceGuide {
     static func clearPass(_ v: ConnectValues) -> [GuideStep] {
         var ldap: [GuideItem] = [
             .field(GuideField("Hostname", v.address)),
-            .field(GuideField("Connection Security", "None", note: "or StartTLS on the same port, or LDAP over SSL on port \(v.ldapsPort), after adding the CA to the Trust List")),
-            .field(GuideField("Port", String(v.ldapPort))),
+            .field(GuideField("Connection Security", clearPassSecurity(v.ldapSecurity),
+                              note: v.ldapSecurity.isEncrypted ? "the CA must be in the Trust List (step 4) with usage AD/LDAP Servers" : nil)),
+            .field(GuideField("Port", String(v.ldapSecurity.port(v)))),
             .field(GuideField("Bind DN", v.lookupAccountDN, note: "the Lookup account")),
             .field(.adminPassword("Bind Password")),
             .field(GuideField("NetBIOS Domain Name", v.netbios)),
@@ -358,7 +396,7 @@ public enum DeviceGuide {
             .field(GuideField("Search Scope", "Subtree Search")),
             .field(GuideField("Filter", ConnectValues.clearPassFilter, note: "Attributes tab ▸ Authentication filter")),
         ]
-        if !v.allowPlainLDAP {
+        if v.ldapSecurity == .plain, !v.allowPlainLDAP {
             ldap.append(.warning("Allow plain LDAP is off, so a Bind DN on port \(v.ldapPort) is refused. Use LDAP over SSL (port \(v.ldapsPort)) or turn it on."))
             ldap.append(.actions([.openDirectorySettings]))
         }
@@ -398,19 +436,29 @@ public enum DeviceGuide {
         ]
     }
 
+    static func clearPassSecurity(_ s: LDAPSecurity) -> String {
+        switch s {
+        case .ldaps: "LDAP over SSL"
+        case .startTLS: "StartTLS"
+        case .plain: "None"
+        }
+    }
+
     // MARK: iMaster NCE-Campus
 
     static func iMaster(_ v: ConnectValues) -> [GuideStep] {
         var sync: [GuideItem] = [
             .field(GuideField("Server IP", v.address)),
-            .field(GuideField("Port", String(v.ldapPort), note: "TLS off (iMaster's default); \(v.ldapsPort) with TLS on after importing the CA")),
+            .field(GuideField("Port", String(v.ldapSecurity.port(v)))),
+            .field(GuideField("TLS", v.ldapSecurity == .ldaps ? "On (LDAPS)" : v.ldapSecurity == .startTLS ? "On (StartTLS)" : "Off",
+                              note: v.ldapSecurity.isEncrypted ? "import the CA (Save CA below) as the LDAP server's trusted certificate" : "iMaster's default")),
             .field(GuideField("Administrator DN", v.lookupAccountDN, note: "iMaster asks for the full DN here")),
             .field(.adminPassword()),
             .field(GuideField("Base DN", v.baseDN)),
             .field(GuideField("User filter", ConnectValues.iMasterUserFilter, note: "people only; plain (objectClass=user) also brings in computer accounts")),
             .text("Sync mode: by OU (root OU = Base DN or a folder), by group with folders, or by nested groups — all three work."),
         ]
-        if !v.allowPlainLDAP {
+        if v.ldapSecurity == .plain, !v.allowPlainLDAP {
             sync.append(.warning("Allow plain LDAP is off, so the Administrator DN on port \(v.ldapPort) with TLS off is refused. Turn TLS on (port \(v.ldapsPort)) or turn plain LDAP on."))
             sync.append(.actions([.openDirectorySettings, .saveCAPEM]))
         } else {
@@ -610,6 +658,75 @@ public enum DeviceGuide {
                 .actions([.openRadiusClients]),
             ]),
         ]
+    }
+
+    // MARK: FortiGate
+
+    static func fortiGate(_ v: ConnectValues) -> [GuideStep] {
+        let sec = v.ldapSecurity
+        let secureValue: String = switch sec {
+        case .ldaps: "On ▸ Protocol: LDAPS"
+        case .startTLS: "On ▸ Protocol: STARTTLS"
+        case .plain: "Off"
+        }
+        var server: [GuideItem] = [
+            .field(GuideField("Name", "LabDC")),
+            .field(GuideField("Server IP/Name", v.address)),
+            .field(GuideField("Server Port", String(sec.port(v)))),
+            .field(GuideField("Common Name Identifier", "sAMAccountName")),
+            .field(GuideField("Distinguished Name", v.baseDN)),
+            .field(GuideField("Exchange server", "Off")),
+            .field(GuideField("Bind Type", "Regular")),
+            .field(GuideField("Username", v.lookupAccountDN, note: "the Lookup account")),
+            .field(.adminPassword()),
+            .field(GuideField("Secure Connection", secureValue)),
+        ]
+        if sec.isEncrypted {
+            server.append(.field(GuideField("Certificate", nil, hint: "the CA imported in step 1")))
+        } else if !v.allowPlainLDAP {
+            server.append(.warning("Allow plain LDAP is off, so a Regular bind on port \(v.ldapPort) is refused. Use LDAPS or STARTTLS, or turn it on."))
+            server.append(.actions([.openDirectorySettings]))
+        }
+        server.append(.text("Test Connectivity, then Test User Credentials with a domain account."))
+        let secure: String = switch sec {
+        case .ldaps: "\n        set secure ldaps\n        set ca-cert \"CA_Cert_1\""
+        case .startTLS: "\n        set secure starttls\n        set ca-cert \"CA_Cert_1\""
+        case .plain: ""
+        }
+        var steps: [GuideStep] = []
+        if sec.isEncrypted {
+            steps.append(step("Import the CA", "System ▸ Certificates ▸ Create/Import ▸ CA Certificate ▸ File", [
+                .text("Upload the CA (.cer or .pem). FortiGate names it CA_Cert_1, CA_Cert_2, … under Remote CA Certificates."),
+                .field(GuideField("SHA-256 fingerprint", v.caSHA256, hint: "appears once the CA is loaded")),
+                .actions([.saveCACER, .saveCAPEM]),
+            ]))
+        }
+        steps += [
+            step("LDAP server", "User & Authentication ▸ LDAP Servers ▸ Create New", server),
+            step("Or from the CLI", nil, [
+                .snippet(title: "CLI", code: """
+                    config user ldap
+                        edit "LabDC"
+                            set server "\(v.address)"
+                            set port \(sec.port(v))
+                            set cnid "sAMAccountName"
+                            set dn "\(v.baseDN)"
+                            set type regular
+                            set username "\(v.lookupAccountDN)"
+                            set password <the Administrator password>\(secure)
+                        next
+                    end
+                    """),
+            ]),
+            step("User group", "User & Authentication ▸ User Groups ▸ Create New ▸ Type: Firewall", [
+                .text("Remote Groups ▸ Add ▸ Remote Server: LabDC, then pick a group (or none for every user)."),
+                .field(GuideField("Group example", "CN=Domain Users,CN=Users,\(v.baseDN)")),
+            ]),
+            step("Test from the CLI", nil, [
+                .command("diagnose test authserver ldap LabDC alice <password>", expect: "authenticate 'alice' against 'LabDC' succeeded!"),
+            ]),
+        ]
+        return steps
     }
 
     // MARK: Other

@@ -4,7 +4,8 @@
 #   CONFIG=debug Scripts/make-app.sh     # faster, debug build
 #   Scripts/make-app.sh /Applications/LabDC.app
 # The bundle: Contents/MacOS/LabDC (the executable), Contents/Info.plist
-# (dev.labdc.app, LSMinimumSystemVersion 26.0), Contents/Resources/AppIcon.icns; ad-hoc signed.
+# (dev.labdc.app, LSMinimumSystemVersion 26.0), Contents/Resources/AppIcon.icns; ad-hoc signed
+# unless CODESIGN_IDENTITY names an identity.
 set -eu
 cd "$(dirname "$0")/.."
 config="${CONFIG:-release}"
@@ -46,7 +47,15 @@ done
 iconutil -c icns -o "$app/Contents/Resources/AppIcon.icns" "$iconset"
 rm -rf "$(dirname "$iconset")"
 
-codesign --force --sign - --timestamp=none "$app" >/dev/null 2>&1 || echo "make-app: ad-hoc signing failed (the app still runs locally)"
+# CODESIGN_IDENTITY (set by the release, e.g. a Developer ID Application identity) signs with
+# the Hardened Runtime and a secure timestamp, as notarization requires; without it, ad-hoc.
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    codesign --force --sign "$CODESIGN_IDENTITY" --options runtime --timestamp "$app"
+    codesign --verify --strict "$app"
+    echo "make-app: signed by $CODESIGN_IDENTITY (Hardened Runtime)"
+else
+    codesign --force --sign - --timestamp=none "$app" >/dev/null 2>&1 || echo "make-app: ad-hoc signing failed (the app still runs locally)"
+fi
 # Tell Launch Services about the document types (Dock drops, Open With) right away.
 lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 [ -x "$lsregister" ] && "$lsregister" -f "$app" >/dev/null 2>&1 || true

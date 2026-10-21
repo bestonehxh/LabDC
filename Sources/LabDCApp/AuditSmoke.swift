@@ -253,6 +253,11 @@ enum AuditSmoke {
             TestLoginContent(test: model.authentications.testLogin, close: {}).frame(width: 580)
         }
         model.authentications.testLogin.showAdvanced = false
+        model.authentications.testLogin.preset = .ldap
+        await sheet("activity-test-sign-in-ldap") {
+            TestLoginContent(test: model.authentications.testLogin, close: {}).frame(width: 580)
+        }
+        model.authentications.testLogin.preset = .kerberos
         await sheet("settings-new-profile") { NewProfileSheet(existing: ["Lab"], settling: false) { _ in } }
         await sheet("settings-rename-profile") {
             RenameProfileSheet(name: "Branch lab", isActive: true, existing: ["Branch lab", "Lab"], settling: false,

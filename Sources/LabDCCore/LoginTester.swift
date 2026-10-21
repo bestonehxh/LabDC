@@ -65,6 +65,8 @@ public struct LoginTestRequest: Sendable, Equatable {
         /// Plain LDAP when "Allow plain LDAP" is on, LDAPS otherwise.
         case automatic
         case plain
+        /// The LDAP port, then StartTLS ("389 secure").
+        case startTLS
         case tls
         public var id: String { rawValue }
     }
@@ -595,31 +597,43 @@ public struct LoginTester: Sendable {
         let env = environment
         let name = await Self.ldapName(r.user, form: r.ldapNameForm, info: env.info, store: env.store)
         let method = Self.methodName(r)
-        let useTLS: Bool = switch r.ldapConnection {
-        case .automatic: !env.allowPlainLDAP || env.ldapPort == nil
-        case .plain: false
-        case .tls: true
+        let mode: LoginTestRequest.LDAPConnection = switch r.ldapConnection {
+        case .automatic: !env.allowPlainLDAP || env.ldapPort == nil ? .tls : .plain
+        default: r.ldapConnection
         }
+        let useTLS = mode == .tls
         guard let port = useTLS ? env.ldapsPort : env.ldapPort else {
             throw LoginTestError.notRunning(useTLS ? "LDAPS" : "LDAP")
         }
-        if useTLS, env.caCertificateDER == nil { throw LoginTestError.notRunning("the lab CA (needed to trust LDAPS)") }
-        let conn = LoopbackConnection(port: port, trustAnchorDER: useTLS ? env.caCertificateDER : nil)
+        if mode != .plain, env.caCertificateDER == nil {
+            throw LoginTestError.notRunning(useTLS ? "the lab CA (needed to trust LDAPS)" : "the lab CA (needed to trust StartTLS)")
+        }
+        let conn = LDAPTestChannel(LoopbackConnection(port: port, trustAnchorDER: useTLS ? env.caCertificateDER : nil))
         defer { conn.close() }
         try await conn.open()
-        let bind = LDAPMessage(messageID: 1, .bindRequest(BindRequest(name: name, authentication: .simple(Array(r.password.utf8)))))
+        var nextID: Int32 = 1
+        if mode == .startTLS, let ca = env.caCertificateDER {
+            try await conn.startTLS(caDER: ca, messageID: nextID)
+            nextID += 1
+        }
+        let bind = LDAPMessage(messageID: nextID, .bindRequest(BindRequest(name: name, authentication: .simple(Array(r.password.utf8)))))
         try await conn.send(bind.encoded())
         let response = try LDAPMessage(bytes: try await conn.receive(frame: Self.ldapFrame))
         guard case .bindResponse(let bound) = response.operation else { throw LoginTestError.protocolError("no BindResponse") }
         let code = bound.result.resultCode
+        let connection = switch mode {
+        case .tls: "LDAPS 127.0.0.1:\(port) (TLS, lab CA)"
+        case .startTLS: "LDAP 127.0.0.1:\(port) + StartTLS (\(conn.tlsSummary ?? "TLS"), lab CA)"
+        default: "LDAP 127.0.0.1:\(port) (plain)"
+        }
         var details: [LoginTestResult.Detail] = [
             .init("Bind name", name),
-            .init("Connection", (useTLS ? "LDAPS" : "LDAP") + " 127.0.0.1:\(port)" + (useTLS ? " (TLS, lab CA)" : " (plain)")),
+            .init("Connection", connection),
             .init("Result code", "\(code.rawValue) (\(code))"),
         ]
         if !bound.result.diagnosticMessage.isEmpty { details.append(.init("Diagnostic", bound.result.diagnosticMessage)) }
         guard code == .success else {
-            try? await conn.send(LDAPMessage(messageID: 2, .unbindRequest).encoded())
+            try? await conn.send(LDAPMessage(messageID: nextID + 1, .unbindRequest).encoded())
             var outcome = code == .invalidCredentials ? "invalidCredentials" : code == .strongerAuthRequired ? "strongerAuthRequired"
                 : code == .unwillingToPerform ? "unwillingToPerform" : "result \(code.rawValue)"
             if let range = bound.result.diagnosticMessage.range(of: #"data ([0-9a-fA-F]+)"#, options: .regularExpression) {
@@ -637,7 +651,7 @@ public struct LoginTester: Sendable {
                     name)
         }
         // Who am I (RFC 4532): the identity the server bound.
-        try await conn.send(LDAPMessage(messageID: 2, .extendedRequest(ExtendedRequest(name: LDAPExtendedOID.whoAmI))).encoded())
+        try await conn.send(LDAPMessage(messageID: nextID + 1, .extendedRequest(ExtendedRequest(name: LDAPExtendedOID.whoAmI))).encoded())
         var account: String?
         if let who = try? LDAPMessage(bytes: try await conn.receive(frame: Self.ldapFrame)),
            case .extendedResponse(let ext) = who.operation, let value = ext.value {
@@ -645,7 +659,7 @@ public struct LoginTester: Sendable {
             account = authz.hasPrefix("u:") ? String(authz.dropFirst(2)) : authz
             details.append(.init("Who am I", authz))
         }
-        try? await conn.send(LDAPMessage(messageID: 3, .unbindRequest).encoded())
+        try? await conn.send(LDAPMessage(messageID: nextID + 2, .unbindRequest).encoded())
         let sam = account.map { ActivityEvent.stripDomain($0) } ?? Self.accountName(r.user)
         let groups = await accountGroups(sam: sam)
         details.append(.init("Groups", groups.isEmpty ? "none" : groups.joined(separator: ", ")))

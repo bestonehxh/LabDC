@@ -39,6 +39,10 @@ struct ConnectView: View {
                     QuietNote("The server is not running; the values below may be incomplete.", attention: true)
                         .padding(.top, 16)
                 }
+                if !connect.device.ldapSecurityOptions.isEmpty {
+                    LDAPSecurityPicker(connect: connect, values: values)
+                        .padding(.top, 24)
+                }
                 if let message = connect.message {
                     QuietNote(message, attention: true)
                         .textSelection(.enabled)
@@ -101,6 +105,7 @@ extension DeviceKind {
         case .windows: "Windows PC"
         case .clearpass: "ClearPass"
         case .imaster: "iMaster NCE"
+        case .fortigate: "FortiGate"
         case .linux: "Linux"
         case .apple: "Mac and iPhone"
         case .switchAP: "Switch or AP"
@@ -114,6 +119,7 @@ extension DeviceKind {
         case .windows: "Connect a Windows PC"
         case .clearpass: "Connect a ClearPass"
         case .imaster: "Connect an iMaster NCE"
+        case .fortigate: "Connect a FortiGate"
         case .linux: "Connect a Linux computer"
         case .apple: "Connect a Mac or iPhone"
         case .switchAP: "Connect a switch or AP"
@@ -127,11 +133,32 @@ extension DeviceKind {
         case .windows: "This PC"
         case .clearpass: "This ClearPass"
         case .imaster: "This iMaster NCE"
+        case .fortigate: "This FortiGate"
         case .linux: "This computer"
         case .apple: "This Mac or iPhone"
         case .switchAP: "This switch or AP"
         case .other: "This device"
         }
+    }
+}
+
+/// How the device's LDAP source connects: LDAPS (636), StartTLS (389, "secure") or plain LDAP;
+/// the steps below follow it.
+struct LDAPSecurityPicker: View {
+    @Bindable var connect: ConnectModel
+    let values: ConnectValues
+
+    var body: some View {
+        SheetField("Connection") {
+            SheetPicker("Connection", selection: $connect.ldapSecurity) {
+                ForEach(connect.device.ldapSecurityOptions) { option in
+                    Text(option.title(values)).tag(option)
+                }
+            }
+            .accessibilityLabel("LDAP connection")
+            .accessibilityValue(connect.ldapSecurity.title(values))
+        }
+        .frame(maxWidth: 420, alignment: .leading)
     }
 }
 

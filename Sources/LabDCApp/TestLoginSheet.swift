@@ -110,11 +110,16 @@ final class TestLoginModel {
         preset == .ldap ? [.upn, .downLevel, .dn, .accountOnly, .asTyped] : [.downLevel, .upn, .accountOnly, .asTyped]
     }
 
-    static func connectionLabel(_ c: LoginTestRequest.LDAPConnection) -> String {
-        switch c {
+    /// With the ports, so "389" / "636" on a NAC's LDAP source maps to a choice here.
+    static func connectionLabel(_ c: LoginTestRequest.LDAPConnection, status: ServerStatus) -> String {
+        func port(_ l: ServeListener, _ fallback: Int) -> Int {
+            status.listeners.first { $0.listener == l }?.port ?? fallback
+        }
+        return switch c {
         case .automatic: "Automatic (LDAPS unless plain LDAP is allowed)"
-        case .plain: "LDAP (plain)"
-        case .tls: "LDAPS (TLS)"
+        case .plain: "LDAP — port \(port(.ldap, 389)) (plain)"
+        case .startTLS: "LDAP + StartTLS — port \(port(.ldap, 389)) (secure)"
+        case .tls: "LDAPS — port \(port(.ldaps, 636)) (LDAP over SSL)"
         }
     }
 
@@ -175,6 +180,11 @@ struct TestLoginContent: View {
                             .accessibilityLabel("Password")
                             .onSubmit { test.run(model.controller) }
                     }
+                    if test.preset == .ldap {
+                        choice("Connection", selection: $test.ldapConnection, options: LoginTestRequest.LDAPConnection.allCases) {
+                            TestLoginModel.connectionLabel($0, status: status)
+                        }
+                    }
                 }
                 .padding(.top, 22)
 
@@ -202,6 +212,7 @@ struct TestLoginContent: View {
             .onChange(of: test.preset) { test.inputsChanged() }
             .onChange(of: test.user) { test.inputsChanged() }
             .onChange(of: test.password) { test.inputsChanged() }
+            .onChange(of: test.ldapConnection) { test.inputsChanged() }
 
             Rectangle().fill(Theme.line).frame(height: 1)
             HStack(alignment: .center, spacing: 22) {
@@ -273,9 +284,6 @@ struct TestLoginContent: View {
         case .ldap:
             choice("Name form", selection: $test.ldapNameForm, options: test.nameForms) {
                 test.nameFormLabel($0, status: status)
-            }
-            choice("Connection", selection: $test.ldapConnection, options: LoginTestRequest.LDAPConnection.allCases) {
-                TestLoginModel.connectionLabel($0)
             }
         }
     }

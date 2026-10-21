@@ -11,6 +11,15 @@ final class ConnectModel {
     var device: DeviceKind {
         didSet { defaults.set(device.rawValue, forKey: Self.deviceKey) }
     }
+    /// The LDAP connection the guides show (remembered; a device without it shows LDAPS).
+    var ldapSecurity: LDAPSecurity {
+        get { device.ldapSecurityOptions.contains(storedLDAPSecurity) ? storedLDAPSecurity : .ldaps }
+        set {
+            storedLDAPSecurity = newValue
+            defaults.set(newValue.rawValue, forKey: Self.ldapSecurityKey)
+        }
+    }
+    private var storedLDAPSecurity: LDAPSecurity
     /// The account the user picked per device ("Automatic" = none).
     private(set) var pinned: [DeviceKind: String]
     var observations = ConnectObservations()
@@ -25,10 +34,12 @@ final class ConnectModel {
     @ObservationIgnored private var reloadTask: Task<Void, Never>?
     static let deviceKey = "connect.device"
     static let pinnedKey = "connect.pinned"
+    static let ldapSecurityKey = "connect.ldapSecurity"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         device = defaults.string(forKey: Self.deviceKey).flatMap(DeviceKind.init(rawValue:)) ?? .windows
+        storedLDAPSecurity = defaults.string(forKey: Self.ldapSecurityKey).flatMap(LDAPSecurity.init(rawValue:)) ?? .ldaps
         let stored = defaults.dictionary(forKey: Self.pinnedKey) as? [String: String] ?? [:]
         pinned = Dictionary(uniqueKeysWithValues: stored.compactMap { k, v in DeviceKind(rawValue: k).map { ($0, v) } })
     }
@@ -45,7 +56,9 @@ final class ConnectModel {
     }
 
     func values(_ controller: ServerController) -> ConnectValues {
-        Self.values(status: controller.status, settings: controller.settings, caName: controller.summary.caName, caDER: caDER)
+        var v = Self.values(status: controller.status, settings: controller.settings, caName: controller.summary.caName, caDER: caDER)
+        v.ldapSecurity = ldapSecurity
+        return v
     }
 
     func steps(_ values: ConnectValues) -> [GuideStep] {

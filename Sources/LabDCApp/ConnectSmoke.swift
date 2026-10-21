@@ -40,7 +40,7 @@ enum ConnectSmoke {
     static func height(for kind: DeviceKind) -> CGFloat {
         switch kind {
         case .switchAP: 1700
-        case .clearpass, .imaster: 1750
+        case .clearpass, .imaster, .fortigate: 1750
         case .windows, .apple: 1600
         case .linux: 1400
         case .other: 1150
