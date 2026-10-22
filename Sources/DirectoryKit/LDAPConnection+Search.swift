@@ -33,12 +33,13 @@ extension LDAPConnection {
 
     /// The RootDSE attributes, in the order AD lists them.
     func rootDSEAttributes() async throws -> [LDAPAttribute] {
-        try await Self.rootDSEAttributes(store: store, info: info, now: config.clock(), vendorVersion: config.vendorVersion)
+        try await Self.rootDSEAttributes(store: store, info: info, now: config.clock(), vendorVersion: config.vendorVersion,
+                                         startTLS: config.allowStartTLS)
     }
 
     /// The RootDSE attributes, in the order AD lists them (shared with the CLDAP responder).
     static func rootDSEAttributes(store: DirectoryStore, info i: DomainInfo, now: Date,
-                                  vendorVersion: String) async throws -> [LDAPAttribute] {
+                                  vendorVersion: String, startTLS: Bool = true) async throws -> [LDAPAttribute] {
         let usn = try await store.highestCommittedUSN()
         func a(_ name: String, _ values: [String]) -> LDAPAttribute { LDAPAttribute(name, strings: values) }
         return [
@@ -61,7 +62,8 @@ extension LDAPConnection {
             a("subschemaSubentry", [i.subschemaDN.description]),
             a("supportedCapabilities", Self.supportedCapabilities),
             a("supportedControl", Self.supportedControls),
-            a("supportedExtension", Self.supportedExtensions),
+            a("supportedExtension", startTLS ? Self.supportedExtensions
+                                     : Self.supportedExtensions.filter { $0 != LDAPExtendedOID.startTLS }),
             a("supportedLDAPPolicies", Self.supportedLDAPPolicies),
             a("supportedLDAPVersion", ["3", "2"]),
             a("supportedSASLMechanisms", Self.saslMechanisms),

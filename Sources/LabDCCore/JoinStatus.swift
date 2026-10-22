@@ -404,11 +404,11 @@ public enum DeviceChecklist {
         if let e {
             return ChecklistItem(id: "ldap", title: "LDAP lookups", state: e.result == .success ? .done : .problem, date: e.date,
                                  detail: e.result == .success ? "as \(e.user)" : "\(e.user): \(e.detail)",
-                                 action: e.result == .success || o.allowPlainLDAP ? nil : .openDirectorySettings)
+                                 action: e.result == .success || o.allowPlainLDAP ? nil : .openLDAPSettings)
         }
         if !o.allowPlainLDAP {
             return ChecklistItem(id: "ldap", title: "LDAP lookups", state: .waiting,
-                                 detail: "Allow plain LDAP is off: use port 636 (LDAP over SSL)", action: .openDirectorySettings)
+                                 detail: "Allow plain LDAP is off: use port 636 (LDAP over SSL)", action: .openLDAPSettings)
         }
         return ChecklistItem(id: "ldap", title: "LDAP lookups", state: .waiting,
                              detail: addresses.isEmpty ? "Not seen yet (known after the join)" : "No bind from the \(device) yet")

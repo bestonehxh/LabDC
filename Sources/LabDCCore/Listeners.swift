@@ -113,6 +113,7 @@ public enum ServeListener: String, CaseIterable, Sendable, Codable, Identifiable
         case .http: options.httpEnabled
         case .est: options.estEnabled
         case .https: options.httpsEnabled
+        case .ldaps, .gcs: options.ldapsEnabled
         default: true
         }
     }

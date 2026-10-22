@@ -13,9 +13,9 @@ No Windows Server, no Samba, no `sudo`.
 
 ## ⬇️ Download
 
-[![Download LabDC for macOS](https://img.shields.io/badge/Download-LabDC_1.1_%286%29_for_macOS-2ea44f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/bestonehxh/LabDC/releases/latest)
+[![Download LabDC for macOS](https://img.shields.io/badge/Download-LabDC_1.1_%287%29_for_macOS-2ea44f?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/bestonehxh/LabDC/releases/latest)
 
-**[Get the latest release →](https://github.com/bestonehxh/LabDC/releases/latest)** — download `LabDC-1.1-6.zip`, unzip, and drag **LabDC.app** into `Applications`.
+**[Get the latest release →](https://github.com/bestonehxh/LabDC/releases/latest)** — download `LabDC-1.1-7.zip`, unzip, and drag **LabDC.app** into `Applications`.
 
 > The build is unsigned (not notarized), so macOS will warn on first launch —
 > right-click the app and choose **Open**, or run

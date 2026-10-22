@@ -89,9 +89,8 @@ struct ConnectView: View {
             model.selection = .certificates
         case .openUsers:
             model.selection = .users
-        case .openDirectorySettings:
-            model.requestedSettingsTab = .directory
-            openSettings()
+        case .openLDAPSettings:
+            model.selection = .ldap
         case .openRadiusClients:
             model.selection = .radius
         }

@@ -598,7 +598,7 @@ public struct LoginTester: Sendable {
         let name = await Self.ldapName(r.user, form: r.ldapNameForm, info: env.info, store: env.store)
         let method = Self.methodName(r)
         let mode: LoginTestRequest.LDAPConnection = switch r.ldapConnection {
-        case .automatic: !env.allowPlainLDAP || env.ldapPort == nil ? .tls : .plain
+        case .automatic: env.allowPlainLDAP && env.ldapPort != nil ? .plain : env.ldapsPort != nil ? .tls : .startTLS
         default: r.ldapConnection
         }
         let useTLS = mode == .tls

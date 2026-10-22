@@ -17,6 +17,12 @@ public struct ServerSettings: Codable, Equatable, Sendable {
     /// "Require LDAP signing" (AD's LDAPServerIntegrity = 2): SASL binds without TLS must sign
     /// or seal. On by default, also for settings files written before it existed.
     public var requireLDAPSigning: Bool = true
+    /// LDAP ▸ "StartTLS on port 389" (owner, 22 Oct 2026): off answers the StartTLS request
+    /// unavailable, so port 389 is plain only.
+    public var startTLSEnabled: Bool = true
+    /// LDAP ▸ "LDAPS on port 636": off leaves the LDAPS and Global Catalog over TLS (3269)
+    /// listeners closed.
+    public var ldapsEnabled: Bool = true
     /// "LDAP channel binding" (AD's LdapEnforceChannelBinding) for binds over TLS.
     public var ldapChannelBinding: ChannelBindingPolicy = .whenSupported
     /// Certificate enrollment over HTTPS (CES / CEP): accept NTLM, always bound to the TLS
@@ -59,6 +65,7 @@ public struct ServerSettings: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case ports, joinDomain, allowPlainLDAP, ntlmAuth, advertise, dnsForwarders, dnsAllowedClients, netbios
         case requireLDAPSigning, ldapChannelBinding, cesAllowNTLM, cesChannelBinding, dnsDynamicUpdates
+        case startTLSEnabled, ldapsEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -75,6 +82,8 @@ public struct ServerSettings: Codable, Equatable, Sendable {
         dnsDynamicUpdates = (try c.decodeIfPresent(String.self, forKey: .dnsDynamicUpdates))
             .flatMap(DNSDynamicUpdateMode.init(rawValue:)) ?? d.dnsDynamicUpdates
         requireLDAPSigning = try c.decodeIfPresent(Bool.self, forKey: .requireLDAPSigning) ?? d.requireLDAPSigning
+        startTLSEnabled = try c.decodeIfPresent(Bool.self, forKey: .startTLSEnabled) ?? d.startTLSEnabled
+        ldapsEnabled = try c.decodeIfPresent(Bool.self, forKey: .ldapsEnabled) ?? d.ldapsEnabled
         ldapChannelBinding = (try c.decodeIfPresent(String.self, forKey: .ldapChannelBinding))
             .flatMap(ChannelBindingPolicy.init(rawValue:)) ?? d.ldapChannelBinding
         cesAllowNTLM = try c.decodeIfPresent(Bool.self, forKey: .cesAllowNTLM) ?? d.cesAllowNTLM
@@ -94,6 +103,8 @@ public struct ServerSettings: Codable, Equatable, Sendable {
         if netbios { try c.encode(netbios, forKey: .netbios) }
         if dnsDynamicUpdates != .secureAndNonsecure { try c.encode(dnsDynamicUpdates.rawValue, forKey: .dnsDynamicUpdates) }
         try c.encode(requireLDAPSigning, forKey: .requireLDAPSigning)
+        if !startTLSEnabled { try c.encode(startTLSEnabled, forKey: .startTLSEnabled) }
+        if !ldapsEnabled { try c.encode(ldapsEnabled, forKey: .ldapsEnabled) }
         try c.encode(ldapChannelBinding.rawValue, forKey: .ldapChannelBinding)
         try c.encode(cesAllowNTLM, forKey: .cesAllowNTLM)
         try c.encode(cesChannelBinding.rawValue, forKey: .cesChannelBinding)
@@ -128,6 +139,8 @@ public struct ServerSettings: Codable, Equatable, Sendable {
         o.netbiosEnabled = netbios             // off by default: macOS's netbiosd owns 137, and nothing in the join needs it
         o.allowPlainLDAP = allowPlainLDAP
         o.requireLDAPSigning = requireLDAPSigning
+        o.startTLSEnabled = startTLSEnabled
+        o.ldapsEnabled = ldapsEnabled
         o.ldapChannelBinding = ldapChannelBinding
         o.cesAllowNTLM = cesAllowNTLM
         o.cesChannelBinding = cesChannelBinding

@@ -566,40 +566,6 @@ struct DirectorySettings: View {
                 }
             }
 
-            QuietSection("LDAP") {
-                QuietRow(first: true) {
-                    Toggle(isOn: binding(\.allowPlainLDAP)) {
-                        SettingsLabel(title: "Allow plain LDAP",
-                                      detail: settings.allowPlainLDAP
-                                          ? "Devices may send a password over port 389 unencrypted. StartTLS on 389 and LDAPS on 636 are always available."
-                                          : "Port 389 refuses passwords unless the device turns on StartTLS; LDAPS on 636 works as before.")
-                    }
-                    .toggleStyle(.quiet)
-                    .accessibilityLabel("Allow plain LDAP")
-                    .accessibilityHint("Simple binds with a password on port 389 without encryption")
-                }
-                QuietRow {
-                    Toggle(isOn: binding(\.requireLDAPSigning)) {
-                        SettingsLabel(title: "Require LDAP signing",
-                                      detail: settings.requireLDAPSigning
-                                          ? "Kerberos and NTLM binds on port 389 must sign or encrypt, as Windows, Samba and macOS do. Like a Windows DC's \"Require signing\"."
-                                          : "Kerberos and NTLM binds on port 389 may skip signing, so the session can be tampered with or relayed.")
-                    }
-                    .toggleStyle(.quiet)
-                    .accessibilityLabel("Require LDAP signing")
-                }
-                SettingsRow(title: "LDAP channel binding",
-                            detail: "Ties Kerberos and NTLM binds on LDAPS and StartTLS to the TLS connection, so a relayed login fails. \"When supported\" checks every client that sends a binding.") {
-                    Picker("LDAP channel binding", selection: binding(\.ldapChannelBinding)) {
-                        ForEach(ChannelBindingPolicy.allCases, id: \.self) { Text($0.settingsLabel).tag($0) }
-                    }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .fixedSize()
-                    .accessibilityLabel("LDAP channel binding")
-                }
-            }
-
             QuietSection("Certificate enrollment over HTTPS") {
                 QuietRow(first: true) {
                     Toggle(isOn: binding(\.cesAllowNTLM)) {
@@ -650,7 +616,8 @@ struct DirectorySettings: View {
 
             // UI-1b: ports grouped by service, like the Services page (owner decision 26 Sep 2026).
             // Listeners that are off (NetBIOS by default) have no port to set and don't show.
-            ForEach(services) { row in
+            // The directory's ports live on the LDAP page (owner, 22 Oct 2026).
+            ForEach(services.filter { $0.service != .directory }) { row in
                 let shown = row.service.listeners.filter { $0.isEnabled(in: model.controller.serveOptions()) }
                 if !shown.isEmpty {
                     QuietSection(title: "Ports · " + row.service.title) {

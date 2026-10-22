@@ -58,6 +58,8 @@ final class ConnectModel {
     func values(_ controller: ServerController) -> ConnectValues {
         var v = Self.values(status: controller.status, settings: controller.settings, caName: controller.summary.caName, caDER: caDER)
         v.ldapSecurity = ldapSecurity
+        v.startTLSEnabled = controller.settings.startTLSEnabled
+        v.ldapsEnabled = controller.settings.ldapsEnabled
         return v
     }
 

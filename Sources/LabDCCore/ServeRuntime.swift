@@ -932,14 +932,16 @@ public actor ServeRuntime {
 
     private func startLDAP(store: DirectoryStore, pki: LabPKI) async throws {
         let p = options.ports
-        var config = DirectoryServerConfig(ldapPort: Int(p.ldap), ldapsPort: Int(p.ldaps), globalCatalogPort: Int(p.gc),
-                                           globalCatalogTLSPort: Int(p.gcs), vendorVersion: Self.vendorVersion)
+        var config = DirectoryServerConfig(ldapPort: Int(p.ldap), ldapsPort: options.ldapsEnabled ? Int(p.ldaps) : nil,
+                                           globalCatalogPort: Int(p.gc),
+                                           globalCatalogTLSPort: options.ldapsEnabled ? Int(p.gcs) : nil, vendorVersion: Self.vendorVersion)
         config.advertisedIPv4 = options.advertise
         // UI-1: bind outcomes on the serve log (the app's activity list) and "Allow plain LDAP".
         let log = self.log
         config.onBind = { line in log.event("LDAP", "bind " + line) }
         config.allowPlainSimpleBind = options.allowPlainLDAP
         config.requireLDAPSigning = options.requireLDAPSigning
+        config.allowStartTLS = options.startTLSEnabled
         config.ldapChannelBinding = options.ldapChannelBinding
         try checkRunning()
         let server = DirectoryServer(store: store, pki: pki, config: config)

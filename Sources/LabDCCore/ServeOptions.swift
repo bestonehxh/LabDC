@@ -201,6 +201,10 @@ public struct ServeOptions: Equatable, Sendable {
     public var allowPlainLDAP: Bool = true
     /// "Require LDAP signing": SASL binds on 389 without TLS must sign or seal.
     public var requireLDAPSigning: Bool = true
+    /// LDAP ▸ StartTLS on the LDAP and Global Catalog ports.
+    public var startTLSEnabled: Bool = true
+    /// LDAP ▸ the LDAPS (636) and Global Catalog over TLS (3269) listeners.
+    public var ldapsEnabled: Bool = true
     /// "LDAP channel binding" (EPA) for SASL binds on LDAPS / StartTLS.
     public var ldapChannelBinding: ChannelBindingPolicy = .whenSupported
     /// CES / CEP (HTTPS): accept NTLM (always with a channel binding that matches the TLS

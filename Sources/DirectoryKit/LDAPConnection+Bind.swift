@@ -245,6 +245,9 @@ extension LDAPConnection {
         let id = message.messageID
         switch request.name {
         case LDAPExtendedOID.startTLS:
+            guard config.allowStartTLS else {
+                throw LDAPFailure(.unavailable, "00000005: LdapErr: DSID-0C090F2B, comment: StartTLS is turned off on this DC, data 0, \(ADDiagnostic.version)")
+            }
             guard let tls = server.tls else {
                 throw LDAPFailure(.unavailable, "00000005: LdapErr: DSID-0C090F2B, comment: no server certificate, data 0, \(ADDiagnostic.version)")
             }

@@ -128,6 +128,18 @@ public struct ConnectValues: Equatable, Sendable {
     public var allowPlainLDAP: Bool
     /// The LDAP connection the guides fill in (the Connection choice on the page).
     public var ldapSecurity: LDAPSecurity = .plain
+    /// LDAP ▸ StartTLS and LDAPS on this DC (a guide warns when the chosen one is off).
+    public var startTLSEnabled = true
+    public var ldapsEnabled = true
+
+    /// Whether the chosen connection works on this DC as set up.
+    public var ldapSecurityAvailable: Bool {
+        switch ldapSecurity {
+        case .plain: allowPlainLDAP
+        case .startTLS: startTLSEnabled
+        case .ldaps: ldapsEnabled
+        }
+    }
 
     public init(address: String, dnsDomain: String, realm: String, netbios: String, dcFQDN: String, baseDN: String,
                 ldapPort: Int = 389, ldapsPort: Int = 636, kerberosPort: Int = 88, httpPort: Int = 80, estPort: Int = 8443,
@@ -232,7 +244,7 @@ public struct GuideField: Equatable, Sendable {
 public enum GuideAction: String, Equatable, Sendable {
     case saveCAPEM, saveCACER, saveMobileConfig
     case publishCA
-    case openSignCSR, openEnrollment, openTrustedRoots, openUsers, openDirectorySettings, openRadiusClients
+    case openSignCSR, openEnrollment, openTrustedRoots, openUsers, openLDAPSettings, openRadiusClients
 
     public var title: String {
         switch self {
@@ -244,7 +256,7 @@ public enum GuideAction: String, Equatable, Sendable {
         case .openEnrollment: "Certificates ▸ Enrollment"
         case .openTrustedRoots: "Certificates ▸ Trusted roots"
         case .openUsers: "Open Directory"
-        case .openDirectorySettings: "Settings ▸ System"
+        case .openLDAPSettings: "LDAP settings"
         case .openRadiusClients: "RADIUS ▸ Clients"
         }
     }
@@ -396,10 +408,7 @@ public enum DeviceGuide {
             .field(GuideField("Search Scope", "Subtree Search")),
             .field(GuideField("Filter", ConnectValues.clearPassFilter, note: "Attributes tab ▸ Authentication filter")),
         ]
-        if v.ldapSecurity == .plain, !v.allowPlainLDAP {
-            ldap.append(.warning("Allow plain LDAP is off, so a Bind DN on port \(v.ldapPort) is refused. Use LDAP over SSL (port \(v.ldapsPort)) or turn it on."))
-            ldap.append(.actions([.openDirectorySettings]))
-        }
+        ldap += securityWarning(v, plain: "Allow plain LDAP is off, so a Bind DN on port \(v.ldapPort) is refused. Use LDAP over SSL (port \(v.ldapsPort)) or turn it on.")
         return [
             step("DNS and time", "Administration ▸ Server Manager ▸ Server Configuration ▸ (server) ▸ System", [
                 .field(GuideField("Primary DNS", v.address)),
@@ -436,6 +445,17 @@ public enum DeviceGuide {
         ]
     }
 
+    /// A warning and the LDAP settings link when the chosen connection is turned off on this DC.
+    static func securityWarning(_ v: ConnectValues, plain: String) -> [GuideItem] {
+        guard !v.ldapSecurityAvailable else { return [] }
+        let text: String = switch v.ldapSecurity {
+        case .plain: plain
+        case .startTLS: "StartTLS is turned off on this DC, so the device's StartTLS request is refused. Turn it on in LDAP settings or use LDAPS."
+        case .ldaps: "LDAPS is turned off on this DC, so nothing answers on port \(v.ldapsPort). Turn it on in LDAP settings or use StartTLS."
+        }
+        return [.warning(text), .actions([.openLDAPSettings])]
+    }
+
     static func clearPassSecurity(_ s: LDAPSecurity) -> String {
         switch s {
         case .ldaps: "LDAP over SSL"
@@ -458,9 +478,10 @@ public enum DeviceGuide {
             .field(GuideField("User filter", ConnectValues.iMasterUserFilter, note: "people only; plain (objectClass=user) also brings in computer accounts")),
             .text("Sync mode: by OU (root OU = Base DN or a folder), by group with folders, or by nested groups — all three work."),
         ]
-        if v.ldapSecurity == .plain, !v.allowPlainLDAP {
-            sync.append(.warning("Allow plain LDAP is off, so the Administrator DN on port \(v.ldapPort) with TLS off is refused. Turn TLS on (port \(v.ldapsPort)) or turn plain LDAP on."))
-            sync.append(.actions([.openDirectorySettings, .saveCAPEM]))
+        let warning = securityWarning(v, plain: "Allow plain LDAP is off, so the Administrator DN on port \(v.ldapPort) with TLS off is refused. Turn TLS on (port \(v.ldapsPort)) or turn plain LDAP on.")
+        if let first = warning.first {
+            sync.append(first)
+            sync.append(.actions([.openLDAPSettings, .saveCAPEM]))
         } else {
             sync.append(.actions([.saveCAPEM]))
         }
@@ -683,10 +704,8 @@ public enum DeviceGuide {
         ]
         if sec.isEncrypted {
             server.append(.field(GuideField("Certificate", nil, hint: "the CA imported in step 1")))
-        } else if !v.allowPlainLDAP {
-            server.append(.warning("Allow plain LDAP is off, so a Regular bind on port \(v.ldapPort) is refused. Use LDAPS or STARTTLS, or turn it on."))
-            server.append(.actions([.openDirectorySettings]))
         }
+        server += securityWarning(v, plain: "Allow plain LDAP is off, so a Regular bind on port \(v.ldapPort) is refused. Use LDAPS or STARTTLS, or turn it on.")
         server.append(.text("Test Connectivity, then Test User Credentials with a domain account."))
         let secure: String = switch sec {
         case .ldaps: "\n        set secure ldaps\n        set ca-cert \"CA_Cert_1\""

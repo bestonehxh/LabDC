@@ -54,7 +54,7 @@ enum CLIDefaults {
 }
 
 enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
-    case overview, services, users
+    case overview, services, users, ldap
     case groupPolicy = "group-policy"
     case certificates, connect, radius, dhcp, activity
 
@@ -65,6 +65,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .overview: "Overview"
         case .services: "Services"
         case .users: "Directory"
+        case .ldap: "LDAP"
         case .groupPolicy: "Group Policy"
         case .radius: "RADIUS"
         case .dhcp: "DHCP"

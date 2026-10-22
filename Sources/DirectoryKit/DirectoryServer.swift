@@ -49,6 +49,9 @@ public struct DirectoryServerConfig: Sendable {
     /// TLS must negotiate integrity (sign) or confidentiality (seal); one that completes without a
     /// layer is answered strongerAuthRequired. Simple binds stay governed by `allowPlainSimpleBind`.
     public var requireLDAPSigning: Bool = true
+    /// StartTLS (RFC 4511 §4.14) on the plain listeners; false answers it unavailable and drops it
+    /// from the root DSE's supportedExtension.
+    public var allowStartTLS: Bool = true
     /// "LDAP channel binding" (AD's `LdapEnforceChannelBinding`): how NTLM and Kerberos SASL binds
     /// over LDAPS / StartTLS must be bound to the TLS channel (EPA).
     public var ldapChannelBinding: ChannelBindingPolicy = .whenSupported

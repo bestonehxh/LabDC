@@ -122,6 +122,8 @@ struct DetailPage: View {
             GroupPolicyView()
         case .users:
             UsersView()
+        case .ldap:
+            LDAPView()
         case .radius:
             RadiusView()
         case .dhcp:
